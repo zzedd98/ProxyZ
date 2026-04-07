@@ -299,6 +299,12 @@ class RoundedButton(tk.Canvas):
 def _replace_exe(target: str, tmp_dl: str) -> None:
     target = os.path.abspath(target)
     bak = target + ".old"
+    target_existed = os.path.isfile(target)
+
+    if not os.path.isfile(tmp_dl):
+        raise RuntimeError("Fichier telecharge introuvable (installation interrompue).")
+    if os.path.getsize(tmp_dl) <= 0:
+        raise RuntimeError("Fichier telecharge vide (installation interrompue).")
 
     for _ in range(120):
         try:
@@ -308,7 +314,7 @@ def _replace_exe(target: str, tmp_dl: str) -> None:
         except OSError:
             time.sleep(0.25)
 
-    if os.path.isfile(target):
+    if target_existed:
         for _ in range(120):
             try:
                 os.replace(target, bak)
@@ -318,13 +324,26 @@ def _replace_exe(target: str, tmp_dl: str) -> None:
         else:
             raise RuntimeError("Impossible de remplacer l'executable (fichier verrouille ?).")
 
+    installed = False
     for _ in range(120):
         try:
             os.replace(tmp_dl, target)
+            installed = True
             break
         except OSError:
             time.sleep(0.25)
-    else:
+
+    if not installed:
+        # Rollback best-effort : remettre l'ancien exe en place si on l'a sauvegarde.
+        if os.path.isfile(bak):
+            for _ in range(60):
+                try:
+                    if os.path.isfile(target):
+                        os.remove(target)
+                    os.replace(bak, target)
+                    break
+                except OSError:
+                    time.sleep(0.25)
         raise RuntimeError("Impossible d'installer le nouveau fichier.")
 
     for _ in range(120):
@@ -334,6 +353,7 @@ def _replace_exe(target: str, tmp_dl: str) -> None:
             break
         except OSError:
             time.sleep(0.25)
+    # Si .old reste verrouille (ancien process encore vivant), on ne bloque pas l'update.
 
 
 class UpdaterApp:
