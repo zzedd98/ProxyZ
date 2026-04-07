@@ -3,6 +3,7 @@ import json
 import math
 import logging
 import importlib
+import importlib.util
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
@@ -124,9 +125,9 @@ def get_python_executable() -> str:
         python_exe = shutil.which("python3w") or shutil.which("python3")
         if python_exe:
             return python_exe
-        # Si on ne trouve pas Python, on utilise quand même sys.executable
-        # mais cela ne fonctionnera probablement pas
-        return sys.executable
+        # IMPORTANT: en mode .exe, sys.executable == ProxyZ.exe (pas un interpréteur Python).
+        # On retourne vide pour éviter de lancer un faux "python" qui ferait des succès instantanés.
+        return ""
     # En script Python, utiliser l'interpréteur actuel
     return sys.executable
 
@@ -137,10 +138,54 @@ def build_reset_command(script_path: Path, proxy_port: int) -> list[str]:
     """
     if script_path.suffix.lower() != ".py":
         raise RuntimeError("Seuls les scripts reset Python (.py) sont supportés.")
-    return [get_python_executable(), str(script_path), str(proxy_port)]
+    python_exe = get_python_executable()
+    if not python_exe:
+        raise RuntimeError(
+            "Interpréteur Python introuvable pour lancer un script .py en mode exécutable."
+        )
+    return [python_exe, str(script_path), str(proxy_port)]
 
 
 _RESET_MODEM_FUNC = None
+_RESET_MODEM_INIT_FUNC = None
+_RESET_MODEM_LOADED_FROM: str | None = None
+
+
+def _load_reset_modem_functions(script_path: Path):
+    """
+    Charge reset_modem.py depuis son chemin absolu.
+    Fiable en mode script ET en mode .exe (indépendant du working directory).
+    """
+    global _RESET_MODEM_FUNC, _RESET_MODEM_INIT_FUNC, _RESET_MODEM_LOADED_FROM
+    resolved = str(script_path.resolve())
+    if (
+        _RESET_MODEM_FUNC is not None
+        and _RESET_MODEM_LOADED_FROM is not None
+        and _RESET_MODEM_LOADED_FROM.lower() == resolved.lower()
+    ):
+        return _RESET_MODEM_FUNC, _RESET_MODEM_INIT_FUNC
+
+    if not script_path.exists():
+        raise FileNotFoundError(f"Script reset introuvable: {script_path}")
+
+    module_name = f"_proxyz_reset_modem_{abs(hash(resolved))}"
+    spec = importlib.util.spec_from_file_location(module_name, resolved)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Impossible de charger le module reset: {resolved}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    reset_func = getattr(module, "reset_modem_by_port", None)
+    if not callable(reset_func):
+        raise RuntimeError(f"Fonction reset_modem_by_port introuvable dans {resolved}")
+    init_func = getattr(module, "initialize_browser_service", None)
+    if not callable(init_func):
+        init_func = None
+
+    _RESET_MODEM_FUNC = reset_func
+    _RESET_MODEM_INIT_FUNC = init_func
+    _RESET_MODEM_LOADED_FROM = resolved
+    return _RESET_MODEM_FUNC, _RESET_MODEM_INIT_FUNC
 
 
 def run_reset_script(script_path: Path, proxy_port: int, timeout_seconds: int = 120) -> int:
@@ -150,16 +195,17 @@ def run_reset_script(script_path: Path, proxy_port: int, timeout_seconds: int = 
     - autres scripts Python restent en subprocess.
     Retourne un code process-like (0 succès, 1 échec).
     """
-    global _RESET_MODEM_FUNC
     if script_path.name.lower() == "reset_modem.py":
-        if _RESET_MODEM_FUNC is None:
-            module = importlib.import_module("reset_modem")
-            _RESET_MODEM_FUNC = getattr(module, "reset_modem_by_port")
-        ok = bool(_RESET_MODEM_FUNC(proxy_port))
+        reset_func, _ = _load_reset_modem_functions(script_path)
+        ok = bool(reset_func(proxy_port))
         return 0 if ok else 1
 
     cmd = build_reset_command(script_path, proxy_port)
-    result = subprocess.run(cmd, timeout=timeout_seconds)
+    result = subprocess.run(
+        cmd,
+        timeout=timeout_seconds,
+        cwd=str(get_app_dir()),
+    )
     return result.returncode
 
 
@@ -3514,8 +3560,12 @@ class MainWindow(QMainWindow):
 
         def _warmup():
             try:
-                mod = importlib.import_module("reset_modem")
-                init_fn = getattr(mod, "initialize_browser_service", None)
+                app_dir = get_app_dir()
+                reset_script = self.config.get("reset_script_default", DEFAULT_RESET_SCRIPT)
+                script_path = resolve_reset_script_path(reset_script, app_dir)
+                if script_path.name.lower() != "reset_modem.py":
+                    return
+                _, init_fn = _load_reset_modem_functions(script_path)
                 if callable(init_fn):
                     ports: list[int] = []
                     for cfg in (self.config.get("interface_proxies", {}) or {}).values():
