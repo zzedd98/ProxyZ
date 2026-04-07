@@ -8,7 +8,6 @@ on:
       - "ProxyZ.py"
       - "ProxyZUpdater.py"
       - "reset_modem.py"
-      - "proxy_configs.json"
       - "Z icon.ico"
       - ".github/workflows/build-proxyz.yml"
 

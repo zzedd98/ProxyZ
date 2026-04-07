@@ -18,3 +18,4 @@ output/
 
 .venv/
 venv/
+proxy_configs.json
