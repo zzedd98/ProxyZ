@@ -2,6 +2,7 @@ import sys
 import json
 import math
 import logging
+import importlib
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
@@ -45,6 +46,53 @@ def get_app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _read_embedded_build_id() -> str:
+    """
+    Lit l'identifiant de build embarque (version.txt).
+    - En onefile PyInstaller, version.txt est extrait dans sys._MEIPASS.
+    - En mode script, on lit version.txt a cote de ProxyZ.py si present.
+    """
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "version.txt")
+    candidates.append(get_app_dir() / "version.txt")
+    for p in candidates:
+        try:
+            if p.is_file():
+                value = p.read_text(encoding="utf-8", errors="replace").strip()
+                if value:
+                    return value
+        except Exception:
+            continue
+    return ""
+
+
+def ensure_local_build_id_file() -> None:
+    """
+    Ecrit/rafraichit version.txt a cote de ProxyZ.exe pour que ProxyZUpdater
+    puisse detecter la version locale de maniere fiable.
+    """
+    try:
+        build_id = _read_embedded_build_id()
+        if not build_id:
+            return
+        local_path = get_app_dir() / "version.txt"
+        current = ""
+        if local_path.is_file():
+            try:
+                current = local_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).strip()
+            except Exception:
+                current = ""
+        if current != build_id:
+            local_path.write_text(build_id + "\n", encoding="utf-8")
+    except Exception:
+        # Ne jamais bloquer le demarrage de l'app pour ce mecanisme.
+        pass
+
+
 def resolve_reset_script_path(script_key: str, app_dir: Path) -> Path:
     """
     Résout le chemin d'un script de reset.
@@ -81,6 +129,38 @@ def get_python_executable() -> str:
         return sys.executable
     # En script Python, utiliser l'interpréteur actuel
     return sys.executable
+
+
+def build_reset_command(script_path: Path, proxy_port: int) -> list[str]:
+    """
+    Construit la commande de reset Python.
+    """
+    if script_path.suffix.lower() != ".py":
+        raise RuntimeError("Seuls les scripts reset Python (.py) sont supportés.")
+    return [get_python_executable(), str(script_path), str(proxy_port)]
+
+
+_RESET_MODEM_FUNC = None
+
+
+def run_reset_script(script_path: Path, proxy_port: int, timeout_seconds: int = 120) -> int:
+    """
+    Exécute un reset:
+    - `reset_modem.py` est appelé en-process (browser persistant réutilisable).
+    - autres scripts Python restent en subprocess.
+    Retourne un code process-like (0 succès, 1 échec).
+    """
+    global _RESET_MODEM_FUNC
+    if script_path.name.lower() == "reset_modem.py":
+        if _RESET_MODEM_FUNC is None:
+            module = importlib.import_module("reset_modem")
+            _RESET_MODEM_FUNC = getattr(module, "reset_modem_by_port")
+        ok = bool(_RESET_MODEM_FUNC(proxy_port))
+        return 0 if ok else 1
+
+    cmd = build_reset_command(script_path, proxy_port)
+    result = subprocess.run(cmd, timeout=timeout_seconds)
+    return result.returncode
 
 
 @dataclass
@@ -826,18 +906,39 @@ class InterfaceQuotaManager:
                                 should_reset_interface = True
 
                         if should_reset_interface:
-                            # Réinitialiser tous les quotas de cette interface à 0
-                            for request_type, domains in list(request_types.items()):
-                                for domain, quota_info in list(domains.items()):
-                                    quota_info.reset()
-                            logger.info(
-                                f"[QUOTA] Réinitialisation de tous les quotas pour {interface_name} (timeout partiel)"
+                            self._request_interface_reset(
+                                interface_name, "timeout quota partiel"
                             )
-                            # Réinitialiser aussi les GET en attente d'un CONNECT
-                            if interface_name in self._pending_gets:
-                                self._pending_gets[interface_name] = 0
             except Exception as e:
                 logger.error(f"[QUOTA] Erreur dans cleanup: {e}")
+
+    def _request_interface_reset(self, interface_name: str, reason: str):
+        """Retire l'interface du pool et déclenche un reset réel avant retour à 0/0."""
+        if interface_name in self.resetting_interfaces:
+            return
+        self.resetting_interfaces.add(interface_name)
+        self.available_interfaces = [
+            i for i in self.available_interfaces if i["name"] != interface_name
+        ]
+        self._interface_available_event_clear_if_empty()
+        logger.info(
+            f"[QUOTA] 🔄 Reset demandé pour {interface_name} ({reason})"
+        )
+        if self._reset_callback:
+            try:
+                self._reset_callback.reset_interface(interface_name)
+                logger.info(
+                    f"[QUOTA] Reset déclenché via callback pour {interface_name}"
+                )
+            except Exception as e:
+                logger.error(f"[QUOTA] Erreur callback reset: {e}")
+                logger.error(traceback.format_exc())
+                asyncio.create_task(self._reset_interface_direct(interface_name))
+        else:
+            logger.warning(
+                f"[QUOTA] Aucun callback défini, reset direct pour {interface_name}"
+            )
+            asyncio.create_task(self._reset_interface_direct(interface_name))
 
     def _get_quota_key(self, request_type: str, host: str, port: int) -> str:
         """Génère une clé de domaine pour le quota"""
@@ -1140,29 +1241,9 @@ class InterfaceQuotaManager:
             return
 
         logger.info(
-            f"[QUOTA] ✅ Quota CONNECT game server plein pour {interface_name}, déclenchement du reset..."
+            f"[QUOTA] ✅ Quota CONNECT game server plein pour {interface_name}, reset requis"
         )
-        self.resetting_interfaces.add(interface_name)
-        self.available_interfaces = [
-            i for i in self.available_interfaces if i["name"] != interface_name
-        ]
-        self._interface_available_event_clear_if_empty()
-
-        if self._reset_callback:
-            try:
-                self._reset_callback.reset_interface(interface_name)
-                logger.info(
-                    f"[QUOTA] Reset déclenché via callback pour {interface_name}"
-                )
-            except Exception as e:
-                logger.error(f"[QUOTA] Erreur callback reset: {e}")
-                logger.error(traceback.format_exc())
-                asyncio.create_task(self._reset_interface_direct(interface_name))
-        else:
-            logger.warning(
-                f"[QUOTA] Aucun callback défini, reset direct pour {interface_name}"
-            )
-            asyncio.create_task(self._reset_interface_direct(interface_name))
+        self._request_interface_reset(interface_name, "quota CONNECT plein")
 
     async def _reset_interface_direct(self, interface_name: str):
         """Reset direct d'une interface via script (fallback si pas de callback)"""
@@ -1194,16 +1275,9 @@ class InterfaceQuotaManager:
             )
 
             if script_path.exists():
-                # Utiliser get_python_executable() pour obtenir Python même dans un .exe
-                python_exe = get_python_executable()
-                process = await asyncio.create_subprocess_exec(
-                    python_exe,
-                    str(script_path),
-                    str(proxy_port),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                result = await asyncio.to_thread(
+                    run_reset_script, script_path, proxy_port, 120
                 )
-                result = await process.wait()
 
                 if result == 0:
                     logger.info(f"[QUOTA] ✅ Reset réussi pour {interface_name}")
@@ -3145,6 +3219,202 @@ class ManualInterfacesList(QListWidget):
         self.order_changed.emit(names)
 
 
+class ZRotateInterfaceRow(QFrame):
+    toggled = Signal(str, int)  # interface_name, Qt.CheckState
+
+    def __init__(self, interface_name: str, public_ip: str, parent=None):
+        super().__init__(parent)
+        self.interface_name = interface_name
+
+        self.setObjectName("zrotateInterfaceRow")
+        self.setMinimumHeight(34)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setSpacing(10)
+
+        self.checkbox = QCheckBox(interface_name)
+        self.checkbox.setObjectName("zrotateInterfaceCheckbox")
+        self.checkbox.stateChanged.connect(
+            lambda state: self.toggled.emit(self.interface_name, state)
+        )
+        layout.addWidget(self.checkbox, 1)
+
+        self.stats_widget = QWidget(self)
+        stats_layout = QHBoxLayout(self.stats_widget)
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setSpacing(8)
+
+        self.get_chip = QLabel("0/2")
+        self.get_chip.setObjectName("zrotateGetChip")
+        self.get_chip.setAlignment(Qt.AlignCenter)
+        self.get_chip.setFixedWidth(74)
+        self.get_chip.setFixedHeight(22)
+        stats_layout.addWidget(self.get_chip)
+
+        self.connect_chip = QLabel("0/2")
+        self.connect_chip.setObjectName("zrotateConnectChip")
+        self.connect_chip.setAlignment(Qt.AlignCenter)
+        self.connect_chip.setFixedWidth(104)
+        self.connect_chip.setFixedHeight(22)
+        stats_layout.addWidget(self.connect_chip)
+
+        self.ip_chip = QLabel(public_ip or "-")
+        self.ip_chip.setObjectName("zrotateIpChip")
+        self.ip_chip.setAlignment(Qt.AlignCenter)
+        self.ip_chip.setFixedWidth(102)
+        self.ip_chip.setFixedHeight(22)
+        stats_layout.addWidget(self.ip_chip)
+
+        layout.addWidget(self.stats_widget, 0, Qt.AlignCenter)
+
+        self.setStyleSheet(
+            """
+            QFrame#zrotateInterfaceRow {
+                background-color: rgba(15, 23, 42, 0.78);
+                border: 1px solid rgba(59, 130, 246, 0.22);
+                border-radius: 10px;
+            }
+            QFrame#zrotateInterfaceRow:hover {
+                border: 1px solid rgba(59, 130, 246, 0.45);
+                background-color: rgba(30, 41, 59, 0.9);
+            }
+            QFrame#zrotateInterfaceRow[poolEnabled="false"] {
+                background-color: rgba(51, 65, 85, 0.42);
+                border: 1px solid rgba(148, 163, 184, 0.22);
+            }
+            QFrame#zrotateInterfaceRow[poolEnabled="false"] QCheckBox#zrotateInterfaceCheckbox {
+                color: #94a3b8;
+            }
+            QFrame#zrotateInterfaceRow[poolEnabled="false"] QLabel#zrotateIpChip {
+                color: #94a3b8;
+                background-color: rgba(71, 85, 105, 0.28);
+                border-color: rgba(148, 163, 184, 0.35);
+            }
+            QCheckBox#zrotateInterfaceCheckbox {
+                color: #e2e8f0;
+                font-size: 14px;
+                font-weight: 600;
+            }
+            QLabel#zrotateIpChip, QLabel#zrotateGetChip, QLabel#zrotateConnectChip {
+                color: #dbeafe;
+                background-color: rgba(30, 64, 175, 0.24);
+                border: 1px solid rgba(96, 165, 250, 0.45);
+                border-radius: 8px;
+                padding: 2px 8px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QLabel#zrotateConnectChip {
+                background-color: rgba(6, 95, 70, 0.28);
+                border-color: rgba(16, 185, 129, 0.5);
+            }
+            """
+        )
+
+    def set_checked(self, checked: bool):
+        blocked = self.checkbox.blockSignals(True)
+        self.checkbox.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self.checkbox.blockSignals(blocked)
+        self._apply_checked_visual_state()
+
+    def is_checked(self) -> bool:
+        return self.checkbox.checkState() == Qt.Checked
+
+    def set_public_ip(self, public_ip: str):
+        value = public_ip or "-"
+        if self.ip_chip.text() != value:
+            self.ip_chip.setText(value)
+
+    def set_quota_values(self, g_used: int, g_max: int, c_used: int, c_max: int):
+        get_txt = f"<b>{g_used}/{g_max}</b>"
+        con_txt = f"<b>{c_used}/{c_max}</b>"
+        if self.get_chip.text() != get_txt:
+            self.get_chip.setText(get_txt)
+        if self.connect_chip.text() != con_txt:
+            self.connect_chip.setText(con_txt)
+
+    def _apply_checked_visual_state(self):
+        enabled = self.is_checked()
+        self.get_chip.setVisible(enabled)
+        self.connect_chip.setVisible(enabled)
+        self.get_chip.setEnabled(enabled)
+        self.connect_chip.setEnabled(enabled)
+        self.ip_chip.setEnabled(enabled)
+        self.checkbox.setEnabled(True)
+        self.setProperty("poolEnabled", enabled)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class ZRotateInterfacesHeaderRow(QFrame):
+    """Ligne d'en-tête fixe pour la liste des interfaces ZRotate."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("zrotateInterfacesHeaderRow")
+        self.setMinimumHeight(34)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setSpacing(10)
+
+        self.name_label = QLabel("Nom de l'interface")
+        self.name_label.setObjectName("zrotateHeaderName")
+        layout.addWidget(self.name_label, 1)
+
+        self.stats_widget = QWidget(self)
+        stats_layout = QHBoxLayout(self.stats_widget)
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setSpacing(8)
+
+        self.get_label = QLabel("GET")
+        self.get_label.setObjectName("zrotateHeaderChip")
+        self.get_label.setAlignment(Qt.AlignCenter)
+        self.get_label.setFixedWidth(74)
+        self.get_label.setFixedHeight(22)
+        stats_layout.addWidget(self.get_label)
+
+        self.connect_label = QLabel("CONNECT")
+        self.connect_label.setObjectName("zrotateHeaderChip")
+        self.connect_label.setAlignment(Qt.AlignCenter)
+        self.connect_label.setFixedWidth(104)
+        self.connect_label.setFixedHeight(22)
+        stats_layout.addWidget(self.connect_label)
+
+        self.ip_label = QLabel("IP")
+        self.ip_label.setObjectName("zrotateHeaderChip")
+        self.ip_label.setAlignment(Qt.AlignCenter)
+        self.ip_label.setFixedWidth(102)
+        self.ip_label.setFixedHeight(22)
+        stats_layout.addWidget(self.ip_label)
+
+        layout.addWidget(self.stats_widget, 0, Qt.AlignCenter)
+
+        self.setStyleSheet(
+            """
+            QFrame#zrotateInterfacesHeaderRow {
+                background-color: rgba(30, 58, 138, 0.46);
+                border: 1px solid rgba(96, 165, 250, 0.55);
+                border-radius: 10px;
+            }
+            QLabel#zrotateHeaderName {
+                color: #bfdbfe;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QLabel#zrotateHeaderChip {
+                color: #e0f2fe;
+                background-color: rgba(37, 99, 235, 0.28);
+                border: 1px solid rgba(147, 197, 253, 0.55);
+                border-radius: 8px;
+                padding: 2px 8px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            """
+        )
+
+
 class ResetCallbackWrapper:
     """Wrapper pour permettre au quota_manager d'émettre un signal Qt pour le reset"""
 
@@ -3213,6 +3483,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._load_config()
+        self._start_playwright_browser_warmup()
 
         self.interface_manager.interfaces_updated.connect(self.on_interfaces_updated)
         self.interface_manager.public_ip_updated.connect(self.on_public_ip_updated)
@@ -3234,6 +3505,38 @@ class MainWindow(QMainWindow):
             if self.zrotate_selected_interfaces:
                 # Attendre un peu que les proxies soient prêts
                 QTimer.singleShot(2000, self._auto_start_zrotate)
+
+    def _start_playwright_browser_warmup(self):
+        """
+        Pré-initialise reset_modem (thread dédié + browser persistant) en arrière-plan.
+        Si indisponible, le premier reset fera le lazy init.
+        """
+
+        def _warmup():
+            try:
+                mod = importlib.import_module("reset_modem")
+                init_fn = getattr(mod, "initialize_browser_service", None)
+                if callable(init_fn):
+                    ports: list[int] = []
+                    for cfg in (self.config.get("interface_proxies", {}) or {}).values():
+                        try:
+                            p = int((cfg or {}).get("port", 0) or 0)
+                            if p > 0:
+                                ports.append(p)
+                        except Exception:
+                            continue
+                    ok = bool(init_fn(ports))
+                    if ok:
+                        if ports:
+                            print(
+                                f"[RESET] Browsers Playwright pré-initialisés pour ports: {sorted(set(ports))}"
+                            )
+                        else:
+                            print("[RESET] Service Playwright prêt (lazy init par port).")
+            except Exception as e:
+                print(f"[RESET] Warmup Playwright ignoré: {e}")
+
+        threading.Thread(target=_warmup, daemon=True).start()
 
     # --- UI ---
     def _build_ui(self):
@@ -3344,15 +3647,7 @@ class MainWindow(QMainWindow):
         zrotate_title.setObjectName("zrotateTitle")
         config_layout.addWidget(zrotate_title)
 
-        # URL du serveur
-        url_label = QLabel("URL du serveur:")
-        url_label.setObjectName("zrotateLabel")
-        config_layout.addWidget(url_label)
-
-        self.zrotate_url_edit = QLineEdit()
-        self.zrotate_url_edit.setPlaceholderText("http://127.0.0.1:9999")
-        self.zrotate_url_edit.setObjectName("zrotateUrlEdit")
-        config_layout.addWidget(self.zrotate_url_edit)
+        # URL du serveur : configurée via proxy_configs.json (zrotate.server_url)
 
         # Liste des interfaces à cocher
         interfaces_label = QLabel("Interfaces pour le pool d'IP:")
@@ -3713,10 +4008,10 @@ class MainWindow(QMainWindow):
         zrotate_cfg["max_requests_per_quota"] = _max_req
         zrotate_cfg.setdefault("quota_timeout_seconds", 60.0)
         zrotate_cfg.setdefault("close_haapi_tunnel_after_seconds", 0.0)
-        if "server_url" in zrotate_cfg:
-            self.zrotate_url_edit.setText(zrotate_cfg["server_url"])
-        else:
-            self.zrotate_url_edit.setText("http://127.0.0.1:9999")
+        self.zrotate_server_url = str(
+            zrotate_cfg.get("server_url", "http://127.0.0.1:9999")
+        ).strip() or "http://127.0.0.1:9999"
+        zrotate_cfg["server_url"] = self.zrotate_server_url
         if "selected_interfaces" in zrotate_cfg:
             self.zrotate_selected_interfaces = set(zrotate_cfg["selected_interfaces"])
         if "auto_start" in zrotate_cfg:
@@ -3744,7 +4039,9 @@ class MainWindow(QMainWindow):
                 _max_req = 2
             zrotate_cfg["max_requests_per_quota"] = _max_req
             zrotate_cfg.setdefault("quota_timeout_seconds", 60.0)
-            zrotate_cfg["server_url"] = self.zrotate_url_edit.text()
+            zrotate_cfg["server_url"] = getattr(
+                self, "zrotate_server_url", "http://127.0.0.1:9999"
+            )
             zrotate_cfg["selected_interfaces"] = list(self.zrotate_selected_interfaces)
             zrotate_cfg["running"] = self.zrotate_running
             zrotate_cfg["auto_start"] = (
@@ -3994,12 +4291,8 @@ class MainWindow(QMainWindow):
                 f"[RESET] 🚀 Lancement {script_path.name} pour '{name}' (port {proxy_port})"
             )
             try:
-                python_exe = get_python_executable()
-                result = subprocess.run(
-                    [python_exe, str(script_path), str(proxy_port)],
-                    timeout=120,
-                )
-                self.reset_completed.emit(name, result.returncode)
+                return_code = run_reset_script(script_path, proxy_port, 120)
+                self.reset_completed.emit(name, return_code)
             except subprocess.TimeoutExpired:
                 self.reset_completed.emit(name, -2)
             except Exception as e:
@@ -4247,21 +4540,22 @@ class MainWindow(QMainWindow):
     # --- ZRotate ---
     def _update_zrotate_interfaces_list(self):
         """Met à jour la liste des interfaces dans le panel ZRotate"""
-        # Sauvegarder l'état actuel des checkboxes avant la mise à jour
+        header_item = getattr(self, "_zrotate_header_item", None)
+        header_widget = getattr(self, "_zrotate_header_widget", None)
+        if header_item is None or header_widget is None:
+            header_item = QListWidgetItem()
+            header_widget = ZRotateInterfacesHeaderRow()
+            self.zrotate_interfaces_list.insertItem(0, header_item)
+            self.zrotate_interfaces_list.setItemWidget(header_item, header_widget)
+            header_item.setSizeHint(header_widget.sizeHint())
+            self._zrotate_header_item = header_item
+            self._zrotate_header_widget = header_widget
+
+        # Sauvegarder l'état actuel des lignes avant la mise à jour
         current_selections = set()
-        for row in range(self.zrotate_interfaces_list.count()):
-            item = self.zrotate_interfaces_list.item(row)
-            if item:
-                widget = self.zrotate_interfaces_list.itemWidget(item)
-                if isinstance(widget, QCheckBox):
-                    if widget.checkState() == Qt.Checked:
-                        # Extraire le nom de l'interface depuis le texte (format: "nom (ip)" ou "nom (-)")
-                        text = widget.text()
-                        if " (" in text:
-                            iface_name = text.split(" (")[0]
-                        else:
-                            iface_name = text
-                        current_selections.add(iface_name)
+        for row_widget in getattr(self, "_zrotate_interface_rows", {}).values():
+            if isinstance(row_widget, ZRotateInterfaceRow) and row_widget.is_checked():
+                current_selections.add(row_widget.interface_name)
 
         # Fusionner les sélections actuelles avec celles sauvegardées (union au lieu d'intersection)
         # pour préserver toutes les sélections, y compris celles qui viennent d'être cochées
@@ -4275,51 +4569,72 @@ class MainWindow(QMainWindow):
         }
         self.zrotate_selected_interfaces &= available_interfaces
 
-        # Bloquer les signaux pendant la mise à jour pour éviter les appels multiples
-        self.zrotate_interfaces_list.blockSignals(True)
-        self.zrotate_interfaces_list.clear()
-        self._zrotate_interface_checkboxes = {}
-        self._zrotate_interface_base_text = {}
-        self._zrotate_last_quota_text = {}
+        rows = getattr(self, "_zrotate_interface_rows", None)
+        row_items = getattr(self, "_zrotate_interface_items", None)
+        if rows is None:
+            self._zrotate_interface_rows = {}
+            rows = self._zrotate_interface_rows
+        if row_items is None:
+            self._zrotate_interface_items = {}
+            row_items = self._zrotate_interface_items
 
+        visible_infos = []
         for name, info in sorted(self.interface_manager.interfaces.items()):
             if not info.is_up or not info.local_ip:
                 continue
+            visible_infos.append((name, info))
 
-            item = QListWidgetItem()
-            checkbox = QCheckBox(name)
-            checkbox.setObjectName("zrotateInterfaceCheckbox")
+        visible_names = {name for name, _ in visible_infos}
 
-            # Restaurer l'état de sélection depuis self.zrotate_selected_interfaces
-            if name in self.zrotate_selected_interfaces:
-                checkbox.setCheckState(Qt.Checked)
+        for old_name in list(rows.keys()):
+            if old_name in visible_names:
+                continue
+            old_item = row_items.get(old_name)
+            if old_item is not None:
+                old_row = self.zrotate_interfaces_list.row(old_item)
+                if old_row >= 0:
+                    self.zrotate_interfaces_list.takeItem(old_row)
+            old_widget = rows.pop(old_name, None)
+            if old_widget is not None:
+                old_widget.deleteLater()
+            row_items.pop(old_name, None)
+
+        for name, info in visible_infos:
+            public_ip = info.public_ip or "-"
+            row_widget = rows.get(name)
+            if row_widget is None:
+                item = QListWidgetItem()
+                row_widget = ZRotateInterfaceRow(name, public_ip)
+                row_widget.set_checked(name in self.zrotate_selected_interfaces)
+                row_widget.toggled.connect(self._on_zrotate_interface_toggled)
+                self.zrotate_interfaces_list.addItem(item)
+                self.zrotate_interfaces_list.setItemWidget(item, row_widget)
+                item.setSizeHint(row_widget.sizeHint())
+                rows[name] = row_widget
+                row_items[name] = item
             else:
-                checkbox.setCheckState(Qt.Unchecked)
+                row_widget.set_public_ip(public_ip)
+                row_widget.set_checked(name in self.zrotate_selected_interfaces)
 
-            checkbox.stateChanged.connect(
-                lambda state, iface=name: self._on_zrotate_interface_toggled(
-                    iface, state
-                )
-            )
-
-            # Base text (nom + IP) pour mise à jour des stats GET/CONNECT plus tard
-            if info.public_ip:
-                base_text = f"{name} ({info.public_ip})"
-            else:
-                base_text = f"{name} (-)"
-            checkbox.setText(base_text)
-            self._zrotate_interface_checkboxes[name] = checkbox
-            self._zrotate_interface_base_text[name] = base_text
-
-            self.zrotate_interfaces_list.addItem(item)
-            self.zrotate_interfaces_list.setItemWidget(item, checkbox)
-
-        # Réactiver les signaux
-        self.zrotate_interfaces_list.blockSignals(False)
+        for target_index, (name, _info) in enumerate(visible_infos):
+            target_index += 1  # index 0 réservé à l'en-tête fixe
+            item = row_items.get(name)
+            if item is None:
+                continue
+            current_index = self.zrotate_interfaces_list.row(item)
+            if current_index == target_index:
+                continue
+            moved_item = self.zrotate_interfaces_list.takeItem(current_index)
+            self.zrotate_interfaces_list.insertItem(target_index, moved_item)
+            self.zrotate_interfaces_list.setItemWidget(target_index, rows[name])
+            moved_item.setSizeHint(rows[name].sizeHint())
 
     def _on_zrotate_interface_toggled(self, interface_name: str, state: int):
         """Gère le changement d'état d'une checkbox d'interface"""
         self._mark_user_interaction()  # Marquer l'interaction pour éviter les mises à jour pendant la sélection
+        row_widget = getattr(self, "_zrotate_interface_rows", {}).get(interface_name)
+        if isinstance(row_widget, ZRotateInterfaceRow):
+            row_widget._apply_checked_visual_state()
         if state == Qt.Checked:
             self.zrotate_selected_interfaces.add(interface_name)
         else:
@@ -4353,28 +4668,19 @@ class MainWindow(QMainWindow):
         self.zrotate_stats_label.setText(text)
 
     def _on_quota_stats_updated(self, stats: dict):
-        """Met à jour le texte des interfaces ZRotate avec GET x/max, CONNECT y/max.
-        On ne met à jour que si les valeurs ont changé pour éviter le clignotement."""
-        checkboxes = getattr(self, "_zrotate_interface_checkboxes", None)
-        base_texts = getattr(self, "_zrotate_interface_base_text", None)
-        last_texts = getattr(self, "_zrotate_last_quota_text", None)
-        if not checkboxes or not base_texts:
+        """Met à jour les badges GET/CONNECT sans recréer la liste."""
+        rows = getattr(self, "_zrotate_interface_rows", None)
+        if not rows:
             return
-        if last_texts is None:
-            self._zrotate_last_quota_text = {}
-            last_texts = self._zrotate_last_quota_text
         for name, data in stats.items():
-            cb = checkboxes.get(name)
-            if cb is None:
+            row_widget = rows.get(name)
+            if row_widget is None:
                 continue
-            base = base_texts.get(name, name)
+            if not row_widget.is_checked():
+                continue
             g_used, g_max = data.get("get", (0, 2))
             c_used, c_max = data.get("connect", (0, 2))
-            new_text = f"{base} — GET {g_used}/{g_max}, CONNECT {c_used}/{c_max}"
-            if last_texts.get(name) == new_text:
-                continue
-            last_texts[name] = new_text
-            cb.setText(new_text)
+            row_widget.set_quota_values(g_used, g_max, c_used, c_max)
 
     def _zrotate_log(self, message: str):
         """Ajoute un message dans la console ZRotate"""
@@ -4435,21 +4741,11 @@ class MainWindow(QMainWindow):
                 self.zrotate_proxy_server.wait(3000)
             self.zrotate_proxy_server = None
 
-        # Lire directement depuis les checkboxes pour avoir l'état actuel
+        # Lire directement depuis les lignes ZRotate pour avoir l'état actuel
         selected_interfaces = set()
-        for row in range(self.zrotate_interfaces_list.count()):
-            item = self.zrotate_interfaces_list.item(row)
-            if item:
-                widget = self.zrotate_interfaces_list.itemWidget(item)
-                if isinstance(widget, QCheckBox):
-                    if widget.checkState() == Qt.Checked:
-                        # Extraire le nom de l'interface depuis le texte
-                        text = widget.text()
-                        if " (" in text:
-                            iface_name = text.split(" (")[0]
-                        else:
-                            iface_name = text
-                        selected_interfaces.add(iface_name)
+        for row_widget in getattr(self, "_zrotate_interface_rows", {}).values():
+            if isinstance(row_widget, ZRotateInterfaceRow) and row_widget.is_checked():
+                selected_interfaces.add(row_widget.interface_name)
 
         # Mettre à jour self.zrotate_selected_interfaces avec les sélections actuelles
         self.zrotate_selected_interfaces = selected_interfaces
@@ -4521,10 +4817,15 @@ class MainWindow(QMainWindow):
                 + ", ".join(missing_ips)
             )
 
-        # Parser l'URL du serveur
-        url_text = self.zrotate_url_edit.text().strip()
+        # Parser l'URL du serveur (source unique: proxy_configs.json -> zrotate.server_url)
+        url_text = str(
+            self.config.get("zrotate", {}).get(
+                "server_url", getattr(self, "zrotate_server_url", "http://127.0.0.1:9999")
+            )
+        ).strip()
         if not url_text:
             url_text = "http://127.0.0.1:9999"
+        self.zrotate_server_url = url_text
 
         try:
             from urllib.parse import urlparse
@@ -4685,6 +4986,7 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     try:
+        ensure_local_build_id_file()
         app = QApplication(sys.argv)
         app.setWindowIcon(QIcon("Z icon.ico"))
         app.setStyle("Fusion")

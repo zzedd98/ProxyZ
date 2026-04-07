@@ -153,6 +153,15 @@ def _read_local_build_id(target_exe: str) -> str:
     return ""
 
 
+def _write_local_build_id(target_exe: str, build_id: str) -> None:
+    if not build_id:
+        return
+    d = os.path.dirname(os.path.abspath(target_exe))
+    p = os.path.join(d, "version.txt")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(build_id.strip() + "\n")
+
+
 def _manifest_url_from_repo(repo: str) -> str:
     r = (repo or "").strip().strip("/")
     if not r:
@@ -501,12 +510,10 @@ class UpdaterApp:
             return
 
         if not self.local_build_id:
-            self.lbl_title.configure(text="Verification impossible")
-            self._set_body("Version locale introuvable.")
-            self.btn_install.set_text("FERMER")
-            self.btn_install.set_command(self.root.destroy)
-            self.btn_install.set_palette("#334155", "#475569")
-            self.btn_install.set_enabled(True)
+            # Premiere installation legacy sans metadata locale:
+            # on propose quand meme la mise a jour au lieu de bloquer.
+            self._show_update_available_ui()
+            self._set_body("Version locale introuvable. UPDATE recommande.")
             return
 
         if self.local_build_id == self.remote_build_id:
@@ -589,6 +596,12 @@ class UpdaterApp:
                         self.lbl_progress.configure(text="Installation...")
                         self.root.update_idletasks()
                         _replace_exe(self.target_exe, tmp_dl)
+                        try:
+                            _write_local_build_id(
+                                self.target_exe, self.remote_build_id
+                            )
+                        except Exception:
+                            pass
                         self.lbl_title.configure(text="Mise a jour terminee")
                         self._set_body("Mise a jour terminee. Relance manuelle de ProxyZ.")
                         self.lbl_progress.configure(text="")

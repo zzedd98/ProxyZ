@@ -49,7 +49,6 @@ jobs:
         run: >
           pyinstaller --noconfirm --onefile --windowed
           --icon "Z icon.ico"
-          --uac-admin
           --add-data "version.txt;."
           --name ProxyZ
           "ProxyZ.py"
