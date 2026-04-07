@@ -165,15 +165,22 @@ def _load_reset_modem_functions(script_path: Path):
     ):
         return _RESET_MODEM_FUNC, _RESET_MODEM_INIT_FUNC
 
-    if not script_path.exists():
-        raise FileNotFoundError(f"Script reset introuvable: {script_path}")
-
-    module_name = f"_proxyz_reset_modem_{abs(hash(resolved))}"
-    spec = importlib.util.spec_from_file_location(module_name, resolved)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Impossible de charger le module reset: {resolved}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = None
+    if script_path.exists():
+        module_name = f"_proxyz_reset_modem_{abs(hash(resolved))}"
+        spec = importlib.util.spec_from_file_location(module_name, resolved)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Impossible de charger le module reset: {resolved}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    else:
+        # En mode PyInstaller, reset_modem peut etre embarque dans l'executable
+        # et ne pas exister en fichier a cote.
+        try:
+            module = importlib.import_module("reset_modem")
+            resolved = "<embedded reset_modem>"
+        except Exception as e:
+            raise FileNotFoundError(f"Script reset introuvable: {script_path}") from e
 
     reset_func = getattr(module, "reset_modem_by_port", None)
     if not callable(reset_func):
@@ -188,7 +195,11 @@ def _load_reset_modem_functions(script_path: Path):
     return _RESET_MODEM_FUNC, _RESET_MODEM_INIT_FUNC
 
 
-def run_reset_script(script_path: Path, proxy_port: int, timeout_seconds: int = 120) -> int:
+def run_reset_script(
+    script_path: Path,
+    proxy_port: int,
+    timeout_seconds: int = 120,
+) -> int:
     """
     Exécute un reset:
     - `reset_modem.py` est appelé en-process (browser persistant réutilisable).
@@ -1320,12 +1331,14 @@ class InterfaceQuotaManager:
                 f"[QUOTA] 🔄 Reset direct de {interface_name} (port {proxy_port})..."
             )
 
-            if script_path.exists():
+            reset_ok = False
+            if script_path.exists() or script_path.name.lower() == "reset_modem.py":
                 result = await asyncio.to_thread(
                     run_reset_script, script_path, proxy_port, 120
                 )
 
                 if result == 0:
+                    reset_ok = True
                     logger.info(f"[QUOTA] ✅ Reset réussi pour {interface_name}")
                 else:
                     logger.warning(
@@ -1335,14 +1348,14 @@ class InterfaceQuotaManager:
                 logger.error(f"[QUOTA] ❌ Script reset introuvable: {script_path}")
 
             # Réinitialiser tous les quotas et remettre l'interface disponible
-            await self._release_interface_after_reset(interface_name)
+            await self._release_interface_after_reset(interface_name, reset_ok)
 
         except Exception as e:
             logger.error(f"[QUOTA] ❌ Erreur lors du reset de {interface_name}: {e}")
             import traceback
 
             logger.error(traceback.format_exc())
-            await self._release_interface_after_reset(interface_name)
+            await self._release_interface_after_reset(interface_name, False)
 
     async def get_quota_stats(self) -> dict:
         """
@@ -1380,11 +1393,15 @@ class InterfaceQuotaManager:
                 }
             return result
 
-    async def release_interface_after_reset(self, interface_name: str):
+    async def release_interface_after_reset(
+        self, interface_name: str, reset_succeeded: bool = True
+    ):
         """Remet une interface en disponibilité après reset (appelé depuis ProxyZ)"""
-        await self._release_interface_after_reset(interface_name)
+        await self._release_interface_after_reset(interface_name, reset_succeeded)
 
-    async def _release_interface_after_reset(self, interface_name: str):
+    async def _release_interface_after_reset(
+        self, interface_name: str, reset_succeeded: bool = True
+    ):
         """Remet une interface en disponibilité après reset (manuel ou ZRotate) et réinitialise tous ses quotas."""
         async with self._lock:
             # Réinitialiser tous les quotas de l'interface (CONNECT game_server, GET, etc.)
@@ -1404,15 +1421,20 @@ class InterfaceQuotaManager:
             if interface_name in self._pending_gets:
                 self._pending_gets[interface_name] = 0
 
-            # Log de succès avec les nouveaux quotas (toujours 0/max après reset)
-            if new_quotas_str:
-                logger.info(
-                    f"[QUOTA] ✅ Reset réussi pour {interface_name} - "
-                    f"Nouveaux quotas: {', '.join(new_quotas_str)}"
-                )
+            # Log cohérent avec l'issue réelle du reset.
+            if reset_succeeded:
+                if new_quotas_str:
+                    logger.info(
+                        f"[QUOTA] ✅ Reset réussi pour {interface_name} - "
+                        f"Nouveaux quotas: {', '.join(new_quotas_str)}"
+                    )
+                else:
+                    logger.info(
+                        f"[QUOTA] ✅ Reset réussi pour {interface_name} - Aucun quota à réinitialiser (déjà à zéro)"
+                    )
             else:
-                logger.info(
-                    f"[QUOTA] ✅ Reset réussi pour {interface_name} - Aucun quota à réinitialiser (déjà à zéro)"
+                logger.warning(
+                    f"[QUOTA] ⚠️ Reset échoué pour {interface_name} - quotas remis à zéro pour éviter le blocage du pool"
                 )
 
             # Retirer de la liste des interfaces en reset
@@ -4231,7 +4253,7 @@ class MainWindow(QMainWindow):
         if widget:
             widget.set_reset_badge_in_use(in_use)
 
-    def _release_interface_to_zrotate(self, name: str):
+    def _release_interface_to_zrotate(self, name: str, reset_succeeded: bool):
         """Remet une interface en disponibilité dans ZRotate (succès ou échec)."""
         if self.zrotate_proxy_server and getattr(
             self.zrotate_proxy_server, "proxy_server", None
@@ -4241,7 +4263,7 @@ class MainWindow(QMainWindow):
             if qm and loop and loop.is_running():
                 try:
                     asyncio.run_coroutine_threadsafe(
-                        qm.release_interface_after_reset(name),
+                        qm.release_interface_after_reset(name, reset_succeeded),
                         loop,
                     )
                 except Exception as e:
@@ -4277,7 +4299,7 @@ class MainWindow(QMainWindow):
             )
 
         try:
-            self._release_interface_to_zrotate(name)
+            self._release_interface_to_zrotate(name, returncode == 0)
         except Exception as e:
             print(f"[RESET] ⚠️ Erreur release ZRotate: {e}")
         # Un seul refresh 2s après le dernier reset (évite 6 refresh en rafale)
@@ -4334,19 +4356,24 @@ class MainWindow(QMainWindow):
         )
 
         def run_reset():
-            if not script_path.exists():
+            is_reset_modem = script_path.name.lower() == "reset_modem.py"
+            if not script_path.exists() and not is_reset_modem:
                 self.reset_completed.emit(name, -1)
                 return
             print(
                 f"[RESET] 🚀 Lancement {script_path.name} pour '{name}' (port {proxy_port})"
             )
             try:
-                return_code = run_reset_script(script_path, proxy_port, 120)
+                return_code = run_reset_script(
+                    script_path,
+                    proxy_port,
+                    120,
+                )
                 self.reset_completed.emit(name, return_code)
             except subprocess.TimeoutExpired:
                 self.reset_completed.emit(name, -2)
             except Exception as e:
-                print(f"[RESET] 💥 Exception: {e}")
+                print(f"[RESET] 💥 Exception reset '{name}' (port {proxy_port}): {e}")
                 traceback.print_exc()
                 self.reset_completed.emit(name, -3)
 

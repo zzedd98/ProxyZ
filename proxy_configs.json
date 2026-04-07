@@ -86,12 +86,12 @@
     "quota_timeout_seconds": 60.0,
     "server_url": "http://127.0.0.1:9999",
     "selected_interfaces": [
-      "Cl\u00e9 103",
-      "Cl\u00e9 104",
+      "Cl\u00e9 102 bis",
       "Cl\u00e9 101",
-      "Cl\u00e9 102 bis"
+      "Cl\u00e9 103",
+      "Cl\u00e9 104"
     ],
-    "running": true,
+    "running": false,
     "auto_start": true,
     "close_haapi_tunnel_after_seconds": 0.0
   }
