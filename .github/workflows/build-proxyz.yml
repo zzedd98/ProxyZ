@@ -1,0 +1,88 @@
+name: Build ProxyZ
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "ProxyZ.py"
+      - "ProxyZUpdater.py"
+      - "reset_modem.py"
+      - "proxy_configs.json"
+      - "Z icon.ico"
+      - ".github/workflows/build-proxyz.yml"
+
+concurrency:
+  group: build-proxyz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/workflows/build-proxyz.yml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install pyinstaller "PySide6>=6.6" psutil "httpx>=0.27"
+
+      - name: Write version.txt
+        shell: pwsh
+        run: |
+          $id = "${{ github.run_id }}-${{ github.sha }}"
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          [System.IO.File]::WriteAllText("$pwd/version.txt", $id.Trim(), $utf8NoBom)
+
+      - name: Build ProxyZ.exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed
+          --icon "Z icon.ico"
+          --uac-admin
+          --add-data "version.txt;."
+          --name ProxyZ
+          "ProxyZ.py"
+
+      - name: Build ProxyZUpdater.exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed
+          --name ProxyZUpdater
+          "ProxyZUpdater.py"
+
+      - name: Write update-manifest.json
+        shell: pwsh
+        run: |
+          $bid = (Get-Content -Path "version.txt" -Raw).Trim()
+          $repo = "${{ github.repository }}"
+          $downloadUrl = "https://github.com/$repo/releases/latest/download/ProxyZ.exe"
+          $obj = [ordered]@{ build_id = $bid; download_url = $downloadUrl }
+          $json = $obj | ConvertTo-Json -Compress
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          [System.IO.File]::WriteAllText("$pwd/update-manifest.json", $json, $utf8NoBom)
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_id }}
+          name: "Build ${{ github.run_id }}"
+          body: |
+            Build declenche par le push sur `${{ github.ref_name }}`.
+            - Identifiant de build : `${{ github.run_id }}-${{ github.sha }}` (voir `update-manifest.json`, champ `build_id`).
+            - Telechargement direct : [ProxyZ.exe](https://github.com/${{ github.repository }}/releases/download/build-${{ github.run_id }}/ProxyZ.exe)
+          files: |
+            dist/ProxyZ.exe
+            dist/ProxyZUpdater.exe
+            update-manifest.json
+          fail_on_unmatched_files: true
+          make_latest: true

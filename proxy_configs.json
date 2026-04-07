@@ -1,0 +1,98 @@
+{
+  "reset_script_default": "reset_modem.py",
+  "interface_proxies": {
+    "Cl\u00e9 1": {
+      "port": 107,
+      "enabled": false
+    },
+    "Cl\u00e9 2": {
+      "port": 102,
+      "enabled": true
+    },
+    "Cl\u00e9 3": {
+      "port": 103,
+      "enabled": true
+    },
+    "Cl\u00e9 4": {
+      "port": 104,
+      "enabled": true
+    },
+    "Cl\u00e9 5": {
+      "port": 105,
+      "enabled": true
+    },
+    "Cl\u00e9 6": {
+      "port": 106,
+      "enabled": true
+    },
+    "R\u00e9si": {
+      "port": 80,
+      "enabled": false
+    },
+    "Fibre Perso": {
+      "port": 90,
+      "enabled": false
+    },
+    "Cl\u00e9 Banques": {
+      "port": 107,
+      "enabled": false
+    },
+    "Cl\u00e9 3 bis": {
+      "port": 103,
+      "enabled": true
+    },
+    "Cl\u00e9 101": {
+      "port": 101,
+      "enabled": true
+    },
+    "Cl\u00e9 102": {
+      "port": 102,
+      "enabled": true
+    },
+    "Ethernet Darna": {
+      "port": 100,
+      "enabled": true
+    },
+    "Ethernet 4G": {
+      "port": 90,
+      "enabled": true
+    },
+    "Cl\u00e9 102 bis": {
+      "port": 102,
+      "enabled": true
+    },
+    "Cl\u00e9 103": {
+      "port": 103,
+      "enabled": true
+    },
+    "Cl\u00e9 104": {
+      "port": 104,
+      "enabled": true
+    },
+    "Ethernet": {
+      "port": 102,
+      "enabled": true
+    }
+  },
+  "ui": {
+    "last_window_size": [
+      1234,
+      944
+    ]
+  },
+  "interface_aliases": {},
+  "zrotate": {
+    "max_requests_per_quota": 2,
+    "quota_timeout_seconds": 60.0,
+    "server_url": "http://127.0.0.1:9999",
+    "selected_interfaces": [
+      "Cl\u00e9 102",
+      "Cl\u00e9 101",
+      "Cl\u00e9 103",
+      "Cl\u00e9 104"
+    ],
+    "running": false,
+    "auto_start": true,
+    "close_haapi_tunnel_after_seconds": 0.0
+  }
+}
