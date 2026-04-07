@@ -87,9 +87,9 @@
     "server_url": "http://127.0.0.1:9999",
     "selected_interfaces": [
       "Cl\u00e9 102 bis",
+      "Cl\u00e9 103",
       "Cl\u00e9 101",
-      "Cl\u00e9 104",
-      "Cl\u00e9 103"
+      "Cl\u00e9 104"
     ],
     "running": false,
     "auto_start": true,
