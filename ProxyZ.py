@@ -4,6 +4,7 @@ import math
 import logging
 import importlib
 import importlib.util
+import contextlib
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
@@ -151,6 +152,32 @@ _RESET_MODEM_INIT_FUNC = None
 _RESET_MODEM_LOADED_FROM: str | None = None
 
 
+class _LineForwarder:
+    """Redirige stdout/stderr vers un callback ligne par ligne."""
+
+    def __init__(self, callback):
+        self._callback = callback
+        self._buf = ""
+
+    def write(self, data):
+        if not data:
+            return 0
+        self._buf += str(data)
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.rstrip("\r")
+            if line and self._callback:
+                self._callback(line)
+        return len(data)
+
+    def flush(self):
+        if self._buf:
+            line = self._buf.rstrip("\r")
+            self._buf = ""
+            if line and self._callback:
+                self._callback(line)
+
+
 def _load_reset_modem_functions(script_path: Path):
     """
     Charge reset_modem.py depuis son chemin absolu.
@@ -195,10 +222,64 @@ def _load_reset_modem_functions(script_path: Path):
     return _RESET_MODEM_FUNC, _RESET_MODEM_INIT_FUNC
 
 
+def _pick_system_python_for_reset() -> str:
+    """Trouve un interpréteur Python système utilisable pour reset_modem.py."""
+    candidates = [
+        shutil.which("python"),
+        shutil.which("python3"),
+        shutil.which("py"),
+    ]
+    for exe in candidates:
+        if exe:
+            return exe
+    return ""
+
+
+def _ensure_playwright_runtime(python_exe: str, log_fn=None) -> bool:
+    """Installe playwright + chromium si nécessaire pour un Python système."""
+    if not python_exe:
+        return False
+
+    def _log(msg: str):
+        if log_fn:
+            log_fn(msg)
+
+    def _run(cmd: list[str], timeout_s: int) -> bool:
+        try:
+            p = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if p.returncode != 0:
+                _log(f"[RESET] ⚠️ Commande échouée: {' '.join(cmd)}")
+                if p.stderr.strip():
+                    _log(f"[RESET] stderr: {p.stderr.strip()[:220]}")
+                return False
+            return True
+        except Exception as e:
+            _log(f"[RESET] ⚠️ Erreur commande {' '.join(cmd)}: {e}")
+            return False
+
+    # Vérifie si playwright est déjà dispo
+    if _run([python_exe, "-c", "import playwright"], 25):
+        return True
+
+    _log("[RESET] Playwright manquant, installation automatique en cours...")
+    if not _run([python_exe, "-m", "pip", "install", "-U", "playwright"], 600):
+        return False
+    if not _run([python_exe, "-m", "playwright", "install", "chromium"], 900):
+        return False
+    return _run([python_exe, "-c", "import playwright"], 25)
+
+
 def run_reset_script(
     script_path: Path,
     proxy_port: int,
     timeout_seconds: int = 120,
+    log_fn=None,
 ) -> int:
     """
     Exécute un reset:
@@ -206,12 +287,66 @@ def run_reset_script(
     - autres scripts Python restent en subprocess.
     Retourne un code process-like (0 succès, 1 échec).
     """
+    # En mode .exe, on préfère un exécutable Python système pour reset_modem.py
+    # afin de permettre l'auto-install dynamique de Playwright.
+    if script_path.name.lower() == "reset_modem.py" and getattr(sys, "frozen", False):
+        if script_path.exists():
+            py = _pick_system_python_for_reset()
+            if py and _ensure_playwright_runtime(py, log_fn=log_fn):
+                cmd = [py, str(script_path), str(proxy_port)]
+                if log_fn:
+                    log_fn(
+                        f"[RESET] frozen fallback subprocess: {' '.join(cmd)} | cwd={str(get_app_dir())}"
+                    )
+                result = subprocess.run(
+                    cmd,
+                    timeout=timeout_seconds,
+                    cwd=str(get_app_dir()),
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                return result.returncode
+            if log_fn:
+                log_fn(
+                    "[RESET] ⚠️ Python système introuvable ou installation Playwright impossible."
+                )
+
     if script_path.name.lower() == "reset_modem.py":
-        reset_func, _ = _load_reset_modem_functions(script_path)
-        ok = bool(reset_func(proxy_port))
+        try:
+            reset_func, _ = _load_reset_modem_functions(script_path)
+        except ModuleNotFoundError as e:
+            # Fallback si import playwright échoue dans le runtime embarqué.
+            if "playwright" in str(e).lower() and script_path.exists():
+                py = _pick_system_python_for_reset()
+                if py and _ensure_playwright_runtime(py, log_fn=log_fn):
+                    cmd = [py, str(script_path), str(proxy_port)]
+                    if log_fn:
+                        log_fn(
+                            f"[RESET] fallback playwright subprocess: {' '.join(cmd)} | cwd={str(get_app_dir())}"
+                        )
+                    result = subprocess.run(
+                        cmd,
+                        timeout=timeout_seconds,
+                        cwd=str(get_app_dir()),
+                        creationflags=CREATE_NO_WINDOW,
+                    )
+                    return result.returncode
+            raise
+        if log_fn:
+            src = _RESET_MODEM_LOADED_FROM or str(script_path)
+            log_fn(
+                f"[RESET] runtime: frozen={getattr(sys, 'frozen', False)} | source reset_modem={src}"
+            )
+        out = _LineForwarder(log_fn) if log_fn else None
+        if out:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                ok = bool(reset_func(proxy_port))
+        else:
+            ok = bool(reset_func(proxy_port))
         return 0 if ok else 1
 
     cmd = build_reset_command(script_path, proxy_port)
+    if log_fn:
+        log_fn(f"[RESET] subprocess: {' '.join(cmd)} | cwd={str(get_app_dir())}")
     result = subprocess.run(
         cmd,
         timeout=timeout_seconds,
@@ -3506,6 +3641,7 @@ class MainWindow(QMainWindow):
     # Si absent, défaut = "reset_modem.py". Les chemins relatifs sont résolus depuis le dossier de l'exe/script.
     # Signal émis par le thread de reset vers le thread Qt principal (name, returncode: 0=ok, -1=script absent, -2=timeout, autre=échec)
     reset_completed = Signal(str, int)
+    reset_log = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -3560,6 +3696,7 @@ class MainWindow(QMainWindow):
         )
         # Connexion du signal reset_completed pour arrêter l'animation après un reset
         self.reset_completed.connect(self._on_reset_completed)
+        self.reset_log.connect(self._on_reset_log)
 
         # Première sync
         self.on_interfaces_updated(list(self.interface_manager.interfaces.values()))
@@ -4306,6 +4443,14 @@ class MainWindow(QMainWindow):
         self._refresh_after_reset_timer.start(2000)
 
     @Slot(str)
+    def _on_reset_log(self, message: str):
+        """Affiche les logs reset dans la console ZRotate (utile en .exe sans console)."""
+        try:
+            self._zrotate_log(message)
+        except Exception:
+            pass
+
+    @Slot(str)
     def on_interface_reset_requested(self, name: str):
         """Reset manuel ou ZRotate : un thread par interface, en parallèle."""
         if name in self._reset_in_progress:
@@ -4360,20 +4505,33 @@ class MainWindow(QMainWindow):
             if not script_path.exists() and not is_reset_modem:
                 self.reset_completed.emit(name, -1)
                 return
-            print(
+
+            def ui_log(msg: str):
+                self.reset_log.emit(msg)
+
+            ui_log(
                 f"[RESET] 🚀 Lancement {script_path.name} pour '{name}' (port {proxy_port})"
             )
             try:
+                t0 = time.time()
                 return_code = run_reset_script(
                     script_path,
                     proxy_port,
                     120,
+                    log_fn=ui_log,
+                )
+                elapsed = time.time() - t0
+                ui_log(
+                    f"[RESET] ⏱️ Fin reset '{name}' (port {proxy_port}) en {elapsed:.1f}s, code={return_code}"
                 )
                 self.reset_completed.emit(name, return_code)
             except subprocess.TimeoutExpired:
+                ui_log(
+                    f"[RESET] ⏱️ Timeout reset '{name}' (port {proxy_port}) après 120s"
+                )
                 self.reset_completed.emit(name, -2)
             except Exception as e:
-                print(f"[RESET] 💥 Exception reset '{name}' (port {proxy_port}): {e}")
+                ui_log(f"[RESET] 💥 Exception reset '{name}' (port {proxy_port}): {e}")
                 traceback.print_exc()
                 self.reset_completed.emit(name, -3)
 
