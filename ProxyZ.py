@@ -1227,14 +1227,29 @@ class InterfaceQuotaManager:
                         (used, interface_info, quota_info, interface_name)
                     )
 
-            # Trier par charge croissante (celles avec le moins de requêtes utilisées en premier)
-            candidates.sort(key=lambda x: x[0])
+            # Stratégie de sélection :
+            # - CONNECT game server : prioriser les quotas déjà avancés (1/2 avant 0/2)
+            #   pour atteindre 2/2 plus vite et déclencher le reset plus tôt.
+            # - Autres requêtes importantes : conserver la distribution équilibrée (charge croissante).
+            if request_type == "CONNECT" and domain_key == GAME_SERVER_QUOTA_KEY:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                selection_reason = "priorité quota CONNECT avancé"
+                candidates_debug = ", ".join(
+                    f"{name}:{used}/{quota.max_requests}"
+                    for used, _info, quota, name in candidates
+                )
+                logger.info(
+                    f"[QUOTA] 📊 Ordre candidates CONNECT {domain_key} (priorité 1/2 puis 0/2): {candidates_debug}"
+                )
+            else:
+                candidates.sort(key=lambda x: x[0])
+                selection_reason = "priorité charge"
 
             if candidates:
                 _total_used, interface_info, quota_info, interface_name = candidates[0]
                 quota_info.start_request()
                 logger.info(
-                    f"[QUOTA] 🚀 {interface_name}: Démarrage {request_type} {domain_key} → Temporaire: {quota_info.temporary_requests}, Complétée: {quota_info.completed_requests}/{quota_info.max_requests} (priorité charge)"
+                    f"[QUOTA] 🚀 {interface_name}: Démarrage {request_type} {domain_key} → Temporaire: {quota_info.temporary_requests}, Complétée: {quota_info.completed_requests}/{quota_info.max_requests} ({selection_reason})"
                 )
 
                 self._active_connections[connection_id] = {

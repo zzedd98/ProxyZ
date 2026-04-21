@@ -51,7 +51,7 @@
     },
     "Ethernet Darna": {
       "port": 100,
-      "enabled": true
+      "enabled": false
     },
     "Ethernet 4G": {
       "port": 90,
@@ -72,6 +72,10 @@
     "Ethernet": {
       "port": 102,
       "enabled": true
+    },
+    "Ethernet Maison": {
+      "port": 100,
+      "enabled": true
     }
   },
   "ui": {
@@ -86,10 +90,10 @@
     "quota_timeout_seconds": 60.0,
     "server_url": "http://127.0.0.1:9999",
     "selected_interfaces": [
+      "Cl\u00e9 102",
       "Cl\u00e9 101",
-      "Cl\u00e9 103",
-      "Cl\u00e9 102 bis",
-      "Cl\u00e9 104"
+      "Cl\u00e9 104",
+      "Cl\u00e9 103"
     ],
     "running": false,
     "auto_start": true,
