@@ -889,6 +889,9 @@ class QuotaInfo:
 GAME_SERVER_QUOTA_KEY = "game_server"  # CONNECT vers IP (x.x.x.x)
 GET_QUOTA_KEY = "get"  # GET (ex. ipinfo.io/ip) : 2 max par interface
 
+# Après N échecs consécutifs du script de reset : quarantaine (plus de reset auto, hors pool).
+MAX_CONSECUTIVE_RESET_FAILURES = 5
+
 
 def _host_is_ip_only(host: str) -> bool:
     """True si host est une adresse IP (chiffres et points uniquement, pas de lettres). Exclut les noms (waf, awswaf, etc.)."""
@@ -949,6 +952,9 @@ class InterfaceQuotaManager:
         self._interface_failure_count: Dict[str, int] = {}
         # Clés retirées du pool (3 échecs) : retry reset toutes les 30s jusqu'à remise en pool
         self._keys_removed_from_pool: set = set()
+        self._consecutive_reset_failures: Dict[str, int] = {}
+        self._quarantine_interfaces: set = set()
+        self._pool_health_task: Optional[asyncio.Task] = None
         # Event pour réveiller les requêtes en attente quand une interface redevient disponible
         self._interface_available_event = asyncio.Event()
         if self.available_interfaces:
@@ -1008,6 +1014,11 @@ class InterfaceQuotaManager:
         if self._retry_reset_task is None or self._retry_reset_task.done():
             self._retry_reset_task = asyncio.create_task(self._retry_reset_loop())
 
+    async def start_pool_health_task(self):
+        """Surveillance du pool ZRotate : toutes les 30s, clés sans accès Internet (IP publique) retirées."""
+        if self._pool_health_task is None or self._pool_health_task.done():
+            self._pool_health_task = asyncio.create_task(self._pool_health_loop())
+
     async def _retry_reset_loop(self):
         """Toutes les 30s, relance un reset pour les clés hors pool tant qu'elles n'ont pas été remises."""
         while True:
@@ -1015,6 +1026,8 @@ class InterfaceQuotaManager:
                 await asyncio.sleep(30)
                 async with self._lock:
                     for key_name in list(self._keys_removed_from_pool):
+                        if key_name in self._quarantine_interfaces:
+                            continue
                         if key_name in (a["name"] for a in self.available_interfaces):
                             continue  # déjà remise
                         if not self._reset_callback:
@@ -1032,6 +1045,97 @@ class InterfaceQuotaManager:
                 break
             except Exception as e:
                 logger.error(f"[QUOTA] Erreur dans _retry_reset_loop: {e}")
+
+    async def _pool_health_loop(self):
+        """Toutes les 30s : retire du pool les clés qui n'obtiennent pas d'IP publique via leur egress."""
+        while True:
+            try:
+                await asyncio.sleep(30)
+                async with self._lock:
+                    snapshot = [
+                        dict(x)
+                        for x in self.available_interfaces
+                        if x.get("name") not in self.resetting_interfaces
+                        and x.get("name") not in self._quarantine_interfaces
+                    ]
+                n_snap = len(snapshot)
+                if n_snap == 0:
+                    logger.info(
+                        "[QUOTA] Health pool: contrôle connectivité (ipify) — "
+                        "aucune clé à vérifier (pool vide ou clés en reset/quarantaine)"
+                    )
+                else:
+                    names_preview = ", ".join(
+                        (x.get("name") or "?") for x in snapshot[:8]
+                    )
+                    if n_snap > 8:
+                        names_preview += f", … (+{n_snap - 8})"
+                    logger.info(
+                        f"[QUOTA] Health pool: contrôle (IP locale système puis ipify) pour "
+                        f"{n_snap} clé(s): {names_preview}"
+                    )
+                for info in snapshot:
+                    name = info.get("name") or ""
+                    ip = info.get("ip") or ""
+                    if not name or not ip:
+                        continue
+                    local_ok = await asyncio.to_thread(local_ipv4_assigned_on_host, ip)
+                    if not local_ok:
+                        logger.warning(
+                            f"[QUOTA] Health pool: ⏸️ {name} ({ip}) — IP locale absente "
+                            f"(clé débranchée ou interface inactive), retrait du pool sans test Internet ni reset"
+                        )
+                        async with self._lock:
+                            before = [a["name"] for a in self.available_interfaces]
+                            if name not in before or name in self.resetting_interfaces:
+                                continue
+                            self.available_interfaces = [
+                                i
+                                for i in self.available_interfaces
+                                if i["name"] != name
+                            ]
+                            self._interface_available_event_clear_if_empty()
+                        continue
+
+                    ok = await async_check_egress_public_internet(ip, timeout=10.0)
+                    if ok:
+                        logger.info(
+                            f"[QUOTA] Health pool: ✅ {name} ({ip}) — accès Internet / IP publique OK"
+                        )
+                        continue
+                    logger.warning(
+                        f"[QUOTA] Health pool: ❌ {name} ({ip}) — test ipify échoué, "
+                        f"tentative de retrait du pool / reset"
+                    )
+                    async with self._lock:
+                        before = [a["name"] for a in self.available_interfaces]
+                        if name not in before or name in self.resetting_interfaces:
+                            continue
+                        self.available_interfaces = [
+                            i for i in self.available_interfaces if i["name"] != name
+                        ]
+                        self._interface_available_event_clear_if_empty()
+                        self._keys_removed_from_pool.add(name)
+                        logger.warning(
+                            f"[QUOTA] ⚠️ {name} retirée du pool ZRotate (pas d'IP publique / pas d'accès Internet)"
+                        )
+                        if self._reset_callback:
+                            try:
+                                self.resetting_interfaces.add(name)
+                                self._reset_callback.reset_interface(name)
+                                logger.info(
+                                    f"[QUOTA] 🔄 Reset déclenché pour {name} (contrôle connectivité)"
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"[QUOTA] Erreur callback reset (health): {e}"
+                                )
+                                self.resetting_interfaces.discard(name)
+                    await self.start_retry_reset_task()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[QUOTA] Erreur dans _pool_health_loop: {e}")
 
     async def _cleanup_partial_quotas(self):
         """
@@ -1108,6 +1212,11 @@ class InterfaceQuotaManager:
         """Retire l'interface du pool et déclenche un reset réel avant retour à 0/0."""
         if interface_name in self.resetting_interfaces:
             return
+        if interface_name in self._quarantine_interfaces:
+            logger.warning(
+                f"[QUOTA] Reset ignoré pour {interface_name} ({reason}) — interface en quarantaine"
+            )
+            return
         self.resetting_interfaces.add(interface_name)
         self.available_interfaces = [
             i for i in self.available_interfaces if i["name"] != interface_name
@@ -1169,6 +1278,7 @@ class InterfaceQuotaManager:
                     )
                     for info in self.available_interfaces
                     if info["name"] not in self.resetting_interfaces
+                    and info["name"] not in self._quarantine_interfaces
                 ]
                 if not eligible:
                     return None
@@ -1195,6 +1305,8 @@ class InterfaceQuotaManager:
                 interface_name = interface_info["name"]
 
                 if interface_name in self.resetting_interfaces:
+                    continue
+                if interface_name in self._quarantine_interfaces:
                     continue
 
                 if interface_name not in self.quotas:
@@ -1543,6 +1655,28 @@ class InterfaceQuotaManager:
                 }
             return result
 
+    async def get_quarantine_snapshot(self) -> list[str]:
+        """Noms d'interfaces en quarantaine (ZRotate), triés pour l'UI."""
+        async with self._lock:
+            return sorted(self._quarantine_interfaces)
+
+    async def get_pool_ui_snapshot(self) -> Dict[str, Dict[str, bool]]:
+        """
+        État runtime du pool ZRotate pour colorer la liste (clés du dernier démarrage).
+        Clés = egress_configs du serveur actif.
+        """
+        async with self._lock:
+            in_pool = {x["name"] for x in self.available_interfaces}
+            out: Dict[str, Dict[str, bool]] = {}
+            for cfg in self.egress_configs:
+                n = cfg["name"]
+                out[n] = {
+                    "in_pool": n in in_pool,
+                    "resetting": n in self.resetting_interfaces,
+                    "quarantine": n in self._quarantine_interfaces,
+                }
+            return out
+
     async def release_interface_after_reset(
         self, interface_name: str, reset_succeeded: bool = True
     ):
@@ -1590,20 +1724,57 @@ class InterfaceQuotaManager:
             # Retirer de la liste des interfaces en reset
             self.resetting_interfaces.discard(interface_name)
 
-            # Vérifier la connectivité avant de remettre dans le pool (surtout après reset suite à 3 échecs)
             interface_info = next(
                 (i for i in self.egress_configs if i["name"] == interface_name), None
             )
-            if interface_info:
-                names_in_available = [a["name"] for a in self.available_interfaces]
-                if interface_name not in names_in_available:
-                    self.available_interfaces.append(interface_info)
-                    self._interface_available_event_set()
-                    self._interface_failure_count[interface_name] = 0
+
+            if reset_succeeded:
+                self._consecutive_reset_failures.pop(interface_name, None)
+                self._quarantine_interfaces.discard(interface_name)
+                if interface_info:
+                    names_in_available = [a["name"] for a in self.available_interfaces]
+                    if interface_name not in names_in_available:
+                        self.available_interfaces.append(interface_info)
+                        self._interface_available_event_set()
+                        self._interface_failure_count[interface_name] = 0
+                        self._keys_removed_from_pool.discard(interface_name)
+                        logger.info(
+                            f"[QUOTA] ✅ Interface {interface_name} remise en disponibilité (reset OK)"
+                        )
+            elif not reset_succeeded:
+                logger.warning(
+                    f"[QUOTA] ⚠️ {interface_name} non remise dans le pool ZRotate (reset échoué ou incomplet)"
+                )
+                self.available_interfaces = [
+                    i for i in self.available_interfaces if i["name"] != interface_name
+                ]
+                self._interface_available_event_clear_if_empty()
+                n = self._consecutive_reset_failures.get(interface_name, 0) + 1
+                self._consecutive_reset_failures[interface_name] = n
+                if n >= MAX_CONSECUTIVE_RESET_FAILURES:
+                    already_q = interface_name in self._quarantine_interfaces
+                    self._quarantine_interfaces.add(interface_name)
                     self._keys_removed_from_pool.discard(interface_name)
-                    logger.info(
-                        f"[QUOTA] ✅ Interface {interface_name} remise en disponibilité"
-                    )
+                    if not already_q:
+                        logger.error(
+                            f"[QUOTA] 🛑 {interface_name} en quarantaine après {n} échec(s) de reset consécutifs "
+                            f"(seuil {MAX_CONSECUTIVE_RESET_FAILURES}) — plus de reset automatique, clé hors pool"
+                        )
+                else:
+                    self._keys_removed_from_pool.add(interface_name)
+                    await self.start_retry_reset_task()
+                    if self._reset_callback and interface_info:
+                        try:
+                            self.resetting_interfaces.add(interface_name)
+                            self._reset_callback.reset_interface(interface_name)
+                            logger.info(
+                                f"[QUOTA] 🔄 Nouvelle tentative de reset pour {interface_name} (suite à échec, {n}/{MAX_CONSECUTIVE_RESET_FAILURES})"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"[QUOTA] Erreur callback reset après échec: {e}"
+                            )
+                            self.resetting_interfaces.discard(interface_name)
 
             # Notifier l'UI : interface à nouveau disponible (badge RESET)
             if self._usage_callback:
@@ -1686,6 +1857,25 @@ def validate_egress_ip(ip: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def local_ipv4_assigned_on_host(ip: str) -> bool:
+    """
+    True si cette IPv4 est encore présente sur une interface système.
+    Permet de détecter une clé débranchée sans tenter de bind (évite WinError 10049)
+    et sans lancer de reset inutile.
+    """
+    if not ip or not str(ip).strip():
+        return False
+    target = str(ip).strip()
+    try:
+        for _iface, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and addr.address == target:
+                    return True
+    except Exception:
+        pass
+    return False
 
 
 async def open_connection_with_bind(
@@ -1773,6 +1963,49 @@ async def open_connection_with_bind(
             pass
         logger.error(f"Erreur open_connection_with_bind: {type(e).__name__}: {e}")
         raise
+
+
+async def async_check_egress_public_internet(
+    source_ip: str, timeout: float = 10.0
+) -> bool:
+    """
+    Vérifie qu'on peut atteindre Internet via l'IP locale (egress) et obtenir une IP publique
+    (même test que l'UI : api.ipify.org, corps = IPv4).
+    """
+    reader: Optional[asyncio.StreamReader] = None
+    writer: Optional[asyncio.StreamWriter] = None
+    try:
+        reader, writer = await open_connection_with_bind(
+            "api.ipify.org", 80, source_ip, timeout=timeout
+        )
+        req = (
+            "GET /?format=text HTTP/1.1\r\n"
+            "Host: api.ipify.org\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        writer.write(req.encode("ascii"))
+        await writer.drain()
+        chunks: list[bytes] = []
+        while True:
+            data = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+            if not data:
+                break
+            chunks.append(data)
+        raw = b"".join(chunks).decode(errors="ignore")
+        parts = raw.split("\r\n\r\n", 1)
+        if len(parts) != 2:
+            return False
+        body = parts[1].strip()
+        return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", body))
+    except Exception:
+        return False
+    finally:
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 def parse_connect_request(request_line: str) -> Optional[Tuple[str, int]]:
@@ -2085,6 +2318,7 @@ class ZRotateSingleProxyServer:
         addr = self.server.sockets[0].getsockname()
         logger.info(f"✅ ZRotate démarré sur {addr[0]}:{addr[1]}")
         if self._use_quotas:
+            await self.quota_manager.start_pool_health_task()
             logger.info(
                 f"Système de quotas activé - {len(self.quota_manager.egress_configs)} interface(s) disponible(s)"
             )
@@ -2863,6 +3097,8 @@ class ZRotateProxyServer(QThread):
     quota_stats_updated = Signal(
         object
     )  # dict[interface_name, {"get": (used, max), "connect": (used, max)}]
+    quarantine_updated = Signal(object)  # list[str] noms en quarantaine
+    pool_state_updated = Signal(object)  # dict[name, {in_pool, resetting, quarantine}]
 
     def __init__(
         self,
@@ -2907,6 +3143,10 @@ class ZRotateProxyServer(QThread):
                     if qm is not None:
                         stats = await qm.get_quota_stats()
                         self.quota_stats_updated.emit(stats)
+                        qlist = await qm.get_quarantine_snapshot()
+                        self.quarantine_updated.emit(qlist)
+                        pool_snap = await qm.get_pool_ui_snapshot()
+                        self.pool_state_updated.emit(pool_snap)
             except Exception:
                 pass
             # Intervalle raisonnable pour l'UI sans charger la boucle
@@ -3508,6 +3748,26 @@ class ZRotateInterfaceRow(QFrame):
                 background-color: rgba(71, 85, 105, 0.28);
                 border-color: rgba(148, 163, 184, 0.35);
             }
+            QFrame#zrotateInterfaceRow[zrotateLive="active"] {
+                background-color: rgba(36, 73, 56, 0.88);
+                border: 1px solid rgba(46, 204, 113, 0.55);
+            }
+            QFrame#zrotateInterfaceRow[zrotateLive="standby"] {
+                background-color: rgba(90, 70, 30, 0.55);
+                border: 1px solid rgba(241, 196, 15, 0.5);
+            }
+            QFrame#zrotateInterfaceRow[zrotateLive="resetting"] {
+                background-color: rgba(70, 55, 30, 0.65);
+                border: 1px solid rgba(243, 156, 18, 0.65);
+            }
+            QFrame#zrotateInterfaceRow[zrotateLive="quarantine"] {
+                background-color: rgba(90, 35, 35, 0.55);
+                border: 1px solid rgba(231, 76, 60, 0.6);
+            }
+            QFrame#zrotateInterfaceRow[zrotateLive="session"] {
+                background-color: rgba(30, 41, 59, 0.55);
+                border: 1px solid rgba(100, 116, 139, 0.45);
+            }
             QCheckBox#zrotateInterfaceCheckbox {
                 color: #e2e8f0;
                 font-size: 14px;
@@ -3536,12 +3796,20 @@ class ZRotateInterfaceRow(QFrame):
         self._apply_checked_visual_state()
 
     def is_checked(self) -> bool:
-        return self.checkbox.checkState() == Qt.Checked
+        try:
+            return self.checkbox.checkState() == Qt.Checked
+        except RuntimeError:
+            # Widget Qt déjà détruit (liste ZRotate en cours de refresh)
+            return False
 
     def set_public_ip(self, public_ip: str):
         value = public_ip or "-"
-        if self.ip_chip.text() != value:
-            self.ip_chip.setText(value)
+        try:
+            if self.ip_chip.text() != value:
+                self.ip_chip.setText(value)
+        except RuntimeError:
+            # Ligne en cours de destruction pendant un refresh UI.
+            pass
 
     def set_quota_values(self, g_used: int, g_max: int, c_used: int, c_max: int):
         get_txt = f"<b>{g_used}/{g_max}</b>"
@@ -3562,6 +3830,29 @@ class ZRotateInterfaceRow(QFrame):
         self.setProperty("poolEnabled", enabled)
         self.style().unpolish(self)
         self.style().polish(self)
+
+    def set_live_pool_state(
+        self, zrotate_running: bool, snap: Optional[Dict[str, bool]]
+    ) -> None:
+        """
+        Couleurs d'état du pool runtime (ZRotate démarré). snap = None ou clsé hors session.
+        Clés snap : in_pool, resetting, quarantine, not_in_session
+        """
+        if not zrotate_running or snap is None:
+            self.setProperty("zrotateLive", "off")
+        elif snap.get("not_in_session"):
+            self.setProperty("zrotateLive", "session")
+        elif snap.get("quarantine"):
+            self.setProperty("zrotateLive", "quarantine")
+        elif snap.get("resetting"):
+            self.setProperty("zrotateLive", "resetting")
+        elif snap.get("in_pool"):
+            self.setProperty("zrotateLive", "active")
+        else:
+            self.setProperty("zrotateLive", "standby")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self._apply_checked_visual_state()
 
 
 class ZRotateInterfacesHeaderRow(QFrame):
@@ -3691,6 +3982,7 @@ class MainWindow(QMainWindow):
         self.zrotate_proxy_server: Optional[ZRotateProxyServer] = None
         self.zrotate_selected_interfaces: set[str] = set()
         self.zrotate_running = False
+        self._last_zrotate_pool_state: Dict[str, Dict[str, bool]] = {}
 
         # Resets en parallèle (un thread par interface) ; suivi pour éviter doublons et refresh en rafale
         self._reset_in_progress: set[str] = set()  # interfaces en cours de reset
@@ -3717,6 +4009,7 @@ class MainWindow(QMainWindow):
         self.on_interfaces_updated(list(self.interface_manager.interfaces.values()))
         self._restore_initial_proxies()
         self._update_zrotate_interfaces_list()
+        self._set_quarantine_ui_stopped()
 
         # Démarrer ZRotate automatiquement si configuré
         zrotate_cfg = self.config.get("zrotate", {})
@@ -3859,33 +4152,28 @@ class MainWindow(QMainWindow):
         zrotate_layout.setContentsMargins(12, 12, 12, 12)
         zrotate_layout.setSpacing(10)
 
-        # Panel haut : Configuration ZRotate
-        config_panel = QWidget()
-        config_panel.setObjectName("zrotateConfigPanel")
-        config_layout = QVBoxLayout(config_panel)
-        config_layout.setContentsMargins(10, 10, 10, 10)
-        config_layout.setSpacing(10)
+        # Onglets : configuration pool ZRotate / liste quarantaine
+        self.zrotate_section_tabs = QTabWidget()
+        self.zrotate_section_tabs.setObjectName("zrotateSectionTabs")
 
-        # Titre
+        tab_zrotate = QWidget()
+        tab_zrotate.setObjectName("zrotateConfigPanel")
+        tab_zrotate_layout = QVBoxLayout(tab_zrotate)
+        tab_zrotate_layout.setContentsMargins(10, 10, 10, 10)
+        tab_zrotate_layout.setSpacing(10)
+
         zrotate_title = QLabel("ZRotate - Rotation d'IP")
         zrotate_title.setObjectName("zrotateTitle")
-        config_layout.addWidget(zrotate_title)
+        tab_zrotate_layout.addWidget(zrotate_title)
 
-        # URL du serveur : configurée via proxy_configs.json (zrotate.server_url)
-
-        # Liste des interfaces à cocher
         interfaces_label = QLabel("Interfaces pour le pool d'IP:")
         interfaces_label.setObjectName("zrotateLabel")
-        config_layout.addWidget(interfaces_label)
+        tab_zrotate_layout.addWidget(interfaces_label)
 
         self.zrotate_interfaces_list = QListWidget()
         self.zrotate_interfaces_list.setObjectName("zrotateInterfacesList")
-        # Augmenter la taille de la liste (partie de l'agrandissement de 50%)
-        config_layout.addWidget(
-            self.zrotate_interfaces_list, 2
-        )  # Augmenté de 1 à 2 pour plus d'espace
+        tab_zrotate_layout.addWidget(self.zrotate_interfaces_list, 2)
 
-        # Checkbox démarrage automatique
         self.zrotate_auto_start_checkbox = QCheckBox(
             "Démarrer automatiquement au lancement"
         )
@@ -3893,23 +4181,43 @@ class MainWindow(QMainWindow):
         self.zrotate_auto_start_checkbox.stateChanged.connect(
             self._on_zrotate_auto_start_changed
         )
-        config_layout.addWidget(self.zrotate_auto_start_checkbox)
+        tab_zrotate_layout.addWidget(self.zrotate_auto_start_checkbox)
 
-        # Bouton démarrer/arrêter
         self.zrotate_start_button = QPushButton("Démarrer ZRotate")
         self.zrotate_start_button.setObjectName("zrotateStartButton")
-        self.zrotate_start_button.setProperty(
-            "stopped", True
-        )  # Initialiser comme arrêté
+        self.zrotate_start_button.setProperty("stopped", True)
         self.zrotate_start_button.clicked.connect(self.on_zrotate_toggle)
-        # Appliquer le style initial
         self.zrotate_start_button.style().unpolish(self.zrotate_start_button)
         self.zrotate_start_button.style().polish(self.zrotate_start_button)
-        config_layout.addWidget(self.zrotate_start_button)
+        tab_zrotate_layout.addWidget(self.zrotate_start_button)
 
-        zrotate_layout.addWidget(
-            config_panel, 2
-        )  # Augmenté de 1 à 2 pour plus d'espace
+        tab_quarantine = QWidget()
+        tab_quarantine.setObjectName("zrotateQuarantinePanel")
+        tab_quarantine_layout = QVBoxLayout(tab_quarantine)
+        tab_quarantine_layout.setContentsMargins(10, 10, 10, 10)
+        tab_quarantine_layout.setSpacing(8)
+
+        quarantine_help = QLabel(
+            "Clés exclues du pool après échecs répétés du script de reset. "
+            "Un reset réussi les retire de cette liste."
+        )
+        quarantine_help.setObjectName("zrotateLabel")
+        quarantine_help.setWordWrap(True)
+        tab_quarantine_layout.addWidget(quarantine_help)
+
+        self.zrotate_quarantine_status = QLabel("")
+        self.zrotate_quarantine_status.setObjectName("zrotateQuarantineStatus")
+        self.zrotate_quarantine_status.setWordWrap(True)
+        tab_quarantine_layout.addWidget(self.zrotate_quarantine_status)
+
+        self.zrotate_quarantine_list = QListWidget()
+        self.zrotate_quarantine_list.setObjectName("zrotateQuarantineList")
+        tab_quarantine_layout.addWidget(self.zrotate_quarantine_list, 1)
+
+        self.zrotate_section_tabs.addTab(tab_zrotate, "ZRotate")
+        self.zrotate_section_tabs.addTab(tab_quarantine, "Quarantaine")
+
+        zrotate_layout.addWidget(self.zrotate_section_tabs, 2)
 
         # Panel bas : Console de logs
         console_panel = QWidget()
@@ -4041,6 +4349,53 @@ class MainWindow(QMainWindow):
                 background-color: #02172e;
                 border-radius: 12px;
                 border: 1px solid rgba(31, 41, 55, 0.9);
+            }
+            QWidget#zrotateQuarantinePanel {
+                background-color: #02172e;
+                border-radius: 12px;
+                border: 1px solid rgba(31, 41, 55, 0.9);
+            }
+            QTabWidget#zrotateSectionTabs::pane {
+                border: 1px solid rgba(31, 41, 55, 0.9);
+                border-radius: 10px;
+                top: -1px;
+                background-color: #02172e;
+            }
+            QTabWidget#zrotateSectionTabs QTabBar::tab {
+                background-color: #1a2f45;
+                color: #bdc3c7;
+                border: 1px solid rgba(31, 41, 55, 0.9);
+                border-bottom: none;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                min-width: 6em;
+                padding: 8px 14px;
+                font-size: 12px;
+            }
+            QTabWidget#zrotateSectionTabs QTabBar::tab:selected {
+                background-color: #02172e;
+                color: #ecf0f1;
+                font-weight: 600;
+            }
+            QTabWidget#zrotateSectionTabs QTabBar::tab:hover:!selected {
+                background-color: #22313f;
+            }
+            QLabel#zrotateQuarantineStatus {
+                color: #95a5a6;
+                font-size: 11px;
+            }
+            QListWidget#zrotateQuarantineList {
+                background-color: #22313f;
+                border-radius: 6px;
+                border: 1px solid rgba(255, 255, 255, 0.05);
+                color: #ecf0f1;
+                font-size: 12px;
+            }
+            QListWidget#zrotateQuarantineList::item {
+                padding: 6px 8px;
+            }
+            QListWidget#zrotateQuarantineList::item:selected {
+                background-color: rgba(52, 152, 219, 0.3);
             }
             QWidget#zrotateConsolePanel {
                 background-color: #02172e;
@@ -4280,9 +4635,13 @@ class MainWindow(QMainWindow):
     # --- Gestion des interfaces depuis InterfaceManager ---
     @Slot(list)
     def on_interfaces_updated(self, interfaces: list):
-        # Si l'utilisateur vient d'interagir (édition de port, drag, clic), on laisse
-        # un petit délai sans update lourd pour ne pas annuler sa sélection.
+        # Rafraîchir toujours la liste ZRotate (IPs / interfaces up) même pendant le
+        # debounce du panneau gauche (drag port, etc.).
         if time.time() - self.last_user_interaction < 2.5:
+            try:
+                self._update_zrotate_interfaces_list()
+            except Exception:
+                traceback.print_exc()
             return
         try:
             # Mapping nom -> InterfaceInfo renvoyé par InterfaceManager
@@ -4374,11 +4733,7 @@ class MainWindow(QMainWindow):
 
             # Mettre à jour le titre / compteur dès qu'on a une nouvelle photo des interfaces
             self._update_window_title()
-            # Mettre à jour la liste ZRotate seulement si pas d'interaction récente sur ZRotate
-            # (pour éviter de perdre la sélection pendant que l'utilisateur coche/décoche)
-            # Augmenter le délai à 3 secondes pour être sûr
-            if time.time() - self.last_user_interaction >= 3.0:
-                self._update_zrotate_interfaces_list()
+            self._update_zrotate_interfaces_list()
         except Exception:
             traceback.print_exc()
 
@@ -4390,6 +4745,7 @@ class MainWindow(QMainWindow):
             widget.update_from_interface(info)
         # Chaque changement d'IP publique peut modifier le nombre de connexions actives
         self._update_window_title()
+        self._refresh_zrotate_row_public_ip(name)
 
     def _get_interface_display_name(self, name: str) -> str:
         # On retourne toujours le vrai nom Windows : plus d'alias d'affichage
@@ -4442,12 +4798,14 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"[RESET] ⚠️ Erreur affichage message: {e}")
         elif returncode == -2:
-            print(f"[RESET] ⏱️ Timeout pour l'interface '{name}' - remise dans le pool")
+            print(
+                f"[RESET] ⏱️ Timeout pour l'interface '{name}' — pas de remise dans le pool ZRotate"
+            )
         elif returncode == 0:
             print(f"[RESET] ✅ Reset réussi pour l'interface '{name}'")
         else:
             print(
-                f"[RESET] ❌ Reset échoué pour l'interface '{name}' (code {returncode}) - remise dans le pool"
+                f"[RESET] ❌ Reset échoué pour l'interface '{name}' (code {returncode}) — pas de remise dans le pool ZRotate"
             )
 
         try:
@@ -4789,28 +5147,19 @@ class MainWindow(QMainWindow):
 
     # --- ZRotate ---
     def _update_zrotate_interfaces_list(self):
-        """Met à jour la liste des interfaces dans le panel ZRotate"""
-        header_item = getattr(self, "_zrotate_header_item", None)
-        header_widget = getattr(self, "_zrotate_header_widget", None)
-        if header_item is None or header_widget is None:
-            header_item = QListWidgetItem()
-            header_widget = ZRotateInterfacesHeaderRow()
-            self.zrotate_interfaces_list.insertItem(0, header_item)
-            self.zrotate_interfaces_list.setItemWidget(header_item, header_widget)
-            header_item.setSizeHint(header_widget.sizeHint())
-            self._zrotate_header_item = header_item
-            self._zrotate_header_widget = header_widget
-
-        # Sauvegarder l'état actuel des lignes avant la mise à jour
+        """Met à jour la liste des interfaces dans le panel ZRotate (rebuild complet, stable)."""
+        # Sauvegarder les cases cochées actuellement (tolérant aux widgets supprimés).
         current_selections = set()
-        for row_widget in getattr(self, "_zrotate_interface_rows", {}).values():
-            if isinstance(row_widget, ZRotateInterfaceRow) and row_widget.is_checked():
-                current_selections.add(row_widget.interface_name)
+        for row_widget in list(getattr(self, "_zrotate_interface_rows", {}).values()):
+            if not isinstance(row_widget, ZRotateInterfaceRow):
+                continue
+            try:
+                if row_widget.is_checked():
+                    current_selections.add(row_widget.interface_name)
+            except RuntimeError:
+                continue
 
-        # Fusionner les sélections actuelles avec celles sauvegardées (union au lieu d'intersection)
-        # pour préserver toutes les sélections, y compris celles qui viennent d'être cochées
         self.zrotate_selected_interfaces.update(current_selections)
-        # Retirer les interfaces qui n'existent plus
         available_interfaces = {
             name
             for name in self.interface_manager.interfaces.keys()
@@ -4819,65 +5168,83 @@ class MainWindow(QMainWindow):
         }
         self.zrotate_selected_interfaces &= available_interfaces
 
-        rows = getattr(self, "_zrotate_interface_rows", None)
-        row_items = getattr(self, "_zrotate_interface_items", None)
-        if rows is None:
-            self._zrotate_interface_rows = {}
-            rows = self._zrotate_interface_rows
-        if row_items is None:
-            self._zrotate_interface_items = {}
-            row_items = self._zrotate_interface_items
+        visible_infos = [
+            (name, info)
+            for name, info in sorted(self.interface_manager.interfaces.items())
+            if info.is_up and info.local_ip
+        ]
 
-        visible_infos = []
-        for name, info in sorted(self.interface_manager.interfaces.items()):
-            if not info.is_up or not info.local_ip:
-                continue
-            visible_infos.append((name, info))
+        # Rebuild complet pour éviter tout pointeur Qt invalide après hot-plug interface.
+        self.zrotate_interfaces_list.clear()
+        self._zrotate_interface_rows = {}
+        self._zrotate_interface_items = {}
 
-        visible_names = {name for name, _ in visible_infos}
-
-        for old_name in list(rows.keys()):
-            if old_name in visible_names:
-                continue
-            old_item = row_items.get(old_name)
-            if old_item is not None:
-                old_row = self.zrotate_interfaces_list.row(old_item)
-                if old_row >= 0:
-                    self.zrotate_interfaces_list.takeItem(old_row)
-            old_widget = rows.pop(old_name, None)
-            if old_widget is not None:
-                old_widget.deleteLater()
-            row_items.pop(old_name, None)
+        header_item = QListWidgetItem()
+        header_widget = ZRotateInterfacesHeaderRow()
+        self.zrotate_interfaces_list.addItem(header_item)
+        self.zrotate_interfaces_list.setItemWidget(header_item, header_widget)
+        header_item.setSizeHint(header_widget.sizeHint())
+        self._zrotate_header_item = header_item
+        self._zrotate_header_widget = header_widget
 
         for name, info in visible_infos:
             public_ip = info.public_ip or "-"
-            row_widget = rows.get(name)
-            if row_widget is None:
-                item = QListWidgetItem()
-                row_widget = ZRotateInterfaceRow(name, public_ip)
-                row_widget.set_checked(name in self.zrotate_selected_interfaces)
-                row_widget.toggled.connect(self._on_zrotate_interface_toggled)
-                self.zrotate_interfaces_list.addItem(item)
-                self.zrotate_interfaces_list.setItemWidget(item, row_widget)
-                item.setSizeHint(row_widget.sizeHint())
-                rows[name] = row_widget
-                row_items[name] = item
-            else:
-                row_widget.set_public_ip(public_ip)
-                row_widget.set_checked(name in self.zrotate_selected_interfaces)
+            item = QListWidgetItem()
+            row_widget = ZRotateInterfaceRow(name, public_ip)
+            row_widget.set_checked(name in self.zrotate_selected_interfaces)
+            row_widget.toggled.connect(self._on_zrotate_interface_toggled)
+            self.zrotate_interfaces_list.addItem(item)
+            self.zrotate_interfaces_list.setItemWidget(item, row_widget)
+            item.setSizeHint(row_widget.sizeHint())
+            self._zrotate_interface_rows[name] = row_widget
+            self._zrotate_interface_items[name] = item
 
-        for target_index, (name, _info) in enumerate(visible_infos):
-            target_index += 1  # index 0 réservé à l'en-tête fixe
-            item = row_items.get(name)
-            if item is None:
+        self._sync_zrotate_row_pool_styles()
+
+    def _refresh_zrotate_row_public_ip(self, name: str):
+        """Met à jour l'IP affichée sur une ligne ZRotate sans reconstruire toute la liste."""
+        rows = getattr(self, "_zrotate_interface_rows", None) or {}
+        row_widget = rows.get(name)
+        if row_widget is None:
+            return
+        info = self.interface_manager.interfaces.get(name)
+        if not info:
+            return
+        try:
+            row_widget.set_public_ip(info.public_ip or "-")
+        except RuntimeError:
+            pass
+
+    def _sync_zrotate_row_pool_styles(self):
+        """Applique les couleurs d'état pool (runtime) aux lignes ZRotate."""
+        rows = getattr(self, "_zrotate_interface_rows", None) or {}
+        state = getattr(self, "_last_zrotate_pool_state", None) or {}
+        if not self.zrotate_running:
+            for row in rows.values():
+                try:
+                    row.set_live_pool_state(False, None)
+                except RuntimeError:
+                    pass
+            return
+        if not state:
+            return
+        for name, row in rows.items():
+            try:
+                snap = state.get(name)
+                if snap is None:
+                    row.set_live_pool_state(True, {"not_in_session": True})
+                else:
+                    row.set_live_pool_state(True, snap)
+            except RuntimeError:
                 continue
-            current_index = self.zrotate_interfaces_list.row(item)
-            if current_index == target_index:
-                continue
-            moved_item = self.zrotate_interfaces_list.takeItem(current_index)
-            self.zrotate_interfaces_list.insertItem(target_index, moved_item)
-            self.zrotate_interfaces_list.setItemWidget(target_index, rows[name])
-            moved_item.setSizeHint(rows[name].sizeHint())
+
+    @Slot(object)
+    def _on_pool_state_updated(self, state_obj: object):
+        """Snapshot du pool (~1 Hz) depuis le thread ZRotate."""
+        self._last_zrotate_pool_state = (
+            dict(state_obj) if isinstance(state_obj, dict) else {}
+        )
+        self._sync_zrotate_row_pool_styles()
 
     def _on_zrotate_interface_toggled(self, interface_name: str, state: int):
         """Gère le changement d'état d'une checkbox d'interface"""
@@ -4930,7 +5297,41 @@ class MainWindow(QMainWindow):
                 continue
             g_used, g_max = data.get("get", (0, 2))
             c_used, c_max = data.get("connect", (0, 2))
-            row_widget.set_quota_values(g_used, g_max, c_used, c_max)
+            try:
+                row_widget.set_quota_values(g_used, g_max, c_used, c_max)
+            except RuntimeError:
+                continue
+
+    def _set_quarantine_ui_stopped(self):
+        """ZRotate arrêté : pas de données live côté quota manager."""
+        self.zrotate_quarantine_list.clear()
+        self.zrotate_quarantine_status.setText(
+            "ZRotate est arrêté — démarrez-le pour afficher la quarantaine."
+        )
+        self.zrotate_quarantine_status.show()
+
+    @Slot(object)
+    def _on_quarantine_updated(self, names_obj: object):
+        """Liste des interfaces en quarantaine (émise ~1x/s par le thread ZRotate)."""
+        if not getattr(self, "zrotate_running", False):
+            self._set_quarantine_ui_stopped()
+            return
+        names: list[str] = (
+            list(names_obj) if names_obj is not None else []
+        )
+        self.zrotate_quarantine_status.hide()
+        self.zrotate_quarantine_list.clear()
+        if not names:
+            item = QListWidgetItem("Aucune clé en quarantaine")
+            item.setFlags(
+                item.flags()
+                & ~Qt.ItemFlag.ItemIsSelectable
+                & ~Qt.ItemFlag.ItemIsEnabled
+            )
+            self.zrotate_quarantine_list.addItem(item)
+        else:
+            for n in names:
+                self.zrotate_quarantine_list.addItem(QListWidgetItem(n))
 
     def _zrotate_log(self, message: str):
         """Ajoute un message dans la console ZRotate"""
@@ -5122,6 +5523,12 @@ class MainWindow(QMainWindow):
         self.zrotate_proxy_server.quota_stats_updated.connect(
             self._on_quota_stats_updated
         )
+        self.zrotate_proxy_server.quarantine_updated.connect(
+            self._on_quarantine_updated
+        )
+        self.zrotate_proxy_server.pool_state_updated.connect(
+            self._on_pool_state_updated
+        )
 
         # Démarrer le serveur
         self.zrotate_proxy_server.start()
@@ -5138,6 +5545,8 @@ class MainWindow(QMainWindow):
         for cfg in egress_configs:
             self._zrotate_log(f"      - {cfg['name']}: {cfg['ip']}")
         self._save_config()
+        # État quarantaine jusqu'au 1er tick du thread (~1s)
+        self._on_quarantine_updated([])
 
     def _stop_zrotate(self, wait_timeout_ms: int = 500):
         """Arrête le serveur ZRotate.
@@ -5151,6 +5560,8 @@ class MainWindow(QMainWindow):
             return  # Déjà arrêté
 
         self.zrotate_running = False  # Marquer comme arrêté immédiatement
+        self._last_zrotate_pool_state = {}
+        self._sync_zrotate_row_pool_styles()
 
         # Mettre à jour le bouton immédiatement
         self._update_zrotate_button_state()
@@ -5178,6 +5589,8 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
             self.zrotate_proxy_server = None
+
+        self._set_quarantine_ui_stopped()
 
         # Remettre les badges à RESET pour les interfaces ZRotate
         for name in self.zrotate_selected_interfaces:
