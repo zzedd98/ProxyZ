@@ -4217,7 +4217,8 @@ class MainWindow(QMainWindow):
         self.zrotate_section_tabs.addTab(tab_zrotate, "ZRotate")
         self.zrotate_section_tabs.addTab(tab_quarantine, "Quarantaine")
 
-        zrotate_layout.addWidget(self.zrotate_section_tabs, 2)
+        # Plus d'espace pour le pool / onglets qu pour la console (3:1 au lieu de 2:2).
+        zrotate_layout.addWidget(self.zrotate_section_tabs, 3)
 
         # Panel bas : Console de logs
         console_panel = QWidget()
@@ -4255,9 +4256,7 @@ class MainWindow(QMainWindow):
         self.zrotate_log_box.setObjectName("zrotateLogBox")
         console_layout.addWidget(self.zrotate_log_box, 1)
 
-        zrotate_layout.addWidget(
-            console_panel, 2
-        )  # Augmenté de 1 à 2 pour plus d'espace (répartition de l'agrandissement)
+        zrotate_layout.addWidget(console_panel, 1)
 
         # Ajouter le panneau ZRotate au splitter
         splitter.addWidget(zrotate_panel)
@@ -5174,6 +5173,9 @@ class MainWindow(QMainWindow):
             if info.is_up and info.local_ip
         ]
 
+        scroll_bar = self.zrotate_interfaces_list.verticalScrollBar()
+        saved_scroll_value = scroll_bar.value()
+
         # Rebuild complet pour éviter tout pointeur Qt invalide après hot-plug interface.
         self.zrotate_interfaces_list.clear()
         self._zrotate_interface_rows = {}
@@ -5200,6 +5202,12 @@ class MainWindow(QMainWindow):
             self._zrotate_interface_items[name] = item
 
         self._sync_zrotate_row_pool_styles()
+
+        def _restore_zrotate_list_scroll():
+            sb = self.zrotate_interfaces_list.verticalScrollBar()
+            sb.setValue(min(saved_scroll_value, sb.maximum()))
+
+        QTimer.singleShot(0, _restore_zrotate_list_scroll)
 
     def _refresh_zrotate_row_public_ip(self, name: str):
         """Met à jour l'IP affichée sur une ligne ZRotate sans reconstruire toute la liste."""
