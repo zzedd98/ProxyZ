@@ -36,6 +36,26 @@ else:
 # Script de reset par défaut (nom ou chemin relatif au dossier de l'app / exe)
 DEFAULT_RESET_SCRIPT = "reset_modem.py"
 
+# Ne jamais réécrire proxy_configs.json depuis l'app (édition manuelle du JSON).
+PERSIST_CONFIG_TO_DISK = False
+
+# Warmup Playwright au démarrage : délai entre chaque port (éviter burst si activé).
+WARMUP_STAGGER_ENABLED = False
+WARMUP_STAGGER_SECONDS = 2.0
+
+# Scripts reset Playwright avec navigateur persistant (warmup page + reset rapide)
+PLAYWRIGHT_RESET_SCRIPT_NAMES = frozenset(
+    {
+        "reset_modem.py",
+        "reset_xpro.py",
+        "reset_huawei.py",
+    }
+)
+
+
+def is_playwright_reset_script(script_path: Path) -> bool:
+    return script_path.name.lower() in PLAYWRIGHT_RESET_SCRIPT_NAMES
+
 
 def get_app_dir() -> Path:
     """
@@ -147,9 +167,7 @@ def build_reset_command(script_path: Path, proxy_port: int) -> list[str]:
     return [python_exe, str(script_path), str(proxy_port)]
 
 
-_RESET_MODEM_FUNC = None
-_RESET_MODEM_INIT_FUNC = None
-_RESET_MODEM_LOADED_FROM: str | None = None
+_RESET_MODULE_CACHE: dict[str, tuple] = {}
 
 
 class _LineForwarder:
@@ -180,46 +198,160 @@ class _LineForwarder:
 
 def _load_reset_modem_functions(script_path: Path):
     """
-    Charge reset_modem.py depuis son chemin absolu.
+    Charge un script reset Playwright depuis son chemin absolu.
     Fiable en mode script ET en mode .exe (indépendant du working directory).
+    Retourne (reset_modem_by_port, initialize_browser_service, resolved_path).
     """
-    global _RESET_MODEM_FUNC, _RESET_MODEM_INIT_FUNC, _RESET_MODEM_LOADED_FROM
     resolved = str(script_path.resolve())
-    if (
-        _RESET_MODEM_FUNC is not None
-        and _RESET_MODEM_LOADED_FROM is not None
-        and _RESET_MODEM_LOADED_FROM.lower() == resolved.lower()
-    ):
-        return _RESET_MODEM_FUNC, _RESET_MODEM_INIT_FUNC
+    cached = _RESET_MODULE_CACHE.get(resolved.lower())
+    if cached is not None:
+        return cached[0], cached[1]
 
     module = None
+    load_resolved = resolved
     if script_path.exists():
-        module_name = f"_proxyz_reset_modem_{abs(hash(resolved))}"
+        module_name = f"_proxyz_reset_{abs(hash(resolved))}"
         spec = importlib.util.spec_from_file_location(module_name, resolved)
         if spec is None or spec.loader is None:
             raise RuntimeError(f"Impossible de charger le module reset: {resolved}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     else:
-        # En mode PyInstaller, reset_modem peut etre embarque dans l'executable
-        # et ne pas exister en fichier a cote.
+        stem = script_path.stem
         try:
-            module = importlib.import_module("reset_modem")
-            resolved = "<embedded reset_modem>"
+            module = importlib.import_module(stem)
+            load_resolved = f"<embedded {stem}>"
         except Exception as e:
             raise FileNotFoundError(f"Script reset introuvable: {script_path}") from e
 
     reset_func = getattr(module, "reset_modem_by_port", None)
     if not callable(reset_func):
-        raise RuntimeError(f"Fonction reset_modem_by_port introuvable dans {resolved}")
+        raise RuntimeError(
+            f"Fonction reset_modem_by_port introuvable dans {load_resolved}"
+        )
     init_func = getattr(module, "initialize_browser_service", None)
     if not callable(init_func):
         init_func = None
 
-    _RESET_MODEM_FUNC = reset_func
-    _RESET_MODEM_INIT_FUNC = init_func
-    _RESET_MODEM_LOADED_FROM = resolved
-    return _RESET_MODEM_FUNC, _RESET_MODEM_INIT_FUNC
+    _RESET_MODULE_CACHE[resolved.lower()] = (
+        reset_func,
+        init_func,
+        load_resolved,
+        module,
+    )
+    return reset_func, init_func
+
+
+def _reset_module_source(script_path: Path) -> str:
+    resolved = str(script_path.resolve()).lower()
+    cached = _RESET_MODULE_CACHE.get(resolved)
+    if cached:
+        return cached[2]
+    return resolved
+
+
+def extract_interface_reset_options(iface_cfg: dict | None) -> dict:
+    """
+    Options reset par interface (proxy_configs.json).
+    modem_gateway : IP ou URL de l'interface web du modem (ex. 192.168.100.1).
+    """
+    if not iface_cfg:
+        return {}
+    for key in (
+        "modem_gateway",
+        "reset_modem_gateway",
+        "modem_url",
+        "passerelle_modem",
+    ):
+        val = iface_cfg.get(key)
+        if val is not None and str(val).strip():
+            return {"modem_gateway": str(val).strip()}
+    return {}
+
+
+def resolve_interface_reset_script(
+    iface_cfg: dict | None, default_reset: str
+) -> tuple[str, bool]:
+    """
+    Résout le script reset d'une interface.
+    Retourne (script, is_explicit_mapping).
+    - explicite si `reset_script` est défini
+    - explicite aussi si `modem_gateway` est défini (mapping XPro implicite)
+    """
+    cfg = iface_cfg or {}
+    script = str(cfg.get("reset_script", "") or "").strip()
+    if script:
+        return script, True
+
+    options = extract_interface_reset_options(cfg)
+    if options.get("modem_gateway"):
+        return "reset_XPro.py", True
+
+    return default_reset, False
+
+
+def _configure_reset_port(
+    script_path: Path, proxy_port: int, reset_options: dict | None
+) -> None:
+    if not reset_options:
+        return
+    _load_reset_modem_functions(script_path)
+    resolved = str(script_path.resolve()).lower()
+    cached = _RESET_MODULE_CACHE.get(resolved)
+    if not cached or len(cached) < 4:
+        return
+    module = cached[3]
+    port = int(proxy_port)
+    configure = getattr(module, "configure_port_options", None)
+    if callable(configure):
+        configure({port: dict(reset_options)})
+        return
+    gateway = reset_options.get("modem_gateway")
+    set_gw = getattr(module, "set_port_modem_gateway", None)
+    if callable(set_gw) and gateway:
+        set_gw(port, str(gateway))
+
+
+def collect_playwright_warmup_by_script(
+    config: dict, app_dir: Path
+) -> dict[str, tuple[list[int], dict[int, dict]]]:
+    """
+    Regroupe ports + options par script Playwright.
+    Retourne {chemin_script: (ports, port_options)}.
+    """
+    default_reset = config.get("reset_script_default", DEFAULT_RESET_SCRIPT)
+    by_script: dict[str, tuple[list[int], dict[int, dict]]] = {}
+
+    for iface_name, cfg in (config.get("interface_proxies", {}) or {}).items():
+        if not cfg or cfg.get("enabled", True) is False:
+            continue
+        try:
+            port = int(cfg.get("port", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if port <= 0:
+            continue
+        reset_script = cfg.get("reset_script", default_reset)
+        script_path = resolve_reset_script_path(reset_script, app_dir)
+        if not is_playwright_reset_script(script_path) or not script_path.exists():
+            continue
+
+        key = str(script_path.resolve()).lower()
+        ports_list, port_options = by_script.get(key, ([], {}))
+        opts = extract_interface_reset_options(cfg)
+        if port in port_options and opts.get("modem_gateway") != port_options[port].get(
+            "modem_gateway"
+        ):
+            print(
+                f"[RESET] ⚠️ Port {port}: conflit modem_gateway entre interfaces "
+                f"('{iface_name}' écrase la config précédente)"
+            )
+        port_options[port] = {**port_options.get(port, {}), **opts}
+        if port not in ports_list:
+            ports_list.append(port)
+        by_script[key] = (ports_list, port_options)
+
+    return by_script
 
 
 def _pick_system_python_for_reset() -> str:
@@ -275,73 +407,98 @@ def _ensure_playwright_runtime(python_exe: str, log_fn=None) -> bool:
     return _run([python_exe, "-c", "import playwright"], 25)
 
 
+def _run_playwright_reset_subprocess(
+    script_path: Path,
+    proxy_port: int,
+    timeout_seconds: int,
+    log_fn=None,
+    reset_options: dict | None = None,
+) -> int | None:
+    """Lance le reset en subprocess Python système. Retourne None si indisponible."""
+    if not script_path.exists():
+        return None
+    py = _pick_system_python_for_reset()
+    if not py or not _ensure_playwright_runtime(py, log_fn=log_fn):
+        if log_fn:
+            log_fn(
+                "[RESET] ⚠️ Python système introuvable ou installation Playwright impossible."
+            )
+        return None
+    cmd = [py, str(script_path), str(proxy_port)]
+    gateway = (reset_options or {}).get("modem_gateway")
+    if gateway:
+        cmd.append(str(gateway))
+    if log_fn:
+        log_fn(
+            f"[RESET] fallback subprocess: {' '.join(cmd)} | cwd={str(get_app_dir())}"
+        )
+    result = subprocess.run(
+        cmd,
+        timeout=timeout_seconds,
+        cwd=str(get_app_dir()),
+        creationflags=CREATE_NO_WINDOW,
+    )
+    return result.returncode
+
+
 def run_reset_script(
     script_path: Path,
     proxy_port: int,
     timeout_seconds: int = 120,
     log_fn=None,
+    reset_options: dict | None = None,
 ) -> int:
     """
     Exécute un reset:
-    - `reset_modem.py` est appelé en-process (browser persistant réutilisable).
-    - autres scripts Python restent en subprocess.
+    - scripts Playwright (reset_modem, reset_XPro, reset_huawei) en-process.
+    - autres scripts Python en subprocess.
     Retourne un code process-like (0 succès, 1 échec).
     """
-    # En mode .exe, on préfère un exécutable Python système pour reset_modem.py
-    # afin de permettre l'auto-install dynamique de Playwright.
-    if script_path.name.lower() == "reset_modem.py" and getattr(sys, "frozen", False):
-        if script_path.exists():
-            py = _pick_system_python_for_reset()
-            if py and _ensure_playwright_runtime(py, log_fn=log_fn):
-                cmd = [py, str(script_path), str(proxy_port)]
-                if log_fn:
-                    log_fn(
-                        f"[RESET] frozen fallback subprocess: {' '.join(cmd)} | cwd={str(get_app_dir())}"
-                    )
-                result = subprocess.run(
-                    cmd,
-                    timeout=timeout_seconds,
-                    cwd=str(get_app_dir()),
-                    creationflags=CREATE_NO_WINDOW,
-                )
-                return result.returncode
-            if log_fn:
-                log_fn(
-                    "[RESET] ⚠️ Python système introuvable ou installation Playwright impossible."
-                )
+    in_process = is_playwright_reset_script(script_path)
 
-    if script_path.name.lower() == "reset_modem.py":
+    if in_process and getattr(sys, "frozen", False) and script_path.exists():
+        code = _run_playwright_reset_subprocess(
+            script_path,
+            proxy_port,
+            timeout_seconds,
+            log_fn=log_fn,
+            reset_options=reset_options,
+        )
+        if code is not None:
+            return code
+
+    if in_process:
         try:
             reset_func, _ = _load_reset_modem_functions(script_path)
         except ModuleNotFoundError as e:
-            # Fallback si import playwright échoue dans le runtime embarqué.
-            if "playwright" in str(e).lower() and script_path.exists():
-                py = _pick_system_python_for_reset()
-                if py and _ensure_playwright_runtime(py, log_fn=log_fn):
-                    cmd = [py, str(script_path), str(proxy_port)]
-                    if log_fn:
-                        log_fn(
-                            f"[RESET] fallback playwright subprocess: {' '.join(cmd)} | cwd={str(get_app_dir())}"
-                        )
-                    result = subprocess.run(
-                        cmd,
-                        timeout=timeout_seconds,
-                        cwd=str(get_app_dir()),
-                        creationflags=CREATE_NO_WINDOW,
-                    )
-                    return result.returncode
+            if "playwright" in str(e).lower():
+                code = _run_playwright_reset_subprocess(
+                    script_path,
+                    proxy_port,
+                    timeout_seconds,
+                    log_fn=log_fn,
+                    reset_options=reset_options,
+                )
+                if code is not None:
+                    return code
             raise
+        _configure_reset_port(script_path, proxy_port, reset_options)
         if log_fn:
-            src = _RESET_MODEM_LOADED_FROM or str(script_path)
+            gw = (reset_options or {}).get("modem_gateway")
             log_fn(
-                f"[RESET] runtime: frozen={getattr(sys, 'frozen', False)} | source reset_modem={src}"
+                f"[RESET] runtime: frozen={getattr(sys, 'frozen', False)} | "
+                f"source={_reset_module_source(script_path)}"
+                + (f" | modem_gateway={gw}" if gw else "")
             )
+        kwargs = {}
+        if reset_options and reset_options.get("modem_gateway"):
+            kwargs["modem_gateway"] = reset_options["modem_gateway"]
         out = _LineForwarder(log_fn) if log_fn else None
         if out:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                ok = bool(reset_func(proxy_port))
+                ok = bool(reset_func(proxy_port, **kwargs))
         else:
-            ok = bool(reset_func(proxy_port))
+            ok = bool(reset_func(proxy_port, **kwargs))
         return 0 if ok else 1
 
     cmd = build_reset_command(script_path, proxy_port)
@@ -1594,9 +1751,15 @@ class InterfaceQuotaManager:
             )
 
             reset_ok = False
-            if script_path.exists() or script_path.name.lower() == "reset_modem.py":
+            reset_options = (entry or {}).get("reset_options") or {}
+            if script_path.exists() or is_playwright_reset_script(script_path):
                 result = await asyncio.to_thread(
-                    run_reset_script, script_path, proxy_port, 120
+                    run_reset_script,
+                    script_path,
+                    proxy_port,
+                    120,
+                    None,
+                    reset_options or None,
                 )
 
                 if result == 0:
@@ -3994,7 +4157,6 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._load_config()
-        self._start_playwright_browser_warmup()
 
         self.interface_manager.interfaces_updated.connect(self.on_interfaces_updated)
         self.interface_manager.public_ip_updated.connect(self.on_public_ip_updated)
@@ -4008,6 +4170,8 @@ class MainWindow(QMainWindow):
         # Première sync
         self.on_interfaces_updated(list(self.interface_manager.interfaces.values()))
         self._restore_initial_proxies()
+        # Attendre que les ProxyThread soient réellement en écoute avant warmup Playwright.
+        QTimer.singleShot(1500, self._start_playwright_browser_warmup)
         self._update_zrotate_interfaces_list()
         self._set_quarantine_ui_stopped()
 
@@ -4021,35 +4185,88 @@ class MainWindow(QMainWindow):
 
     def _start_playwright_browser_warmup(self):
         """
-        Pré-initialise reset_modem (thread dédié + browser persistant) en arrière-plan.
-        Si indisponible, le premier reset fera le lazy init.
+        Prépare les navigateurs reset (auth + page de rotation) en arrière-plan,
+        par script Playwright et par port proxy configuré.
+        Délai optionnel entre ports : WARMUP_STAGGER_ENABLED / WARMUP_STAGGER_SECONDS.
         """
 
         def _warmup():
             try:
                 app_dir = get_app_dir()
-                reset_script = self.config.get("reset_script_default", DEFAULT_RESET_SCRIPT)
-                script_path = resolve_reset_script_path(reset_script, app_dir)
-                if script_path.name.lower() != "reset_modem.py":
-                    return
-                _, init_fn = _load_reset_modem_functions(script_path)
-                if callable(init_fn):
-                    ports: list[int] = []
-                    for cfg in (self.config.get("interface_proxies", {}) or {}).values():
+                default_reset = self.config.get(
+                    "reset_script_default", DEFAULT_RESET_SCRIPT
+                )
+                # Ne warmup QUE les ports dont le ProxyThread correspondant est déjà running,
+                # sinon Playwright passe par un proxy TCP non ouvert => ERR_EMPTY_RESPONSE.
+                proxy_threads_snapshot = dict(self.proxy_threads)
+                ports_by_script: dict[str, list[int]] = {}
+                port_options_by_script: dict[str, dict[int, dict]] = {}
+
+                for iface_name, thread in proxy_threads_snapshot.items():
+                    if not getattr(thread, "running", False):
+                        continue
+                    cfg = getattr(thread, "config", None)
+                    proxy_port = int(getattr(cfg, "port", 0) or 0) if cfg else 0
+                    if proxy_port <= 0:
+                        continue
+
+                    iface_cfg = self.config.get("interface_proxies", {}).get(
+                        iface_name, {}
+                    )
+                    reset_script, is_explicit_mapping = resolve_interface_reset_script(
+                        iface_cfg, default_reset
+                    )
+                    script_path = resolve_reset_script_path(reset_script, app_dir)
+                    if not is_playwright_reset_script(script_path):
+                        continue
+                    # Évite les warmups "par défaut" Playwright (ex: reset_huawei.py en global)
+                    # quand l'interface n'a pas de mapping explicite reset_script/modem_gateway.
+                    if not is_explicit_mapping:
+                        continue
+                    if not script_path.exists():
+                        continue
+
+                    key = str(script_path.resolve()).lower()
+                    ports_by_script.setdefault(key, [])
+                    port_options_by_script.setdefault(key, {})
+                    if proxy_port not in ports_by_script[key]:
+                        ports_by_script[key].append(proxy_port)
+
+                    opts = extract_interface_reset_options(iface_cfg)
+                    if opts:
+                        prev = port_options_by_script[key].get(proxy_port) or {}
+                        port_options_by_script[key][proxy_port] = {
+                            **prev,
+                            **opts,
+                        }
+
+                for script_key, ports in ports_by_script.items():
+                    script_path = Path(script_key)
+                    _, init_fn = _load_reset_modem_functions(script_path)
+                    if not callable(init_fn):
+                        continue
+                    unique_ports = sorted({int(p) for p in ports if int(p) > 0})
+                    port_options = port_options_by_script.get(script_key) or {}
+                    for index, port in enumerate(unique_ports):
+                        single_opts = {port: dict(port_options.get(port) or {})}
                         try:
-                            p = int((cfg or {}).get("port", 0) or 0)
-                            if p > 0:
-                                ports.append(p)
-                        except Exception:
-                            continue
-                    ok = bool(init_fn(ports))
-                    if ok:
-                        if ports:
-                            print(
-                                f"[RESET] Browsers Playwright pré-initialisés pour ports: {sorted(set(ports))}"
-                            )
-                        else:
-                            print("[RESET] Service Playwright prêt (lazy init par port).")
+                            init_fn([port], port_options=single_opts)
+                        except TypeError:
+                            init_fn([port])
+
+                        gw = (single_opts.get(port) or {}).get("modem_gateway")
+                        print(
+                            f"[RESET] Préparation navigateur en arrière-plan "
+                            f"({script_path.name}, port {port}"
+                            + (f", gateway {gw}" if gw else "")
+                            + ")"
+                        )
+                        if (
+                            WARMUP_STAGGER_ENABLED
+                            and index < len(unique_ports) - 1
+                            and WARMUP_STAGGER_SECONDS > 0
+                        ):
+                            time.sleep(WARMUP_STAGGER_SECONDS)
             except Exception as e:
                 print(f"[RESET] Warmup Playwright ignoré: {e}")
 
@@ -4605,7 +4822,35 @@ class MainWindow(QMainWindow):
             # Taille de départ qui épouse le panneau central (agrandie de 50% en hauteur et 20% en largeur pour le panel droit)
             self.resize(1070, 920)  # Largeur: 400 + 540 + 20 espacement + marges ≈ 1070
 
+    def _save_zrotate_selection_config(self) -> None:
+        """
+        Persiste uniquement zrotate.selected_interfaces dans proxy_configs.json.
+        Toujours actif (même si PERSIST_CONFIG_TO_DISK est False) pour ne pas
+        écraser le reste du fichier édité à la main.
+        """
+        try:
+            config_path = get_app_dir() / self.CONFIG_FILE
+            data: dict = {}
+            if config_path.is_file():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+
+            zrotate_cfg = data.setdefault("zrotate", {})
+            selected = sorted(self.zrotate_selected_interfaces)
+            zrotate_cfg["selected_interfaces"] = selected
+
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+
+            self.config.setdefault("zrotate", {})["selected_interfaces"] = list(selected)
+        except Exception as e:
+            print(f"Erreur sauvegarde sélection ZRotate: {e}")
+
     def _save_config(self):
+        if not PERSIST_CONFIG_TO_DISK:
+            return
         try:
             # Ne jamais écraser les clés globales (ex. reset_script_default)
             self.config.setdefault("reset_script_default", DEFAULT_RESET_SCRIPT)
@@ -4857,8 +5102,8 @@ class MainWindow(QMainWindow):
             )
             return
 
-        reset_script = (iface_cfg or {}).get(
-            "reset_script",
+        reset_script, _ = resolve_interface_reset_script(
+            iface_cfg,
             self.config.get("reset_script_default", DEFAULT_RESET_SCRIPT),
         )
         app_dir = get_app_dir()
@@ -4873,16 +5118,19 @@ class MainWindow(QMainWindow):
         )
 
         def run_reset():
-            is_reset_modem = script_path.name.lower() == "reset_modem.py"
-            if not script_path.exists() and not is_reset_modem:
+            is_playwright_reset = is_playwright_reset_script(script_path)
+            if not script_path.exists() and not is_playwright_reset:
                 self.reset_completed.emit(name, -1)
                 return
 
             def ui_log(msg: str):
                 self.reset_log.emit(msg)
 
+            reset_options = extract_interface_reset_options(iface_cfg)
+            gw = reset_options.get("modem_gateway")
             ui_log(
-                f"[RESET] 🚀 Lancement {script_path.name} pour '{name}' (port {proxy_port})"
+                f"[RESET] 🚀 Lancement {script_path.name} pour '{name}' (port {proxy_port}"
+                + (f", gateway {gw})" if gw else ")")
             )
             try:
                 t0 = time.time()
@@ -4891,6 +5139,7 @@ class MainWindow(QMainWindow):
                     proxy_port,
                     120,
                     log_fn=ui_log,
+                    reset_options=reset_options or None,
                 )
                 elapsed = time.time() - t0
                 ui_log(
@@ -5274,7 +5523,7 @@ class MainWindow(QMainWindow):
             # Redémarrer après un court délai
             QTimer.singleShot(500, self._start_zrotate)
 
-        self._save_config()
+        self._save_zrotate_selection_config()
 
     def _clear_zrotate_console(self):
         """Efface le contenu de la console ZRotate"""
@@ -5446,13 +5695,16 @@ class MainWindow(QMainWindow):
                         proxy_port = int(widget.port_edit.text().strip())
                     except ValueError:
                         pass
-            reset_script = iface_cfg.get("reset_script", default_reset)
+            reset_script, _ = resolve_interface_reset_script(iface_cfg, default_reset)
             reset_script_path = str(resolve_reset_script_path(reset_script, app_dir))
 
             cfg = {"name": iface_name, "ip": interface_info.local_ip}
             if proxy_port is not None:
                 cfg["proxy_port"] = proxy_port
             cfg["reset_script_path"] = reset_script_path
+            reset_options = extract_interface_reset_options(iface_cfg)
+            if reset_options:
+                cfg["reset_options"] = reset_options
             egress_configs.append(cfg)
 
         # Ne mettre dans le pool que les clés qui ont une IP (déjà fait ci-dessus).
@@ -5612,11 +5864,6 @@ class MainWindow(QMainWindow):
     # --- Fermeture ---
     def closeEvent(self, event):
         print("[SHUTDOWN] closeEvent reçu, arrêt de l'application...")
-        # Sauvegarder taille fenêtre
-        size = [self.width(), self.height()]
-        self.config.setdefault("ui", {})["last_window_size"] = size
-        self._save_config()
-
         self._refresh_after_reset_timer.stop()
 
         # Arrêter tous les proxies proprement

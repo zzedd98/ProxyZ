@@ -1,0 +1,630 @@
+<html><head>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <title>Xproxy XH22 Wireless Router</title>
+
+    <script type="text/javascript" src="js/jquery/jquery.js" language="javascript"></script>
+    <script type="text/javascript">
+        var g_platformName = "mifi";
+        if (typeof jQuery == 'undefined') {
+            //document.location = "http://192.168.0.1?c=" + (new Date()).valueOf();
+            window.location.reload(true);
+        }   
+    </script>
+    <script type="text/javascript" src="js/jquery/jquery.i18n.properties-1.0.4.js" language="javascript"></script>
+
+    <script type="text/javascript" src="js/library/jquery.form.js" language="javascript"></script>
+    <script type="text/javascript" src="js/library/download.jQuery.js" language="javascript"></script>
+
+
+
+    <script type="text/javascript" src="js/library/md5.js" language="javascript"></script>
+    <script type="text/javascript" src="js/library/table.js" language="javascript"></script>
+    <script type="text/javascript" src="js/library/modaldbox.js" language="javascript"></script>
+
+
+    <script type="text/javascript" src="js/base/ajax_calls.js" language="javascript"></script>
+    <script type="text/javascript" src="js/base/utils.js" language="javascript"></script>
+    <script type="text/javascript" src="js/base/xml_helper.js" language="javascript"></script>
+    <script type="text/javascript" src="js/base/layout_manager.js" language="javascript"></script>
+    <script type="text/javascript" src="js/base/validator.js" language="javascript"></script>
+
+    <script type="text/javascript" src="js/controls/enabled_disabled.js" language="javascript"></script>
+    <script type="text/javascript" src="js/controls/ip_address.js" language="javascript"></script>
+    <script type="text/javascript" src="js/controls/visible_invisible.js" language="javascript"></script>
+    <script type="text/javascript" src="js/controls/allow_deny.js" language="javascript"></script>
+    <script type="text/javascript" src="js/controls/always_ondemand.js" language="javascript"></script>
+    <script type="text/javascript" src="js/controls/ascii_hex.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/dashboard.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/quick_setup.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/wireless/primary_network.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/internet/internet_connection.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/router/user_management.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/router/poweroff_router.js" language="javascript"></script>
+
+    <script type="text/javascript" src="js/panel/router/software_upgrade.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/router/conf_management.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/router/reboot_router.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/router/time_setting.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/router/acs_management.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/wireless/wireless_settings.js" language="javascript"></script>
+
+    <script type="text/javascript" src="js/panel/wireless/wireless_mac_filters.js" language="javascript"></script>
+
+    <script type="text/javascript" src="js/panel/home_network/network_activity.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/home_network/dhcp_settings.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/home_network/firewall_settings.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/home_network/connected_device.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/home_network/custom_fw.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/home_network/port_forwarding.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/home_network/port_filter.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/home_network/data_traffic.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/home_network/ussd.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/internet/manual_network.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/internet/traffic_statistics.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/internet/traffic_setting.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/internet/esim.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/internet/ping.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/internet/band.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/internet/imei.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/internet/pin_puk.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/internet/mep.js" language="javascript"></script>
+
+    <!--<script type="text/javascript" src="js/panel/phoneBook/phoneBook.js" language="javascript"></script>-->
+    <script type="text/javascript" src="js/panel/SMS/SMS.js" language="javascript"></script>
+    <script type="text/javascript" src="js/panel/SMS/SMSSettings.js" language="javascript"></script>
+
+
+
+
+
+    <script type="text/javascript" src="WebDav/WebDavObj.js" language="javascript"></script>
+    <script type="text/javascript" src="WebDav/SD_Card_management.js" language="javascript"></script>
+    <script type="text/javascript" src="WebDav/WebDavObj_Share.js" language="javascript"></script>
+
+
+    <link href="css/stylesheet.css" rel="stylesheet" type="text/css">
+    <link rel="stylesheet" type="text/css" href="css/table.css" media="all">
+    <link rel="stylesheet" type="text/css" href="css/webdav_table.css" media="all">
+    <link rel="stylesheet" type="text/css" href="css/modaldbox.css" media="all">
+
+
+    <link type="application/rss+xml" rel="alternate" href="ap-x.rss">
+
+    <script type="text/javascript">
+        //  var locale;
+        var deviceinfo_hardware_version = "";
+        var deviceinfo_version_num = "";
+        var deviceinfo_simmuxen = "";
+        var deviceinfo_simmuxpwd = "";
+        var deviceinfo_pingen = "";
+        var deviceinfo_tcarden = "";
+        var deviceinfo_devicetype = "";
+        var deviceinfo_banden = "";
+        var deviceinfo_imeien = "";
+
+        function getXml(xmlName) {
+            var url = "";
+            var content;
+            var host = window.location.protocol + "//" + window.location.host + "/";
+            url = host + 'xml_action.cgi?method=get&module=duster&file=' + xmlName;
+            content = $.ajax({
+                type: "GET",
+                'beforeSend': function (xhr) {
+                    xhr.setRequestHeader("Authorization", getAuthHeader("GET"))
+                },
+                url: url,
+                dataType: "xml",
+                async: false
+            }).responseXML;
+            var login_text = $(content).find("login_status").text();
+            if (login_text == "UNAUTHORIZED") {
+                return null;
+            }
+
+            if ("KICKOFF" == $(content).find("login_status").text()) {
+                return null;
+            }
+            return content;
+        }
+
+
+        function setLocale(value) {
+            setCookie("locale", value, 365);
+            setLocalization(getCookie('locale'));
+            var strLocale = getCookie('locale');
+            /*
+            var locale_lan;
+            if (strLocale == 'cn')
+                locale_lan = 'cn';
+            else
+                locale_lan = 'en';
+            postXMLlocale("locale", "<?xml version=\"1.0\" encoding=\"US-ASCII\"?><RGW><locale><language>" + locale_lan + "</language></locale></RGW>", 15000);
+            */
+            displayControls();
+            document.getElementById("tbarouter_username").focus();
+        }
+
+        function displayControls() {
+            document.getElementById("laUsername").innerHTML = jQuery.i18n.prop("laUsername");
+            document.getElementById("laPassword").innerHTML = jQuery.i18n.prop("laPassword");
+            document.getElementById("btnSignIn").value = jQuery.i18n.prop("btnSignIn");
+            document.getElementById("btnSharedFile").value = jQuery.i18n.prop("btnSharedFile");
+            document.getElementById("lTitleUAPXC").innerHTML = deviceinfo_hardware_version + ' ' + jQuery.i18n.prop("lTitleUAPXC");
+            document.getElementById("lacopyright").innerHTML = jQuery.i18n.prop("lacopyright");
+
+        }
+
+        function sharefile() {
+            document.getElementById("divAdminApp").style.width = "1000px";
+            document.getElementById("divAdminApp").innerHTML = callProductHTML("WebDav/WebDav_Share.html");
+            document.getElementById("lTitleShareFile").innerHTML = jQuery.i18n.prop("lTitleShareFile");
+            document.getElementById("ShareFileBack").innerHTML = jQuery.i18n.prop("ShareFileBack");
+            ShareFileShowInit();
+        }
+
+        function Login() {
+            var username = encodeURIComponent(document.getElementById("tbarouter_username").value);
+            var password = encodeURIComponent(document.getElementById("tbarouter_password").value);
+            var login_done;
+
+            //setLocalization(getCookie("locale"));
+            if (username == "" || password == "")
+                login_done = 0;
+            else
+                login_done = doLogin(username, password)
+            if (login_done == 1) {
+
+                document.getElementById("divAdminApp").innerHTML = callProductHTML("html/adminApp.html");
+                document.getElementById("lableWelcome").innerHTML = jQuery.i18n.prop("lableWelcome");
+                document.getElementById("quickSetup").innerHTML = jQuery.i18n.prop("quickSetupName");
+                document.getElementById("MainHelp").innerHTML = jQuery.i18n.prop("helpName");
+                document.getElementById("MainLogOut").innerHTML = jQuery.i18n.prop("LogOutName");
+                document.getElementById("divAdminApp").className = "";
+                document.getElementsByTagName("body")[0].className = "";
+
+                initAPP();
+
+            }
+            else {
+                document.getElementById('lloginfailed').style.display = 'block';
+                if (login_done == 0)
+                    document.getElementById("lloginfailed").innerHTML = jQuery.i18n.prop("lloginfailed");
+                else if (login_done == -1)
+                    document.getElementById("lloginfailed").innerHTML = jQuery.i18n.prop("lnoconn");
+            }
+        }
+        function checkEnter(e) {
+
+            var characterCode;
+            if (e && e.which) {
+                e = e
+                characterCode = e.which
+            } else {
+                e = event
+                characterCode = e.keyCode
+            }
+            if (characterCode == 13) {
+                Login();
+            }
+        }
+        function hideError() {
+            document.getElementById('lloginfailed').style.display = 'none';
+        }
+        var versionString;
+        function initIndex() {
+            if ("IE6" == GetBrowserType()) {
+
+                var fileref = document.createElement('script');
+                fileref.setAttribute("type", "text/javascript");
+                fileref.setAttribute("src", 'js/jquery/jquery.bgiframe.min.js');
+
+                document.getElementsByTagName("head")[0].appendChild(fileref);
+            }
+
+            var objXML = $().XML_Operations();
+            var versionXMLData = getVersionXML("version_num.txt");
+            var versionXML = objXML.getXMLDOCVersion(versionXMLData);
+
+            var strVesrion = $(versionXML).find("firmware_version").text();
+            strVesrion = strVesrion.substring(strVesrion.indexOf("UAPXC", 0), strVesrion.length);
+            strVesrion = strVesrion.replace("_", " ");
+            document.getElementById("version").innerHTML = strVesrion;
+            versionString = strVesrion;
+            var Last_loginString = "Last Login Time: ";
+            var lastLoginXMLData = getLastLoginXML("last_login.txt");
+            var lastlogindateXML = objXML.getXMLDOCVersion(lastLoginXMLData);
+            var Last_loginTime = $(lastlogindateXML).find("last_login").text();
+            if (Last_loginTime != '')
+                Last_loginString = Last_loginString + Last_loginTime
+            else
+                Last_loginString = ""
+            document.getElementById("last_login").innerHTML = Last_loginString;
+
+
+            document.getElementById("tbarouter_username").focus();
+            /*
+            var xml = callProductXML("locale");
+            var language = $(xml).find("language").text();
+            if (language == "en") {
+                setLocalization("en");
+                setCookie("locale", "en", 365);
+            }
+            else {
+                setLocalization("cn");
+                setCookie("locale", "cn", 365);
+            }
+            */
+
+            var xml;
+
+            var lang = getCookie('locale');
+            if (!lang) {
+                lang = navigator.language || navigator.browserLanguage;
+            }
+            if (!lang) {
+                lang = 'en-US';
+            }
+            lang = lang.substr(0, 2);
+            if (lang == 'zh') {
+                lang = 'cn';
+            }
+            if (lang != 'cn') {
+                lang = 'en';
+            }
+            setLocalization(lang);
+            setCookie("locale", lang, 365);
+
+            setCookie("platform", "mifi", 365);
+
+            xml = getXml("deviceinfo");
+            if (xml) {
+                deviceinfo_hardware_version = $(xml).find("hardware_version").text();
+                deviceinfo_version_num = $(xml).find("version_num").text();
+                deviceinfo_simmuxen = $(xml).find("simmuxen").text();
+                deviceinfo_simmuxpwd = $(xml).find("simmuxpwd").text();
+                deviceinfo_pingen = $(xml).find("pingen").text();
+                deviceinfo_tcarden = $(xml).find("tcarden").text();
+                deviceinfo_devicetype = $(xml).find("devicetype").text();
+                deviceinfo_banden = $(xml).find("banden").text();
+                deviceinfo_imeien = $(xml).find("imeien").text();
+            }
+
+            if (deviceinfo_tcarden == "0") {
+                var ctl = document.getElementById("btnSharedFile");
+                if (ctl) {
+                    ctl.style.display = 'none';
+                }
+            }
+			
+            deviceinfo_hardware_version = "Xproxy XH22";
+
+            document.title = deviceinfo_hardware_version + ' ' + jQuery.i18n.prop("lTitleUAPXC");
+
+
+            displayControls();
+        }
+
+
+        function initAPP() {
+            document.title = deviceinfo_hardware_version + ' ' + jQuery.i18n.prop("lTitleUAPXC");
+            document.getElementById("devicemodel").innerHTML = deviceinfo_hardware_version;
+
+            document.getElementById("lVesrion").innerHTML = versionString;
+            document.getElementById("lacopyright").innerHTML = jQuery.i18n.prop("lacopyright");
+            initmb();
+
+
+            createMenuFromXML();
+            createMenu(1);
+
+        }
+
+
+        function btnSkipQSClicked() {
+            if (document.getElementById("chkSkip").checked) {
+                var mapData = new Array(0);
+                mapData = putMapElement(mapData, "RGW/management/qs_complete", "1", 0);
+                postXML("qs_complete", g_objXML.getXMLDocToString(g_objXML.createXML(mapData)));
+            }
+            document.getElementById("lableWelcome").innerHTML = jQuery.i18n.prop("lableWelcome");
+            document.getElementById("quickSetupSpan").innerHTML = '<a href="#."  onclick="quickSetup()" id="quickSetup" >Quick Setup</a>  |  <a href="#." id="HelpName" onclick="getMainHelp()">Help</a>  |  <a href="#."  id="LogOutName"  onclick="logOut()">Log Out</a>';
+            document.getElementById("quickSetup").innerHTML = jQuery.i18n.prop("quickSetupName");
+            document.getElementById("HelpName").innerHTML = jQuery.i18n.prop("helpName");
+            document.getElementById("LogOutName").innerHTML = jQuery.i18n.prop("LogOutName");
+            hm();
+            createMenuFromXML();
+            createMenu(1);
+
+        }
+    </script>
+</head>
+
+<body onload="initIndex()" class=""><div id="ol" style="display: none; position: absolute; top: 0px; left: 0px; z-index: 998; width: 891px; height: 917px;"></div><div id="mbox" style="display: none; position: absolute; z-index: 999;"><span><div id="mbd"></div></span></div>
+    <div class="" id="divAdminApp"><div class="header" id="header">
+    <div class="logo"><img src="images/oem_logo.png" alt="OEM" title="OEM"></div>
+    <div class="loginArea"><label id="lableWelcome">Welcome</label> <a href="#"></a> <br>
+        <span id="quickSetupSpan"><a href="#." onclick="quickSetup()" id="quickSetup">Quick Setup</a> | <a href="#." id="MainHelp" onclick="getMainHelp()">Help</a> | <a href="#." id="MainLogOut" onclick="logOut()">Log Out</a></span>
+    </div>
+    <br class="clear">
+    <div class="navigation" id="navigation">
+        <ul id="menu"><li style="width: 157px;"><a href="#" id="1" onclick="createMenu(1)" class="on">Dashboard</a></li><li style="width: 157px;"><a href="#" id="2" onclick="createMenu(2)" class="">Internet</a></li><li style="width: 157px;"><a href="#" id="3" onclick="createMenu(3)" class="">Home Network</a></li><li style="width: 157px;"><a href="#" id="4" onclick="createMenu(4)" class="">SMS</a></li><li style="width: 157px;"><a href="#" id="5" onclick="createMenu(5)" class="">Wireless</a></li><li style="width: 157px;"><a href="#" id="6" onclick="createMenu(6)" class="">Router</a></li></ul>
+        <!--<div class="date" id="divDateTime"></div>-->
+    </div>
+</div>
+<div class="mainColumn" id="mainColumn"><div align="center" style="padding: 15px 0"><img src="images/globe.png" alt="" id="globeImage">
+    <img id="image1" alt="" class="arrow" src="images/con-arrow.png"> <img src="images/router.png" alt=""> <img id="image2" alt="" class="arrow" src="images/discon-arrow.png"> <img id="networkImage" alt="" src="images/network_gr.png">
+</div>
+<div class="homeBox">
+    <h2 id="h2Internet">Internet</h2>
+    <div class="boxInner brdr2">
+        <a id="Cellular"><span class="heading1" id="h3CellularConnection">Cellular Connection</span><strong id="pSignalStrength">Signal Strength:</strong>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<img id="imgSignalStrength" src="images/signal1.png" alt="" align="baseline"><br><br><strong id="pCellular">Cellular Data Connectivity:</strong><br><label id="lcconnectivity">Enabled</label><label class="link1" id="cellED" onclick="CellularED()" onmousedown="CellularED()" onmouseover="this.style.cursor='pointer';">Disabled</label><br><br><br><label class="link0" id="cellRotate" onclick="CellularRotate()" style="cursor: pointer; text-decoration: underline; color: #52587a; font-weight: bold;">Rotate Public IP</label><br></a>
+    </div>
+    <div class="boxInner brdr1 brdr2" id="Internet_DIV" style="display: block;">
+
+        <a href="#" onclick="dashboardOnClick(2,'mInternetConn')">
+            <span class="heading1" id="h3IntrenetConnection">Internet Connection</span>
+            <strong id="pISPName">Network Operator:</strong><br>
+            <label id="lISPName">NRJ MOBILE</label><br><br>
+            <strong id="pCellularMode">Cellular Network Mode:</strong><br>
+            <label id="lcconnectivitymode">LTE</label><br><br>
+            <!--<strong id="pWanConnStatus"> </strong><br />
+	        <img id="imgDashDefaultGateway" src="" alt="" align="right"/>
+	        <label id="lDashDHCP" style="text-transform:capitalize">  </label><br />-->
+        </a>
+
+        <a>
+            <strong id="SPdpInformation">PDP Information</strong><br>
+
+            <select id="pdpRuleNameDropdown" onchange="setDetailPDPInfo()"><option value="selectValuePDN1">PDN1</option></select><br></a>
+
+        <a href="#" onclick="dashboardOnClick(2,'mInternetConn')">
+
+            <div id="DetailPDP_DIV" style="display: block;">
+                <!--<strong id="Sconnum"></strong><br/>
+                <label id="LconnumValue"></label><br/>-->
+
+                <strong id="SpdpType">PDP Type</strong><br>
+                <label id="IpdpTypeValue">Default Primary PDP</label><br><br>
+                <strong id="SpdpSuccess">PDP Connection Status</strong><br>
+                <label id="LpdpSuccess">connected</label><br><br>
+
+
+                <strong id="SIPV4Address">IPv4 Address</strong><br>
+                <label id="LIPV4AddValue">100.96.179.252</label><br><br>
+                <strong id="SIPV4DNS">IPv4 DNS Server</strong><br>
+                <label id="LDNSIPV4Value">62.201.129.202,62.201.129.201</label><br><br>
+                <strong id="SIPV4Gateway">IPv4 Default Gateway</strong><br>
+                <label id="LIPV4GatewayValue">100.96.179.3</label><br><br>
+                <strong id="SIPV4Netmask">IPv4 Network Mask</strong><br>
+                <label id="LIPV4NetmaskValue">255.0.0.0</label><br><br>
+
+                <strong id="SIPV6Address">IPv6 Address</strong><br>
+                <label id="LIPV6AddValue">NA</label><br><br>
+                <strong id="SGIPV6Address">Global IPv6 Address</strong><br>
+                <label id="LGIPV6AddValue">NA</label><br><br>
+                <strong id="SIPV6DNS">IPv6 DNS Server</strong><br>
+                <label id="LDNSIPV6Value">NA,NA</label><br><br>
+                <strong id="SIPV6Gateway">IPv6 Default Gateway</strong><br>
+                <label id="LIPV6GatewayValue">NA</label><br><br>
+                <strong id="SIPV6Netmask">IPv6 Network Mask</strong><br>
+                <label id="LIPV6NetmaskValue">NA</label><br><br>
+
+                <strong id="pDashCurConnTime">Current Connect Time</strong><br>
+                <label id="lDashCurConnValue">0 Day 0 Hour 4 Minutes 20 Seconds </label><br><br>
+
+                <div id="dashboardPDPInfo" style="display: none;">
+                    <strong id="pDashTotalConnTime">Total Connect Time</strong><br>
+                    <label id="lDashTotalConnValue">0 Day 2 Hours 20 Minutes 51 Seconds </label><br><br>
+                </div>
+            </div>
+        </a>
+    </div>
+
+
+</div>
+<div class="homeBox marginLR">
+    <h2 id="h2Router">Router</h2>
+    <div class="boxInner brdr1">
+        <a href="#" onclick="dashboardOnClick(3,'mDHCP_Settings')" id="h3LANIP">
+            <span class="heading1" id="h3RouterInfo">Router Information</span>
+            <strong id="pDashRouterLANIP">Router LAN IP:</strong><br>
+            <label id="lRouterIP">192.168.100.1</label> <br><br>
+            <strong id="pDashRouterImeiTag">IMEI:</strong><br>
+            <label id="lDashRouterImeiValue">357872314784035</label> <br><br>
+            <strong id="pDashRouterIccidTag">ICCID:</strong><br>
+            <label id="lDashRouterIccidValue">8933202725006417200F</label> <br><br>
+            <strong id="pDashRouterMask">Router Network Mask:</strong><br>
+            <label id="lRouterMask">255.255.255.0</label> <br><br>
+            <strong id="pDashRouterMAC">Router MAC:</strong><br>
+            <label id="lRouterMAC">E8:49:43:23:A5:CF</label> <br><br>
+            <strong id="pDashRouterRunTime">Run Time:</strong><br>
+            <label id="lDashRunDaysValue">0 Day </label>
+            <label id="lDashRunHoursValue">2 Hours </label>
+            <label id="lDashRunMinutesValue">24 Minutes </label>
+            <label id="lDashRunSecondsValue">44 Seconds </label><br><br>
+
+            <div id="dashboardBatInfo" style="display: none;">
+                <strong id="pDashBetteryInfo">Battery Charging:</strong><br>
+                <label id="lDashChargeStatus">No Battery</label><br><br>
+                <strong id="pDashBetteryVol">Battery Electric Quantity:</strong><br>
+                <label id="lDashBatteryQuantity">No Battery</label><br><br>
+            </div>
+        </a>
+    </div>
+
+    <div class="boxInner brdr2">
+        <a href="#" onclick="dashboardOnClick(5,'mSoftUpdate')">
+            <span class="heading1" id="h3SoftInfo">Software Information</span>
+            <strong id="pDeviceModel" style="display:none;">Device Mode:</strong>
+            <!--<br />-->
+            <label id="lDeviceModelValue" style="display:none;">XH22</label><!-- <br /><br />-->
+            <strong id="pSoftVersion">Software Version:</strong><br>
+            <label id="lSoftVersion">XH22_V2_NA-V4.9.12_xproxyb_ims</label> <br><br>
+            <strong id="pHardVersion">Hardware Version:</strong><br>
+            <label id="lHardVersion">XH22_V2_NA</label>
+        </a>
+        
+    </div>
+
+    <div id="divAutoApn" style="display:none;">
+        <h2 id="h2AutoApn">Auto APN List</h2>
+        <div class="boxInner brdr1">
+            <a href="#" onclick="dashboardOnClick(2,'mInternetConn')" id="h3AutoApn">
+                <strong id="pDashAutoApn_mmcTag">MCC:</strong><label id="pDashAutoApn_mmcValue" style="margin-left:5px;margin-bottom:5px;"></label><br><br>
+                <strong id="pDashAutoApn_mncTag">MNC:</strong><label id="pDashAutoApn_mncValue"></label><br><br>
+                <strong id="pDashAutoApn_OperatorNameTag">Operator Name:</strong><label id="pDashAutoApn_OperatorNameValue" style="margin-left:5px;"></label><br><br>
+                <strong id="pDashAutoApn_ApnTag">APN:</strong><label id="pDashAutoApn_ApnValue" style="margin-left:5px;"></label><br><br>
+                <strong id="pDashAutoApn_LteApnTag">LTE APN:</strong><label id="pDashAutoApn_LteApnValue" style="margin-left:5px;"></label> <br><br>
+                <strong id="pDashAutoApn_NetworkTypeTag">Network Type:</strong><label id="pDashAutoApn_NetworkTypeValue" style="margin-left:5px;"></label><br><br>
+                <strong id="pDashAutoApn_authtype2g3gTag">2G3G Auth Type:</strong><label id="pDashAutoApn_authtype2g3gValue" style="margin-left:5px;"></label><br><br>
+                <strong id="pDashAutoApn_username2g3gTag">2G3G User Name:</strong><label id="pDashAutoApn_username2g3gValue" style="margin-left:5px;"></label><br><br>
+                <strong id="pDashAutoApn_password2g3gTag">2G3G Password:</strong><label id="pDashAutoApn_password2g3gValue" style="margin-left:5px;"></label><br><br>
+                <strong id="pDashAutoApn_authtype4gTag">4G Auth Type:</strong><label id="pDashAutoApn_authtype4gValue" style="margin-left:5px;"></label><br><br>
+                <strong id="pDashAutoApn_username4gTag">4G User Name:</strong><label id="pDashAutoApn_username4gValue" style="margin-left:5px;"></label><br><br>
+                <strong id="pDashAutoApn_password4gTag">4G Password:</strong><label id="pDashAutoApn_password4gValue" style="margin-left:5px;"></label><br><br>
+                <strong id="pDashAutoApn_iptypeTag">Ip Type:</strong><label id="pDashAutoApn_iptypeValue" style="margin-left:5px;"></label><br>
+            </a>
+        </div>
+    </div>
+
+</div>
+
+<div class="homeBox">
+    <h2 id="h2HomeNw">Home Network</h2>
+    <div class="boxInner brdr1">
+        <a href="#" onclick="dashboardOnClick(3,'mConnected_Devices')"><span class="heading1" id="h3ConnDevice">Connected Devices</span>
+            <img id="imgConnDevice" src="images/status-icon3.png" alt="" align="right">
+            <label id="lConnDeviceValue">1</label>
+        </a>
+        <br class="clear clearCrm">
+    </div>
+
+    <div class="boxInner brdr1 brdr2" id="wlan_enble">
+        <a href="#" onclick="dashboardOnClick(4,'mWire_Set')">
+            <span class="heading1" id="h3Wireless">Wireless</span>
+            <img id="imgWN" src="images/status-icon2.png" alt="" align="right" style="display: block;">
+            <label id="lWLANStatus">Disabled</label> </a>
+    </div>
+    <div class="boxInner brdr1 brdr2" id="wlan_settings" style="display: none;">
+        <a href="#" onclick="dashboardOnClick(4,'mWire_Sec')">
+            <span class="heading1" id="h3WirelessS">Wireless Settings</span>
+            <strong id="pWirelessNw">Wireless Network:</strong><br>
+            <label id="lWirelessNwValue">UFI_A5CF</label> <br><br>
+            <strong id="pSecurityMode">Security Mode:</strong><br>
+            <label id="lSecurityModeValue">WPA2-PSK</label> <br><br>
+            <strong id="pChannelNumber">Channel Number:</strong><br>
+            <label id="lChannelNumber">Automatic</label> </a>
+    </div>
+    <div class="boxInner brdr2">
+        <a href="#" onclick="dashboardOnClick(3,'mDHCP_Settings')">
+            <span id="h3DhcpServer" class="heading1">DHCP Server</span>
+            <img id="imgDhcpServerValue" src="images/status-icon3.png" alt="" style="display: block;" align="right">
+            <label id="lDhcpServerValue">Enabled</label>
+        </a>
+    </div>
+
+    <div class="boxInner brdr2" id="dashboardPacketInfo" style="display: none;">
+        <a href="#" onclick="dashboardOnClick(2,'mTrafficStats')">
+            <span class="heading1" id="h3IntConn">Traffic Statistics</span>
+            <strong id="pSentPackets">Sent Packets:</strong><br>
+            <label id="lsentPackets">14902</label><br><br>
+
+            <strong id="pRecPackets">Received Packets:</strong><br>
+            <label id="lRecPackets">17001</label>
+            <span class="boxInner brdr1" id="traffic_reset_div"><label class="link1" id="resetTraffic" onclick="ResetTraffic()" onmousedown="ResetTraffic()" onmouseover="this.style.cursor='pointer';">Reset</label></span>
+        </a>
+    </div>
+
+</div>
+<br class="clear"></div>
+<div id="alertMB" style="display: none">
+
+    <h1 id="lAlert"></h1>
+
+    <a href="#" class="close" onclick="hm()"><img src="images/close-icon.gif" alt=""></a><br style="clear:both">
+
+    <div align="center">
+        <label id="lAlertMessage" class="lable12"></label>
+        <br style="clear:both">
+        <div class="buttonRow1" style="border-top:1px solid #a7a7a7; padding:7px 0; margin:7px 0 0 0; text-align:center">
+            <span class="btnWrp"><input id="btnModalOk" type="button" value="OK" onclick="hm()"></span>
+        </div>
+    </div>
+
+</div>
+<div id="mbox" style="display: none">
+    <div class="" id="PleaseWait">
+
+        <div align="center">
+            <br>
+            <img src="images/PleaseWait.png" alt="..." class="loading" id="WaitPic">
+            <br>
+            <label id="lPleaseWait"></label>
+        </div>
+    </div>
+</div>
+<script type="text/javascript">
+    function displayControls() {
+        document.getElementById("laUsername").innerHTML = jQuery.i18n.prop("laUsername");
+        document.getElementById("laPassword").innerHTML = jQuery.i18n.prop("laPassword");
+        document.getElementById("btnSignIn").value = jQuery.i18n.prop("btnSignIn");
+        //document.getElementById("lSignIn").innerHTML = jQuery.i18n.prop("lTitle");
+        document.getElementById("lacopyright").innerHTML = jQuery.i18n.prop("lacopyright");
+
+    }
+</script>
+
+<div id="mbox1" style="display: none">
+    <div class="popUpBox popUpBox3" id="MBQuickSetup">
+        <div class="pBoxCont" style="padding:10px 55px 10px 20px;">
+            <h2 class="subtlt" id="QsText">Welcome!</h2>
+
+            <p id="QsText1"></p>
+            <p id="QsText2"></p>
+            <br>
+            <br>
+            <div align="center">
+                <span class="btnWrp">
+                    <input type="button" id="btnQuickSetup" value="Quick Setup" onclick="hm(); quickSetup()" style="padding:3px 3px;">
+                </span>
+            </div>
+            <br>
+            <br>
+            <br>
+            <input id="chkSkip" type="checkbox" value="" class="chk"><label id="QsText3" style="width:230px; color:#333; padding:2px 0 0 0;">Don't show Quick Setup in future.</label>
+            <span class="btnWrp skip" style="margin-left: auto;margin-right: auto;"> <input id="btnSkip" type="button" value="Skip" onclick="btnSkipQSClicked()"></span>
+
+
+            <br style="clear:both">
+            <label class="error" style="width:500px; margin-left:22px" id="QsText4"></label>
+            <br style="clear:both">
+
+        </div>
+    </div>
+</div>
+<div class="footer">
+    <div class="footerLft"></div>
+    <div class="footerMast">
+        <div id="lacopyright">Copyright 2017-2023, All Rights Reserved.</div>
+        <span class="logoTxt" id="devicemodel">Xproxy XH22</span>
+        <span class="footerTxt"><label id="lVesrion">UAPXC v2.6.0</label></span>
+    </div>
+    <div class="footerRgt"></div>
+</div></div>
+
+
+<input type="hidden" id="batterystatus" value="Fully Charged">
+<input type="hidden" id="batterylevel" value="100%">
+<input type="hidden" id="signalstrength" value="Good">
+<input type="hidden" id="ulCurrentDataRate" value="32 bps">
+<input type="hidden" id="dlCurrentDataRate" value="32 bps">
+<input type="hidden" id="connectionTime" value="00:00:11:11">
+<input type="hidden" id="imsi" value="208202700641720">
+<input type="hidden" id="devicemodel" value="AR5510">
+<input type="hidden" id="connectedStatus" value="Attached">
+<input type="hidden" id="physicalcellId" value="N/A">
+<input type="hidden" id="noOfClient" value="2">
+<input type="hidden" id="eutrancellid" value="N/A">
+
+
+</body></html>

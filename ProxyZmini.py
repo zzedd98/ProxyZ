@@ -11,13 +11,18 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QVBoxLayout,
     QWidget,
+    QMainWindow,
     QApplication,
     QLabel,
     QPushButton,
     QTextEdit,
 )
 
-from ProxyZ import MainWindow, ManualInterfacesList, ensure_local_build_id_file
+from ProxyZ import (
+    MainWindow,
+    ManualInterfacesList,
+    ensure_local_build_id_file,
+)
 
 
 class ProxyZMiniWindow(MainWindow):
@@ -209,6 +214,7 @@ class ProxyZMiniWindow(MainWindow):
             self.resize(400, 920)
 
     def _save_config(self):
+        return
         try:
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
@@ -256,6 +262,31 @@ class ProxyZMiniWindow(MainWindow):
 
     def _auto_start_zrotate(self):
         return
+
+    def closeEvent(self, event):
+        """Fermeture dédiée ProxyZmini: arrêt propre, sans persistance config."""
+        print("[SHUTDOWN][MINI] closeEvent reçu, arrêt de l'application...")
+        self._refresh_after_reset_timer.stop()
+
+        # Arrêter tous les proxies proprement
+        for name, thread in list(self.proxy_threads.items()):
+            try:
+                print(f"[SHUTDOWN][MINI] Arrêt proxy pour interface '{name}'...")
+                thread.stop()
+                if not thread.wait(2000):
+                    thread.wait(1000)
+            except Exception:
+                traceback.print_exc()
+        self.proxy_threads.clear()
+
+        # Arrêter InterfaceManager (timers + workers)
+        try:
+            self.interface_manager.shutdown()
+        except Exception:
+            traceback.print_exc()
+
+        print("[SHUTDOWN][MINI] Fermeture de la fenêtre principale.")
+        QMainWindow.closeEvent(self, event)
 
 
 def main():
