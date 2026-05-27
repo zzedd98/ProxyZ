@@ -456,17 +456,6 @@ def run_reset_script(
     """
     in_process = is_playwright_reset_script(script_path)
 
-    if in_process and getattr(sys, "frozen", False) and script_path.exists():
-        code = _run_playwright_reset_subprocess(
-            script_path,
-            proxy_port,
-            timeout_seconds,
-            log_fn=log_fn,
-            reset_options=reset_options,
-        )
-        if code is not None:
-            return code
-
     if in_process:
         try:
             reset_func, _ = _load_reset_modem_functions(script_path)
