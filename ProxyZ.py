@@ -13,6 +13,7 @@ import select
 import socket
 from dataclasses import dataclass
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import re
 import subprocess
 import shutil
@@ -43,6 +44,15 @@ PERSIST_CONFIG_TO_DISK = False
 WARMUP_STAGGER_ENABLED = False
 WARMUP_STAGGER_SECONDS = 2.0
 
+# Polling interfaces / IP publique (perf CPU-GPU, réactivité préservée sur changement réel)
+INTERFACE_REFRESH_BASE_MS = 5000
+INTERFACE_NETSH_INTERVAL_S = 8.0
+INTERFACE_PUBLIC_IP_BASE_MS = 12000
+INTERFACE_PUBLIC_IP_WORKERS = 4
+INTERFACE_PUBLIC_IP_STABLE_SKIP_S = 45.0
+INTERFACE_STABLE_CYCLES_BEFORE_SLOW = 5
+INTERFACE_SLOW_MULTIPLIER = 2
+
 # Scripts reset Playwright avec navigateur persistant (warmup page + reset rapide)
 PLAYWRIGHT_RESET_SCRIPT_NAMES = frozenset(
     {
@@ -55,6 +65,208 @@ PLAYWRIGHT_RESET_SCRIPT_NAMES = frozenset(
 
 def is_playwright_reset_script(script_path: Path) -> bool:
     return script_path.name.lower() in PLAYWRIGHT_RESET_SCRIPT_NAMES
+
+
+INTERFACE_CARD_QSS = """
+QFrame#interfaceCard {
+    background-color: #2c3e50;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+}
+QFrame#interfaceCard[connected="true"] {
+    background-color: #244938;
+    border: 1px solid rgba(46, 204, 113, 0.6);
+}
+QFrame#interfaceCard[disconnected="true"] {
+    background-color: #2b2b2b;
+    border: 1px dashed rgba(255, 255, 255, 0.15);
+}
+QLabel#ifaceName {
+    color: #ecf0f1;
+    font-size: 14px;
+    font-weight: 700;
+}
+QLabel#metricBadge {
+    background-color: rgba(149, 165, 166, 0.18);
+    color: #bdc3c7;
+    border-radius: 9px;
+    padding: 1px 6px;
+    font-size: 11px;
+}
+QLabel#autoBadge {
+    background-color: rgba(52, 152, 219, 0.18);
+    color: #3498db;
+    border-radius: 9px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+QLabel#ipLabel {
+    color: #bdc3c7;
+    font-size: 11px;
+}
+QLabel#publicIpHeaderLabel {
+    color: #ecf0f1;
+    font-size: 13px;
+    font-weight: 700;
+}
+QLabel#proxyOnChip {
+    background-color: rgba(52, 152, 219, 0.3);
+    color: #ecf0f1;
+    border-radius: 10px;
+    padding: 3px 10px;
+    font-size: 12px;
+    font-weight: 700;
+    border: 1px solid rgba(52, 152, 219, 0.8);
+}
+QLabel#proxyOffChip {
+    background-color: rgba(127, 140, 141, 0.25);
+    color: #bdc3c7;
+    border-radius: 8px;
+    padding: 2px 8px;
+    font-size: 11px;
+    border: 1px solid transparent;
+}
+QLabel#proxyOnChip:hover,
+QLabel#proxyOffChip:hover {
+    background-color: rgba(59, 130, 246, 0.35);
+    color: #ffffff;
+    border-color: rgba(59, 130, 246, 0.9);
+}
+QLabel#resetBadge {
+    background-color: rgba(255, 255, 255, 0.15);
+    color: #ffffff;
+    border-radius: 8px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+}
+QLabel#resetBadge:hover {
+    background-color: rgba(255, 255, 255, 0.25);
+    color: #ffffff;
+    border-color: rgba(255, 255, 255, 0.5);
+}
+QLabel#resetBadge[loading="true"] {
+    background-color: rgba(59, 130, 246, 0.3);
+    color: #ffffff;
+    border-color: rgba(59, 130, 246, 0.6);
+}
+QLineEdit#portEdit {
+    background-color: #22313f;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    padding: 3px 6px;
+    color: #ecf0f1;
+    font-size: 12px;
+}
+QLineEdit#portEdit:focus {
+    border: 1px solid #3498db;
+}
+"""
+
+ZROTATE_INTERFACE_ROW_QSS = """
+QFrame#zrotateInterfaceRow {
+    background-color: rgba(15, 23, 42, 0.78);
+    border: 1px solid rgba(59, 130, 246, 0.22);
+    border-radius: 10px;
+}
+QFrame#zrotateInterfaceRow:hover {
+    border: 1px solid rgba(59, 130, 246, 0.45);
+    background-color: rgba(30, 41, 59, 0.9);
+}
+QFrame#zrotateInterfaceRow[poolEnabled="false"] {
+    background-color: rgba(51, 65, 85, 0.42);
+    border: 1px solid rgba(148, 163, 184, 0.22);
+}
+QFrame#zrotateInterfaceRow[poolEnabled="false"] QCheckBox#zrotateInterfaceCheckbox {
+    color: #94a3b8;
+}
+QFrame#zrotateInterfaceRow[poolEnabled="false"] QLabel#zrotateIpChip {
+    color: #94a3b8;
+    background-color: rgba(71, 85, 105, 0.28);
+    border-color: rgba(148, 163, 184, 0.35);
+}
+QFrame#zrotateInterfaceRow[zrotateLive="active"] {
+    background-color: rgba(36, 73, 56, 0.88);
+    border: 1px solid rgba(46, 204, 113, 0.55);
+}
+QFrame#zrotateInterfaceRow[zrotateLive="standby"] {
+    background-color: rgba(90, 70, 30, 0.55);
+    border: 1px solid rgba(241, 196, 15, 0.5);
+}
+QFrame#zrotateInterfaceRow[zrotateLive="resetting"] {
+    background-color: rgba(70, 55, 30, 0.65);
+    border: 1px solid rgba(243, 156, 18, 0.65);
+}
+QFrame#zrotateInterfaceRow[zrotateLive="quarantine"] {
+    background-color: rgba(90, 35, 35, 0.55);
+    border: 1px solid rgba(231, 76, 60, 0.6);
+}
+QFrame#zrotateInterfaceRow[zrotateLive="session"] {
+    background-color: rgba(30, 41, 59, 0.55);
+    border: 1px solid rgba(100, 116, 139, 0.45);
+}
+QCheckBox#zrotateInterfaceCheckbox {
+    color: #e2e8f0;
+    font-size: 14px;
+    font-weight: 600;
+}
+QLabel#zrotateIpChip, QLabel#zrotateGetChip, QLabel#zrotateConnectChip {
+    color: #dbeafe;
+    background-color: rgba(30, 64, 175, 0.24);
+    border: 1px solid rgba(96, 165, 250, 0.45);
+    border-radius: 8px;
+    padding: 2px 8px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QLabel#zrotateConnectChip {
+    background-color: rgba(6, 95, 70, 0.28);
+    border-color: rgba(16, 185, 129, 0.5);
+}
+"""
+
+
+def _qt_apply_properties(widget, properties: dict) -> bool:
+    """Met à jour les propriétés dynamiques Qt ; polish uniquement si changement."""
+    changed = False
+    for key, value in properties.items():
+        if widget.property(key) != value:
+            widget.setProperty(key, value)
+            changed = True
+    if changed:
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)
+    return changed
+
+
+def interfaces_ui_snapshot(interfaces: dict[str, "InterfaceInfo"]) -> tuple:
+    """Snapshot hashable pour interfaces_updated (sans IP publique / online)."""
+    return tuple(
+        sorted(
+            (
+                name,
+                info.metric,
+                info.is_up,
+                info.local_ip,
+                info.automatic,
+            )
+            for name, info in interfaces.items()
+        )
+    )
+
+
+def zrotate_visible_structure_signature(interfaces: dict[str, "InterfaceInfo"]) -> tuple:
+    """Signature structurelle de la liste ZRotate (interfaces visibles, ordre trié)."""
+    return tuple(
+        sorted(
+            name
+            for name, info in interfaces.items()
+            if info.is_up and info.local_ip
+        )
+    )
 
 
 def get_app_dir() -> Path:
@@ -663,43 +875,85 @@ class InterfaceManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.interfaces: dict[str, InterfaceInfo] = {}
-        # Threads Python pour IP publique (évite d'utiliser QThread qui peut crasher en natif)
-        self._public_ip_threads: dict[str, threading.Thread] = {}
+        self._last_ui_snapshot: tuple | None = None
+        self._stable_refresh_cycles = 0
+        self._ui_minimized = False
+        self._netsh_cache: dict[str, dict] = {}
+        self._netsh_cache_time = 0.0
+        self._force_netsh_refresh = True
+        self._last_psutil_iface_keys: frozenset[str] = frozenset()
+        self._public_ip_executor = ThreadPoolExecutor(
+            max_workers=INTERFACE_PUBLIC_IP_WORKERS,
+            thread_name_prefix="pubip",
+        )
+        self._public_ip_inflight: set[str] = set()
+        self._public_ip_inflight_lock = threading.Lock()
+        self._public_ip_last_ok: dict[str, tuple[str, float]] = {}
 
         self.refresh_timer = QTimer(self)
-        self.refresh_timer.setInterval(2000)
-        self.refresh_timer.timeout.connect(self.refresh_interfaces)
-        self.refresh_timer.start()
+        self.refresh_timer.timeout.connect(
+            lambda: self.refresh_interfaces(force_netsh=False)
+        )
 
         self.public_ip_timer = QTimer(self)
-        # IP publique plus réactive : toutes les 5 secondes
-        self.public_ip_timer.setInterval(5000)
-        self.public_ip_timer.timeout.connect(self.refresh_public_ips)
+        self.public_ip_timer.timeout.connect(
+            lambda: self.refresh_public_ips(force=False)
+        )
+
+        self._recompute_timer_intervals()
+        self.refresh_timer.start()
         self.public_ip_timer.start()
 
         # Première charge
         try:
-            self.refresh_interfaces()
-            # Lancer immédiatement une première résolution d'IP publique
-            self.refresh_public_ips()
+            self.refresh_interfaces(force_netsh=True)
+            self.refresh_public_ips(force=True)
         except Exception:
             traceback.print_exc()
 
+    def notify_window_minimized(self, minimized: bool) -> None:
+        if self._ui_minimized == minimized:
+            return
+        self._ui_minimized = minimized
+        if not minimized:
+            self._stable_refresh_cycles = 0
+        self._recompute_timer_intervals()
+
+    def request_immediate_refresh(self) -> None:
+        """Refresh complet (netsh + psutil + IP) après reset, rename, métriques, etc."""
+        self._force_netsh_refresh = True
+        self._stable_refresh_cycles = 0
+        self._recompute_timer_intervals()
+        self.refresh_interfaces(force_netsh=True)
+        self.refresh_public_ips(force=True)
+
+    def _recompute_timer_intervals(self) -> None:
+        mult = 1
+        if self._ui_minimized:
+            mult *= INTERFACE_SLOW_MULTIPLIER
+        if self._stable_refresh_cycles >= INTERFACE_STABLE_CYCLES_BEFORE_SLOW:
+            mult *= INTERFACE_SLOW_MULTIPLIER
+        refresh_ms = INTERFACE_REFRESH_BASE_MS * mult
+        public_ip_ms = INTERFACE_PUBLIC_IP_BASE_MS * mult
+        if getattr(self, "refresh_timer", None) is not None:
+            self.refresh_timer.setInterval(refresh_ms)
+        if getattr(self, "public_ip_timer", None) is not None:
+            self.public_ip_timer.setInterval(public_ip_ms)
+
     def shutdown(self):
-        """Arrête proprement les timers et attend la fin des threads IP publique."""
+        """Arrête proprement les timers et le pool IP publique."""
         try:
             self.refresh_timer.stop()
             self.public_ip_timer.stop()
         except Exception:
             traceback.print_exc()
 
-        for name, th in list(self._public_ip_threads.items()):
-            try:
-                if th.is_alive():
-                    th.join(timeout=2.0)
-            except Exception:
-                traceback.print_exc()
-        self._public_ip_threads.clear()
+        try:
+            self._public_ip_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            traceback.print_exc()
+        with self._public_ip_inflight_lock:
+            self._public_ip_inflight.clear()
 
     # --- Récupération des interfaces & métriques ---
     def _parse_netsh_interfaces(self) -> dict[str, dict]:
@@ -751,16 +1005,38 @@ class InterfaceManager(QObject):
 
         return result
 
-    def refresh_interfaces(self):
-        netsh_data = self._parse_netsh_interfaces()
-        if not netsh_data:
-            return
+    def _should_refresh_netsh(self, force: bool, addrs) -> bool:
+        if force or self._force_netsh_refresh:
+            return True
+        if not self._netsh_cache:
+            return True
+        if frozenset(addrs.keys()) != self._last_psutil_iface_keys:
+            return True
+        return (time.monotonic() - self._netsh_cache_time) >= INTERFACE_NETSH_INTERVAL_S
 
+    def refresh_interfaces(self, force_netsh: bool = False):
         try:
             addrs = psutil.net_if_addrs()
             stats = psutil.net_if_stats()
         except Exception:
             traceback.print_exc()
+            return
+
+        iface_keys = frozenset(addrs.keys())
+        if iface_keys != self._last_psutil_iface_keys:
+            self._last_psutil_iface_keys = iface_keys
+            force_netsh = True
+
+        if self._should_refresh_netsh(force_netsh, addrs):
+            netsh_data = self._parse_netsh_interfaces()
+            if netsh_data:
+                self._netsh_cache = netsh_data
+                self._netsh_cache_time = time.monotonic()
+                self._force_netsh_refresh = False
+        else:
+            netsh_data = self._netsh_cache
+
+        if not netsh_data:
             return
 
         new_interfaces: dict[str, InterfaceInfo] = {}
@@ -807,28 +1083,43 @@ class InterfaceManager(QObject):
                 online=online,
             )
 
+        snapshot = interfaces_ui_snapshot(new_interfaces)
+        if snapshot == self._last_ui_snapshot:
+            self._stable_refresh_cycles += 1
+        else:
+            self._stable_refresh_cycles = 0
+            self._last_ui_snapshot = snapshot
+            self.interfaces = new_interfaces
+            self.interfaces_updated.emit(list(self.interfaces.values()))
+            self._recompute_timer_intervals()
+            return
+
         self.interfaces = new_interfaces
-        self.interfaces_updated.emit(list(self.interfaces.values()))
+        self._recompute_timer_intervals()
 
     # --- Public IP / connectivité ---
-    def refresh_public_ips(self):
-        for name, info in self.interfaces.items():
+    def refresh_public_ips(self, force: bool = False):
+        now = time.monotonic()
+        for name, info in list(self.interfaces.items()):
             if not info.is_up or not info.local_ip:
                 continue
-            # Ne pas lancer plusieurs threads en parallèle pour la même interface
-            th = self._public_ip_threads.get(name)
-            if th is not None and th.is_alive():
-                continue
-            # print(
-            #     f"[REFRESH] Lancement thread IP publique pour interface '{name}' ({info.local_ip})"
-            # )
-            t = threading.Thread(
-                target=self._public_ip_worker_thread,
-                args=(name, info.local_ip),
-                daemon=True,
+            with self._public_ip_inflight_lock:
+                if name in self._public_ip_inflight:
+                    continue
+            if not force:
+                last_ok = self._public_ip_last_ok.get(name)
+                if (
+                    last_ok
+                    and info.online
+                    and info.public_ip == last_ok[0]
+                    and (now - last_ok[1]) < INTERFACE_PUBLIC_IP_STABLE_SKIP_S
+                ):
+                    continue
+            with self._public_ip_inflight_lock:
+                self._public_ip_inflight.add(name)
+            self._public_ip_executor.submit(
+                self._public_ip_worker_thread, name, info.local_ip
             )
-            self._public_ip_threads[name] = t
-            t.start()
 
     def _public_ip_worker_thread(self, name: str, local_ip: str, timeout: float = 4.0):
         public_ip = None
@@ -864,16 +1155,27 @@ class InterfaceManager(QObject):
                 s.close()
             except Exception:
                 pass
-        # Mettre à jour l'état interne + émettre le signal (Qt dispatchera côté GUI)
         try:
+            prev_ip = ""
+            prev_online = False
             if name in self.interfaces:
                 info = self.interfaces[name]
-                info.public_ip = public_ip or info.public_ip
+                prev_ip = info.public_ip or ""
+                prev_online = info.online
+                new_ip = public_ip or info.public_ip
+                info.public_ip = new_ip
                 info.online = online
                 self.interfaces[name] = info
-            self.public_ip_updated.emit(name, public_ip or "", online)
+                if online and new_ip:
+                    self._public_ip_last_ok[name] = (new_ip, time.monotonic())
+            new_ip_str = public_ip or prev_ip or ""
+            if new_ip_str != prev_ip or online != prev_online:
+                self.public_ip_updated.emit(name, new_ip_str, online)
         except Exception:
             traceback.print_exc()
+        finally:
+            with self._public_ip_inflight_lock:
+                self._public_ip_inflight.discard(name)
 
     @Slot(str, str, bool)
     def _on_public_ip_result(self, name: str, public_ip: str, online: bool):
@@ -938,7 +1240,7 @@ class InterfaceManager(QObject):
                 + "\n".join(errors[:5])
             )
         # Dans tous les cas on resynchronise avec l'état réel (netsh + psutil)
-        self.refresh_interfaces()
+        self.request_immediate_refresh()
 
 
 # ============================================================
@@ -3528,136 +3830,42 @@ class InterfaceWidget(QFrame):
 
         main_layout.addLayout(proxy_row)
 
-        self.setStyleSheet(
-            """
-        QFrame#interfaceCard {
-            background-color: #2c3e50;
-            border-radius: 8px;
-            border: 1px solid rgba(255, 255, 255, 0.05);
-        }
-        QFrame#interfaceCard[connected="true"] {
-            background-color: #244938;
-            border: 1px solid rgba(46, 204, 113, 0.6);
-        }
-        QFrame#interfaceCard[disconnected="true"] {
-            background-color: #2b2b2b;
-            border: 1px dashed rgba(255, 255, 255, 0.15);
-        }
-        QLabel#ifaceName {
-            color: #ecf0f1;
-            font-size: 14px;
-            font-weight: 700;
-        }
-        QLabel#metricBadge {
-            background-color: rgba(149, 165, 166, 0.18);
-            color: #bdc3c7;
-            border-radius: 9px;
-            padding: 1px 6px;
-            font-size: 11px;
-        }
-        QLabel#autoBadge {
-            background-color: rgba(52, 152, 219, 0.18);
-            color: #3498db;
-            border-radius: 9px;
-            padding: 2px 8px;
-            font-size: 11px;
-            font-weight: 600;
-        }
-        QLabel#ipLabel {
-            color: #bdc3c7;
-            font-size: 11px;
-        }
-        QLabel#publicIpHeaderLabel {
-            color: #ecf0f1;
-            font-size: 13px;
-            font-weight: 700;
-        }
-        QLabel#proxyOnChip {
-            background-color: rgba(52, 152, 219, 0.3);
-            color: #ecf0f1;
-            border-radius: 10px;
-            padding: 3px 10px;
-            font-size: 12px;
-            font-weight: 700;
-            border: 1px solid rgba(52, 152, 219, 0.8);
-        }
-        QLabel#proxyOffChip {
-            background-color: rgba(127, 140, 141, 0.25);
-            color: #bdc3c7;
-            border-radius: 8px;
-            padding: 2px 8px;
-            font-size: 11px;
-            border: 1px solid transparent;
-        }
-        QLabel#proxyOnChip:hover,
-        QLabel#proxyOffChip:hover {
-            background-color: rgba(59, 130, 246, 0.35);
-            color: #ffffff;
-            border-color: rgba(59, 130, 246, 0.9);
-        }
-        QLabel#resetBadge {
-            background-color: rgba(255, 255, 255, 0.15);
-            color: #ffffff;
-            border-radius: 8px;
-            padding: 2px 8px;
-            font-size: 11px;
-            font-weight: 600;
-            border: 1px solid rgba(255, 255, 255, 0.3);
-        }
-        QLabel#resetBadge:hover {
-            background-color: rgba(255, 255, 255, 0.25);
-            color: #ffffff;
-            border-color: rgba(255, 255, 255, 0.5);
-        }
-        QLabel#resetBadge[loading="true"] {
-            background-color: rgba(59, 130, 246, 0.3);
-            color: #ffffff;
-            border-color: rgba(59, 130, 246, 0.6);
-        }
-        QLineEdit#portEdit {
-            background-color: #22313f;
-            border-radius: 6px;
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            padding: 3px 6px;
-            color: #ecf0f1;
-            font-size: 12px;
-        }
-        QLineEdit#portEdit:focus {
-                border: 1px solid #3498db;
-        }
-        """
-        )
-
         # Autoriser le renommage via double-clic sur le nom
         self.name_label.installEventFilter(self)
 
     # --- Mise à jour depuis InterfaceInfo ---
     def update_from_interface(self, interface: InterfaceInfo):
         self.interface = interface
-        self.name_label.setText(interface.name)
-        self.metric_badge.setText(f"Metric {interface.metric}")
+        if self.name_label.text() != interface.name:
+            self.name_label.setText(interface.name)
+        metric_txt = f"Metric {interface.metric}"
+        if self.metric_badge.text() != metric_txt:
+            self.metric_badge.setText(metric_txt)
         self.auto_badge.setVisible(interface.automatic)
 
-        if interface.local_ip:
-            self.local_ip_label.setText(f"IPv4 locale: {interface.local_ip}")
-        else:
-            self.local_ip_label.setText("IPv4 locale: -")
+        local_txt = (
+            f"IPv4 locale: {interface.local_ip}"
+            if interface.local_ip
+            else "IPv4 locale: -"
+        )
+        if self.local_ip_label.text() != local_txt:
+            self.local_ip_label.setText(local_txt)
 
-        if interface.public_ip:
-            self.public_ip_header_label.setText(interface.public_ip)
-        else:
-            self.public_ip_header_label.setText("-")
+        public_txt = interface.public_ip if interface.public_ip else "-"
+        if self.public_ip_header_label.text() != public_txt:
+            self.public_ip_header_label.setText(public_txt)
 
         has_local = bool(interface.local_ip)
-        # Si plus d'IP locale, forcer l'affichage en OFF (sans émettre de signal)
         if not has_local:
             self.set_proxy_running(False)
 
-        # Appliquer l'état disconnected / connected pour la surbrillance globale
-        self.setProperty("disconnected", not interface.is_up)
-        self.setProperty("connected", bool(interface.online and interface.is_up))
-        self.style().unpolish(self)
-        self.style().polish(self)
+        _qt_apply_properties(
+            self,
+            {
+                "disconnected": not interface.is_up,
+                "connected": bool(interface.online and interface.is_up),
+            },
+        )
 
     # --- Proxy ---
     def _on_proxy_button_clicked(self):
@@ -3692,21 +3900,26 @@ class InterfaceWidget(QFrame):
 
     def set_proxy_running(self, running: bool, port: int | None = None):
         if running:
-            self.proxy_status_chip.setText(f"PROXY ON · 127.0.0.1:{port}")
-            self.proxy_status_chip.setObjectName("proxyOnChip")
+            chip_txt = f"PROXY ON · 127.0.0.1:{port}"
+            chip_name = "proxyOnChip"
         else:
-            self.proxy_status_chip.setText("PROXY OFF")
-            self.proxy_status_chip.setObjectName("proxyOffChip")
-
-        # Rafraîchir le style du badge et du bouton
-        self.style().unpolish(self.proxy_status_chip)
-        self.style().polish(self.proxy_status_chip)
+            chip_txt = "PROXY OFF"
+            chip_name = "proxyOffChip"
+        chip_changed = False
+        if self.proxy_status_chip.text() != chip_txt:
+            self.proxy_status_chip.setText(chip_txt)
+            chip_changed = True
+        if self.proxy_status_chip.objectName() != chip_name:
+            self.proxy_status_chip.setObjectName(chip_name)
+            chip_changed = True
+        if chip_changed:
+            st = self.proxy_status_chip.style()
+            st.unpolish(self.proxy_status_chip)
+            st.polish(self.proxy_status_chip)
 
     def mark_disconnected(self, disconnected: bool):
         self._disconnected = disconnected
-        self.setProperty("disconnected", disconnected)
-        self.style().unpolish(self)
-        self.style().polish(self)
+        _qt_apply_properties(self, {"disconnected": disconnected})
         # Si l'interface est déconnectée, désactiver le bouton et afficher OFF
         if disconnected:
             self.set_proxy_running(False)
@@ -3725,25 +3938,23 @@ class InterfaceWidget(QFrame):
         """Active ou désactive l'animation de loading sur le bouton reset"""
         self._reset_loading = loading
         if loading:
-            self.reset_badge.setProperty("loading", True)
-            self.reset_badge.style().unpolish(self.reset_badge)
-            self.reset_badge.style().polish(self.reset_badge)
+            _qt_apply_properties(self.reset_badge, {"loading": True})
             self._reset_loading_dots = 0
             self._reset_loading_timer.start(500)  # Mise à jour toutes les 500ms
         else:
             self._reset_loading_timer.stop()
-            self.reset_badge.setProperty("loading", False)
-            self.reset_badge.setText("In use" if self._reset_in_use else "RESET")
-            self.reset_badge.style().unpolish(self.reset_badge)
-            self.reset_badge.style().polish(self.reset_badge)
+            _qt_apply_properties(self.reset_badge, {"loading": False})
+            txt = "In use" if self._reset_in_use else "RESET"
+            if self.reset_badge.text() != txt:
+                self.reset_badge.setText(txt)
 
     def set_reset_badge_in_use(self, in_use: bool):
         """Affiche 'In use' si la clé a une requête/connexion en cours, sinon 'RESET'."""
         self._reset_in_use = in_use
         if not self._reset_loading:
-            self.reset_badge.setText("In use" if in_use else "RESET")
-            self.reset_badge.style().unpolish(self.reset_badge)
-            self.reset_badge.style().polish(self.reset_badge)
+            txt = "In use" if in_use else "RESET"
+            if self.reset_badge.text() != txt:
+                self.reset_badge.setText(txt)
 
     def _update_reset_loading_animation(self):
         """Met à jour l'animation de loading du bouton reset"""
@@ -3835,6 +4046,8 @@ class ZRotateInterfaceRow(QFrame):
     def __init__(self, interface_name: str, public_ip: str, parent=None):
         super().__init__(parent)
         self.interface_name = interface_name
+        self._last_zrotate_live: str | None = None
+        self._last_pool_enabled: bool | None = None
 
         self.setObjectName("zrotateInterfaceRow")
         self.setMinimumHeight(34)
@@ -3877,70 +4090,6 @@ class ZRotateInterfaceRow(QFrame):
 
         layout.addWidget(self.stats_widget, 0, Qt.AlignCenter)
 
-        self.setStyleSheet(
-            """
-            QFrame#zrotateInterfaceRow {
-                background-color: rgba(15, 23, 42, 0.78);
-                border: 1px solid rgba(59, 130, 246, 0.22);
-                border-radius: 10px;
-            }
-            QFrame#zrotateInterfaceRow:hover {
-                border: 1px solid rgba(59, 130, 246, 0.45);
-                background-color: rgba(30, 41, 59, 0.9);
-            }
-            QFrame#zrotateInterfaceRow[poolEnabled="false"] {
-                background-color: rgba(51, 65, 85, 0.42);
-                border: 1px solid rgba(148, 163, 184, 0.22);
-            }
-            QFrame#zrotateInterfaceRow[poolEnabled="false"] QCheckBox#zrotateInterfaceCheckbox {
-                color: #94a3b8;
-            }
-            QFrame#zrotateInterfaceRow[poolEnabled="false"] QLabel#zrotateIpChip {
-                color: #94a3b8;
-                background-color: rgba(71, 85, 105, 0.28);
-                border-color: rgba(148, 163, 184, 0.35);
-            }
-            QFrame#zrotateInterfaceRow[zrotateLive="active"] {
-                background-color: rgba(36, 73, 56, 0.88);
-                border: 1px solid rgba(46, 204, 113, 0.55);
-            }
-            QFrame#zrotateInterfaceRow[zrotateLive="standby"] {
-                background-color: rgba(90, 70, 30, 0.55);
-                border: 1px solid rgba(241, 196, 15, 0.5);
-            }
-            QFrame#zrotateInterfaceRow[zrotateLive="resetting"] {
-                background-color: rgba(70, 55, 30, 0.65);
-                border: 1px solid rgba(243, 156, 18, 0.65);
-            }
-            QFrame#zrotateInterfaceRow[zrotateLive="quarantine"] {
-                background-color: rgba(90, 35, 35, 0.55);
-                border: 1px solid rgba(231, 76, 60, 0.6);
-            }
-            QFrame#zrotateInterfaceRow[zrotateLive="session"] {
-                background-color: rgba(30, 41, 59, 0.55);
-                border: 1px solid rgba(100, 116, 139, 0.45);
-            }
-            QCheckBox#zrotateInterfaceCheckbox {
-                color: #e2e8f0;
-                font-size: 14px;
-                font-weight: 600;
-            }
-            QLabel#zrotateIpChip, QLabel#zrotateGetChip, QLabel#zrotateConnectChip {
-                color: #dbeafe;
-                background-color: rgba(30, 64, 175, 0.24);
-                border: 1px solid rgba(96, 165, 250, 0.45);
-                border-radius: 8px;
-                padding: 2px 8px;
-                font-size: 12px;
-                font-weight: 600;
-            }
-            QLabel#zrotateConnectChip {
-                background-color: rgba(6, 95, 70, 0.28);
-                border-color: rgba(16, 185, 129, 0.5);
-            }
-            """
-        )
-
     def set_checked(self, checked: bool):
         blocked = self.checkbox.blockSignals(True)
         self.checkbox.setCheckState(Qt.Checked if checked else Qt.Unchecked)
@@ -3979,9 +4128,9 @@ class ZRotateInterfaceRow(QFrame):
         self.connect_chip.setEnabled(enabled)
         self.ip_chip.setEnabled(enabled)
         self.checkbox.setEnabled(True)
-        self.setProperty("poolEnabled", enabled)
-        self.style().unpolish(self)
-        self.style().polish(self)
+        if self._last_pool_enabled != enabled:
+            self._last_pool_enabled = enabled
+            _qt_apply_properties(self, {"poolEnabled": enabled})
 
     def set_live_pool_state(
         self, zrotate_running: bool, snap: Optional[Dict[str, bool]]
@@ -3991,19 +4140,20 @@ class ZRotateInterfaceRow(QFrame):
         Clés snap : in_pool, resetting, quarantine, not_in_session
         """
         if not zrotate_running or snap is None:
-            self.setProperty("zrotateLive", "off")
+            live = "off"
         elif snap.get("not_in_session"):
-            self.setProperty("zrotateLive", "session")
+            live = "session"
         elif snap.get("quarantine"):
-            self.setProperty("zrotateLive", "quarantine")
+            live = "quarantine"
         elif snap.get("resetting"):
-            self.setProperty("zrotateLive", "resetting")
+            live = "resetting"
         elif snap.get("in_pool"):
-            self.setProperty("zrotateLive", "active")
+            live = "active"
         else:
-            self.setProperty("zrotateLive", "standby")
-        self.style().unpolish(self)
-        self.style().polish(self)
+            live = "standby"
+        if self._last_zrotate_live != live:
+            self._last_zrotate_live = live
+            _qt_apply_properties(self, {"zrotateLive": live})
         self._apply_checked_visual_state()
 
 
@@ -4135,13 +4285,17 @@ class MainWindow(QMainWindow):
         self.zrotate_selected_interfaces: set[str] = set()
         self.zrotate_running = False
         self._last_zrotate_pool_state: Dict[str, Dict[str, bool]] = {}
+        self._last_zrotate_structure_sig: tuple | None = None
+        self._last_quarantine_names: tuple[str, ...] | None = None
+        self._last_pool_state_for_ui: Dict[str, Dict[str, bool]] | None = None
+        self._was_minimized = False
 
         # Resets en parallèle (un thread par interface) ; suivi pour éviter doublons et refresh en rafale
         self._reset_in_progress: set[str] = set()  # interfaces en cours de reset
         self._refresh_after_reset_timer = QTimer(self)
         self._refresh_after_reset_timer.setSingleShot(True)
         self._refresh_after_reset_timer.timeout.connect(
-            self.interface_manager.refresh_interfaces
+            self.interface_manager.request_immediate_refresh
         )
 
         self._build_ui()
@@ -4161,7 +4315,7 @@ class MainWindow(QMainWindow):
         self._restore_initial_proxies()
         # Attendre que les ProxyThread soient réellement en écoute avant warmup Playwright.
         QTimer.singleShot(1500, self._start_playwright_browser_warmup)
-        self._update_zrotate_interfaces_list()
+        self._maybe_rebuild_zrotate_interfaces_list(force=True)
         self._set_quarantine_ui_stopped()
 
         # Démarrer ZRotate automatiquement si configuré
@@ -4712,6 +4866,8 @@ class MainWindow(QMainWindow):
                 font-size: 11px;
             }
         """
+            + INTERFACE_CARD_QSS
+            + ZROTATE_INTERFACE_ROW_QSS
         )
 
     # --- Logging / titre ---
@@ -4865,14 +5021,31 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Erreur de sauvegarde config: {e}")
 
+    def _prune_zrotate_selections(self) -> None:
+        """Retire les sélections ZRotate pour interfaces hors ligne (sans rebuild liste)."""
+        available = {
+            name
+            for name, info in self.interface_manager.interfaces.items()
+            if info.is_up and info.local_ip
+        }
+        self.zrotate_selected_interfaces &= available
+
+    def _maybe_rebuild_zrotate_interfaces_list(self, force: bool = False) -> None:
+        """Rebuild complet uniquement si l'ensemble d'interfaces visibles change."""
+        sig = zrotate_visible_structure_signature(self.interface_manager.interfaces)
+        if not force and sig == self._last_zrotate_structure_sig:
+            self._prune_zrotate_selections()
+            return
+        self._last_zrotate_structure_sig = sig
+        self._update_zrotate_interfaces_list()
+
     # --- Gestion des interfaces depuis InterfaceManager ---
     @Slot(list)
     def on_interfaces_updated(self, interfaces: list):
-        # Rafraîchir toujours la liste ZRotate (IPs / interfaces up) même pendant le
-        # debounce du panneau gauche (drag port, etc.).
+        self._prune_zrotate_selections()
         if time.time() - self.last_user_interaction < 2.5:
             try:
-                self._update_zrotate_interfaces_list()
+                self._maybe_rebuild_zrotate_interfaces_list(force=False)
             except Exception:
                 traceback.print_exc()
             return
@@ -4966,7 +5139,7 @@ class MainWindow(QMainWindow):
 
             # Mettre à jour le titre / compteur dès qu'on a une nouvelle photo des interfaces
             self._update_window_title()
-            self._update_zrotate_interfaces_list()
+            self._maybe_rebuild_zrotate_interfaces_list(force=False)
         except Exception:
             traceback.print_exc()
 
@@ -5225,7 +5398,8 @@ class MainWindow(QMainWindow):
 
         self._save_config()
         # Forcer un refresh des interfaces pour récupérer le nouveau nom
-        self.interface_manager.refresh_interfaces()
+        self._last_zrotate_structure_sig = None
+        self.interface_manager.request_immediate_refresh()
 
     @Slot(str)
     def on_metrics_update_failed(self, message: str):
@@ -5465,6 +5639,11 @@ class MainWindow(QMainWindow):
         """Applique les couleurs d'état pool (runtime) aux lignes ZRotate."""
         rows = getattr(self, "_zrotate_interface_rows", None) or {}
         state = getattr(self, "_last_zrotate_pool_state", None) or {}
+        if state == self._last_pool_state_for_ui:
+            return
+        self._last_pool_state_for_ui = (
+            dict(state) if isinstance(state, dict) else {}
+        )
         if not self.zrotate_running:
             for row in rows.values():
                 try:
@@ -5487,9 +5666,10 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_pool_state_updated(self, state_obj: object):
         """Snapshot du pool (~1 Hz) depuis le thread ZRotate."""
-        self._last_zrotate_pool_state = (
-            dict(state_obj) if isinstance(state_obj, dict) else {}
-        )
+        state = dict(state_obj) if isinstance(state_obj, dict) else {}
+        if state == self._last_zrotate_pool_state:
+            return
+        self._last_zrotate_pool_state = state
         self._sync_zrotate_row_pool_styles()
 
     def _on_zrotate_interface_toggled(self, interface_name: str, state: int):
@@ -5550,6 +5730,7 @@ class MainWindow(QMainWindow):
 
     def _set_quarantine_ui_stopped(self):
         """ZRotate arrêté : pas de données live côté quota manager."""
+        self._last_quarantine_names = None
         self.zrotate_quarantine_list.clear()
         self.zrotate_quarantine_status.setText(
             "ZRotate est arrêté — démarrez-le pour afficher la quarantaine."
@@ -5565,6 +5746,10 @@ class MainWindow(QMainWindow):
         names: list[str] = (
             list(names_obj) if names_obj is not None else []
         )
+        names_key = tuple(sorted(names))
+        if names_key == self._last_quarantine_names:
+            return
+        self._last_quarantine_names = names_key
         self.zrotate_quarantine_status.hide()
         self.zrotate_quarantine_list.clear()
         if not names:
@@ -5810,6 +5995,8 @@ class MainWindow(QMainWindow):
 
         self.zrotate_running = False  # Marquer comme arrêté immédiatement
         self._last_zrotate_pool_state = {}
+        self._last_pool_state_for_ui = None
+        self._last_quarantine_names = None
         self._sync_zrotate_row_pool_styles()
 
         # Mettre à jour le bouton immédiatement
@@ -5849,6 +6036,14 @@ class MainWindow(QMainWindow):
 
         self._zrotate_log("⏹️ ZRotate arrêté")
         self._save_config()
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.WindowStateChange:
+            minimized = bool(self.windowState() & Qt.WindowState.WindowMinimized)
+            if minimized != self._was_minimized:
+                self._was_minimized = minimized
+                self.interface_manager.notify_window_minimized(minimized)
+        super().changeEvent(event)
 
     # --- Fermeture ---
     def closeEvent(self, event):

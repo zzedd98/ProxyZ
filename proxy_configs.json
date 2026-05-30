@@ -172,6 +172,10 @@
       "enabled": true,
       "reset_script": "reset_XPro.py",
       "modem_gateway": "192.168.103.1"
+    },
+    "Ethernet 4G": {
+      "port": 101,
+      "enabled": true
     }
   },
   "ui": {
@@ -185,17 +189,7 @@
     "max_requests_per_quota": 2,
     "quota_timeout_seconds": 60.0,
     "server_url": "http://127.0.0.1:9999",
-    "selected_interfaces": [
-      "Clef 1",
-      "Clef 8",
-      "Clef 6",
-      "Clef 9",
-      "Clef 5",
-      "Clef 3",
-      "Clef 7",
-      "Clef 4",
-      "Clef 2"
-    ],
+    "selected_interfaces": [],
     "running": false,
     "auto_start": true,
     "close_haapi_tunnel_after_seconds": 0.0
