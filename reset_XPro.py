@@ -1,6 +1,8 @@
 """
 Reset modem Xproxy XH22 via Playwright Python avec thread dédié et browser persistant.
-Interface web 192.168.100.1 : login admin, rotation IP publique (cellRotate).
+Warmup : navigation jusqu'à la page prête (#cellRotate).
+Reset : clic sur la page préparée, réutilisée telle quelle entre chaque reset.
+En cas d'erreur UI : redémarrage browser + séquence complète pour retrouver la page.
 """
 
 import atexit
@@ -569,6 +571,10 @@ class _PlaywrightPortWorker:
         _ensure_dashboard(page, self.proxy_port)
 
     def _prepare_session(self) -> bool:
+        if self.is_prepared():
+            _log("Page reset déjà prête, réutilisation", self.proxy_port)
+            self._last_activity = time.time()
+            return True
         self._discard_prepared_session()
         context, page = self._new_modem_page()
         try:
@@ -597,15 +603,13 @@ class _PlaywrightPortWorker:
 
         _log("Page non préparée, séquence complète (navigation + rotation)", self.proxy_port)
         context, page = self._new_modem_page()
-        try:
-            self._navigate_to_reset_page(page)
-            _trigger_ip_rotation(page, self.proxy_port)
-            page.wait_for_timeout(3000)
-        finally:
-            try:
-                context.close()
-            except Exception:
-                pass
+        self._navigate_to_reset_page(page)
+        _trigger_ip_rotation(page, self.proxy_port)
+        page.wait_for_timeout(3000)
+        self._prepared_context = context
+        self._prepared_page = page
+        self._prepared = True
+        _log("Page reset prête après séquence complète", self.proxy_port)
 
     def _close_browser_if_idle(self) -> None:
         if self._prepared:
@@ -645,22 +649,25 @@ class _PlaywrightPortWorker:
             self._last_activity = time.time()
             if fut:
                 fut.set_result(True)
-            _log("Reset UI réussi", self.proxy_port)
+            _log("Reset UI réussi (page conservée pour prochain reset)", self.proxy_port)
         except Exception as e:
             _log(f"Reset UI échoué, retry après restart browser: {e}", self.proxy_port)
+            self._discard_prepared_session()
             try:
                 self._restart_browser()
                 self._run_reset_click()
                 self._last_activity = time.time()
                 if fut:
                     fut.set_result(True)
-                _log("Reset UI réussi après retry", self.proxy_port)
+                _log(
+                    "Reset UI réussi après retry (page re-préparée)",
+                    self.proxy_port,
+                )
             except Exception as e2:
+                self._discard_prepared_session()
                 _log(f"Reset UI échoué définitivement: {e2}", self.proxy_port)
                 if fut:
                     fut.set_exception(e2 if e2 else e)
-        finally:
-            self._discard_prepared_session()
 
     def _run(self) -> None:
         _log("Démarrage thread worker", self.proxy_port)
@@ -781,7 +788,11 @@ def initialize_browser_service(
 
 
 def schedule_prepare_after_reset(proxy_port: int) -> None:
-    """Re-prépare un navigateur en arrière-plan après un reset réussi."""
+    """Re-prépare uniquement si la page n'est plus utilisable après reset."""
+    worker = _POOL._get_worker(proxy_port)
+    if worker.is_prepared():
+        _log("Page reset toujours prête, re-préparation ignorée", proxy_port)
+        return
     _log("Re-préparation navigateur planifiée", proxy_port)
     _POOL.schedule_prepare(proxy_port)
 
