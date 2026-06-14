@@ -93,6 +93,14 @@ QLabel#metricBadge {
     padding: 1px 6px;
     font-size: 11px;
 }
+QLabel#resetAvgBadge {
+    background-color: rgba(52, 152, 219, 0.14);
+    color: #85c1e9;
+    border-radius: 9px;
+    padding: 1px 6px;
+    font-size: 11px;
+    font-weight: 600;
+}
 QLabel#autoBadge {
     background-color: rgba(52, 152, 219, 0.18);
     color: #3498db;
@@ -407,6 +415,37 @@ class _LineForwarder:
             if line and self._callback:
                 self._callback(line)
 
+    def isatty(self):
+        return False
+
+
+@contextlib.contextmanager
+def _quiet_third_party_loggers():
+    """Évite les 'Logging error' httpx/httpcore quand stderr est None (exe windowed)."""
+    targets = (
+        logging.root,
+        logging.getLogger("httpx"),
+        logging.getLogger("httpcore"),
+    )
+    prev_levels = {lg: lg.level for lg in targets}
+    removed_handlers: list[tuple[logging.Logger, logging.Handler]] = []
+    try:
+        for lg in targets:
+            lg.setLevel(logging.WARNING)
+            for handler in list(lg.handlers):
+                stream = getattr(handler, "stream", None)
+                if isinstance(handler, logging.StreamHandler) and (
+                    stream is None or stream is sys.stderr
+                ):
+                    removed_handlers.append((lg, handler))
+                    lg.removeHandler(handler)
+        yield
+    finally:
+        for lg, level in prev_levels.items():
+            lg.setLevel(level)
+        for lg, handler in removed_handlers:
+            lg.addHandler(handler)
+
 
 def _load_reset_modem_functions(script_path: Path):
     """
@@ -684,22 +723,16 @@ def run_reset_script(
                     return code
             raise
         _configure_reset_port(script_path, proxy_port, reset_options)
-        if log_fn:
-            gw = (reset_options or {}).get("modem_gateway")
-            log_fn(
-                f"[RESET] runtime: frozen={getattr(sys, 'frozen', False)} | "
-                f"source={_reset_module_source(script_path)}"
-                + (f" | modem_gateway={gw}" if gw else "")
-            )
         kwargs = {}
         if reset_options and reset_options.get("modem_gateway"):
             kwargs["modem_gateway"] = reset_options["modem_gateway"]
         out = _LineForwarder(log_fn) if log_fn else None
-        if out:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        with _quiet_third_party_loggers():
+            if out:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                    ok = bool(reset_func(proxy_port, **kwargs))
+            else:
                 ok = bool(reset_func(proxy_port, **kwargs))
-        else:
-            ok = bool(reset_func(proxy_port, **kwargs))
         return 0 if ok else 1
 
     cmd = build_reset_command(script_path, proxy_port)
@@ -2905,31 +2938,18 @@ class ZRotateSingleProxyServer:
                 # Ancien système round-robin
                 egress_info = await self.egress_selector.get_egress()
 
-            logger.info(
-                f"[{connection_id}] Nouvelle connexion depuis {client_ip}:{client_port} "
-                f"→ Egress: {egress_info['name']} ({egress_info['ip']})"
-            )
+            if request_type == "CONNECT":
+                logger.info(
+                    f"[{connection_id}] Requête CONNECT reçue → {egress_info['name']} → {dest_host}:{dest_port}"
+                )
+            else:
+                logger.info(
+                    f"[{connection_id}] Nouvelle connexion depuis {client_ip}:{client_port} "
+                    f"→ Egress: {egress_info['name']} ({egress_info['ip']})"
+                )
 
             # Traiter la requête selon son type
             if request_type == "CONNECT":
-                # Requête CONNECT (HTTPS)
-                dest = parse_connect_request(first_line)
-                if not dest:
-                    logger.warning(
-                        f"[{connection_id}] Requête CONNECT invalide: {first_line}"
-                    )
-                    writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                    await writer.drain()
-                    # Libérer le quota temporaire si pris
-                    # complete_request vérifie elle-même si la connexion est dans _active_connections avec le lock
-                    if self._use_quotas:
-                        await self.quota_manager.complete_request(
-                            connection_id, success=False
-                        )
-                    return
-
-                logger.info(f"[{connection_id}] CONNECT {dest_host}:{dest_port}")
-
                 # Ouvrir connexion upstream avec bind source
                 try:
                     upstream_reader, upstream_writer = await open_connection_with_bind(
@@ -3132,11 +3152,6 @@ class ZRotateSingleProxyServer:
                     await writer.wait_closed()
                 except Exception:
                     pass
-
-            if egress_info:
-                logger.info(
-                    f"[{connection_id}] ✅ Connexion fermée (egress: {egress_info['name']})"
-                )
 
             # Note: Les quotas sont gérés lors de l'attribution de l'interface, pas lors de la fermeture
             # Le système de quotas vérifie automatiquement si tous les quotas sont pleins et déclenche le reset
@@ -3650,6 +3665,8 @@ class ZRotateProxyServer(QThread):
             # Démarrer et faire tourner le serveur
             self.loop.run_until_complete(self.proxy_server.serve_forever())
 
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
             if self.running:  # Ne logger que si on n'a pas arrêté volontairement
                 self.log_message.emit(f"❌ Erreur serveur: {e}")
@@ -3738,7 +3755,9 @@ class InterfaceWidget(QFrame):
         )
 
         self.setObjectName("interfaceCard")
+        self.setMinimumHeight(84)
         self._build_ui()
+        self.setStyleSheet(INTERFACE_CARD_QSS)
         self.update_from_interface(interface)
 
     # --- UI ---
@@ -3747,9 +3766,8 @@ class InterfaceWidget(QFrame):
         self.setFrameShadow(QFrame.Raised)
 
         main_layout = QVBoxLayout(self)
-        # Marges et espacements compacts pour réduire la hauteur tout en restant lisible
-        main_layout.setContentsMargins(8, 3, 8, 3)
-        main_layout.setSpacing(2)
+        main_layout.setContentsMargins(8, 4, 8, 4)
+        main_layout.setSpacing(3)
 
         # Ligne titre + badges (sans bouton paramètres local)
         header = QHBoxLayout()
@@ -3823,6 +3841,11 @@ class InterfaceWidget(QFrame):
         proxy_row.addWidget(self.port_edit, 0, Qt.AlignLeft)
 
         proxy_row.addStretch(1)
+
+        self.reset_avg_badge = QLabel()
+        self.reset_avg_badge.setObjectName("resetAvgBadge")
+        self.reset_avg_badge.setVisible(False)
+        proxy_row.addWidget(self.reset_avg_badge, 0, Qt.AlignRight)
 
         self.metric_badge = QLabel()
         self.metric_badge.setObjectName("metricBadge")
@@ -3934,6 +3957,15 @@ class InterfaceWidget(QFrame):
     def set_display_name(self, display_name: str):
         self.name_label.setText(display_name)
 
+    def set_reset_avg(self, avg_seconds: float | None):
+        if avg_seconds is None:
+            self.reset_avg_badge.setVisible(False)
+            return
+        txt = f"{avg_seconds:.1f}s"
+        if self.reset_avg_badge.text() != txt:
+            self.reset_avg_badge.setText(txt)
+        self.reset_avg_badge.setVisible(True)
+
     def set_reset_loading(self, loading: bool):
         """Active ou désactive l'animation de loading sur le bouton reset"""
         self._reset_loading = loading
@@ -3994,13 +4026,14 @@ class InterfaceWidget(QFrame):
 class ManualInterfacesList(QListWidget):
     order_changed = Signal(list)  # list of interface names
     user_interaction = Signal()  # clic / drag dans la liste
+    console_general_requested = Signal()  # clic dans le vide → console générale
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDefaultDropAction(Qt.MoveAction)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.NoSelection)
         self.setDragDropMode(QAbstractItemView.InternalMove)
         # Cartes un peu plus rapprochées
         self.setSpacing(4)
@@ -4011,15 +4044,14 @@ class ManualInterfacesList(QListWidget):
                 padding: 0px;
                 margin: 0px;
             }
-            QListWidget::item:selected {
-                background: transparent;
-            }
             """
         )
         self.setFrameShape(QFrame.NoFrame)
 
     def mousePressEvent(self, event):
         self.user_interaction.emit()
+        if self.itemAt(event.pos()) is None:
+            self.console_general_requested.emit()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -4248,7 +4280,7 @@ class MainWindow(QMainWindow):
     # dans interface_proxies["NomInterface"] : "reset_script" (ex: "reset_modem.py" ou chemin absolu).
     # Si absent, défaut = "reset_modem.py". Les chemins relatifs sont résolus depuis le dossier de l'exe/script.
     # Signal émis par le thread de reset vers le thread Qt principal (name, returncode: 0=ok, -1=script absent, -2=timeout, autre=échec)
-    reset_completed = Signal(str, int)
+    reset_completed = Signal(str, int, float)
     reset_log = Signal(str)
 
     def __init__(self):
@@ -4292,11 +4324,17 @@ class MainWindow(QMainWindow):
 
         # Resets en parallèle (un thread par interface) ; suivi pour éviter doublons et refresh en rafale
         self._reset_in_progress: set[str] = set()  # interfaces en cours de reset
+        self._reset_duration_sums: dict[str, float] = {}
+        self._reset_duration_counts: dict[str, int] = {}
         self._refresh_after_reset_timer = QTimer(self)
         self._refresh_after_reset_timer.setSingleShot(True)
         self._refresh_after_reset_timer.timeout.connect(
             self.interface_manager.request_immediate_refresh
         )
+
+        self._console_view: str | None = None
+        self._console_lines: dict[str | None, list[str]] = {None: []}
+        self._iface_by_port: dict[int, str] = {}
 
         self._build_ui()
         self._load_config()
@@ -4478,6 +4516,8 @@ class MainWindow(QMainWindow):
         self.manual_list = ManualInterfacesList()
         self.manual_list.order_changed.connect(self.on_manual_order_changed)
         self.manual_list.user_interaction.connect(self._mark_user_interaction)
+        self.manual_list.itemClicked.connect(self._on_manual_interface_clicked)
+        self.manual_list.console_general_requested.connect(self._show_general_console)
 
         manual_scroll = QScrollArea()
         manual_scroll.setWidgetResizable(True)
@@ -4577,9 +4617,6 @@ class MainWindow(QMainWindow):
         self.zrotate_section_tabs.addTab(tab_zrotate, "ZRotate")
         self.zrotate_section_tabs.addTab(tab_quarantine, "Quarantaine")
 
-        # Plus d'espace pour le pool / onglets qu pour la console (3:1 au lieu de 2:2).
-        zrotate_layout.addWidget(self.zrotate_section_tabs, 3)
-
         # Panel bas : Console de logs
         console_panel = QWidget()
         console_panel.setObjectName("zrotateConsolePanel")
@@ -4591,9 +4628,16 @@ class MainWindow(QMainWindow):
         console_title_row = QHBoxLayout()
         console_title_row.setSpacing(8)
 
-        console_title = QLabel("Console ZRotate")
-        console_title.setObjectName("zrotateTitle")
-        console_title_row.addWidget(console_title)
+        self.zrotate_general_console_button = QPushButton("Console générale")
+        self.zrotate_general_console_button.setObjectName("zrotateGeneralConsoleButton")
+        self.zrotate_general_console_button.setFixedHeight(28)
+        self.zrotate_general_console_button.clicked.connect(self._show_general_console)
+        self.zrotate_general_console_button.setVisible(False)
+        console_title_row.addWidget(self.zrotate_general_console_button)
+
+        self.zrotate_console_title = QLabel("Console ZRotate")
+        self.zrotate_console_title.setObjectName("zrotateTitle")
+        console_title_row.addWidget(self.zrotate_console_title)
 
         console_title_row.addStretch(1)
 
@@ -4616,7 +4660,16 @@ class MainWindow(QMainWindow):
         self.zrotate_log_box.setObjectName("zrotateLogBox")
         console_layout.addWidget(self.zrotate_log_box, 1)
 
-        zrotate_layout.addWidget(console_panel, 1)
+        self.zrotate_vertical_splitter = QSplitter(Qt.Vertical)
+        self.zrotate_vertical_splitter.setObjectName("zrotateVerticalSplitter")
+        self.zrotate_vertical_splitter.setChildrenCollapsible(False)
+        self.zrotate_vertical_splitter.addWidget(self.zrotate_section_tabs)
+        self.zrotate_vertical_splitter.addWidget(console_panel)
+        self.zrotate_vertical_splitter.setStretchFactor(0, 3)
+        self.zrotate_vertical_splitter.setStretchFactor(1, 2)
+        self.zrotate_vertical_splitter.setSizes([540, 360])
+
+        zrotate_layout.addWidget(self.zrotate_vertical_splitter, 1)
 
         # Ajouter le panneau ZRotate au splitter
         splitter.addWidget(zrotate_panel)
@@ -4761,6 +4814,15 @@ class MainWindow(QMainWindow):
                 border-radius: 12px;
                 border: 1px solid rgba(31, 41, 55, 0.9);
             }
+            QSplitter#zrotateVerticalSplitter::handle {
+                background-color: rgba(52, 152, 219, 0.28);
+                height: 8px;
+                margin: 4px 10px;
+                border-radius: 4px;
+            }
+            QSplitter#zrotateVerticalSplitter::handle:hover {
+                background-color: rgba(59, 130, 246, 0.65);
+            }
             QLabel#zrotateTitle {
                 color: #ecf0f1;
                 font-size: 15px;
@@ -4871,6 +4933,93 @@ class MainWindow(QMainWindow):
         )
 
     # --- Logging / titre ---
+    def _rebuild_iface_port_map(self) -> None:
+        mapping: dict[int, str] = {}
+        for name, widget in self.interface_widgets.items():
+            port = 0
+            cfg = self.config.get("interface_proxies", {}).get(name) or {}
+            try:
+                port = int(cfg.get("port") or 0)
+            except (TypeError, ValueError):
+                port = 0
+            if port <= 0 and widget is not None:
+                try:
+                    port = int((widget.port_edit.text() or "").strip())
+                except ValueError:
+                    port = 0
+            if port > 0:
+                mapping[port] = name
+        self._iface_by_port = mapping
+
+    def _interface_for_log_message(self, message: str) -> str | None:
+        port_match = re.search(r"\[port (\d+)\]", message)
+        if port_match:
+            iface = self._iface_by_port.get(int(port_match.group(1)))
+            if iface:
+                return iface
+
+        if message.startswith("Interfaces:"):
+            return None
+
+        names = sorted(self.interface_widgets.keys(), key=len, reverse=True)
+        matched: list[str] = []
+        for name in names:
+            if (
+                f"Egress: {name}" in message
+                or f"egress: {name}" in message
+                or f"→ {name} →" in message
+                or f"→ {name} (" in message
+                or f"'{name}'" in message
+                or f'"{name}"' in message
+                or f" {name}:" in message
+                or f" pour {name}" in message
+                or f" pour '{name}'" in message
+                or f"Interface {name}" in message
+                or f"Reset réussi pour {name}" in message
+                or f"Reset réussi pour l'interface '{name}'" in message
+                or f"Fin reset '{name}'" in message
+            ):
+                matched.append(name)
+
+        if len(matched) == 1:
+            return matched[0]
+        return None
+
+    def _ensure_console_buffer(self, key: str | None) -> None:
+        if key not in self._console_lines:
+            self._console_lines[key] = []
+
+    def _scroll_console_to_bottom(self) -> None:
+        cursor = self.zrotate_log_box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.zrotate_log_box.setTextCursor(cursor)
+        self.zrotate_log_box.ensureCursorVisible()
+        scrollbar = self.zrotate_log_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _refresh_console_text(self) -> None:
+        lines = self._console_lines.get(self._console_view, [])
+        self.zrotate_log_box.setPlainText("\n".join(lines))
+        self._scroll_console_to_bottom()
+
+    def _show_general_console(self) -> None:
+        self._console_view = None
+        self.zrotate_console_title.setText("Console ZRotate")
+        self.zrotate_general_console_button.setVisible(False)
+        self._refresh_console_text()
+
+    def _show_interface_console(self, interface_name: str) -> None:
+        self._console_view = interface_name
+        self._ensure_console_buffer(interface_name)
+        self.zrotate_console_title.setText(f"Console — {interface_name}")
+        self.zrotate_general_console_button.setVisible(True)
+        self._refresh_console_text()
+
+    def _on_manual_interface_clicked(self, item: QListWidgetItem) -> None:
+        widget = self.manual_list.itemWidget(item)
+        if isinstance(widget, InterfaceWidget):
+            self._show_interface_console(widget.interface_name)
+
     def _append_log(self, text: str):
         timestamp = time.strftime("%H:%M:%S")
         self.log_box.append(f"[{timestamp}] {text}")
@@ -5129,6 +5278,13 @@ class MainWindow(QMainWindow):
                 if w:
                     w.update_from_interface(info)
                     w.set_display_name(self._get_interface_display_name(name))
+                    self._update_reset_avg_ui(name)
+
+            for row in range(self.manual_list.count()):
+                item = self.manual_list.item(row)
+                w = self.manual_list.itemWidget(item)
+                if isinstance(w, InterfaceWidget):
+                    item.setSizeHint(w.sizeHint())
 
             # Resynchroniser l'état visuel des widgets avec les ProxyThread existants
             for name, thread in self.proxy_threads.items():
@@ -5140,6 +5296,7 @@ class MainWindow(QMainWindow):
             # Mettre à jour le titre / compteur dès qu'on a une nouvelle photo des interfaces
             self._update_window_title()
             self._maybe_rebuild_zrotate_interfaces_list(force=False)
+            self._rebuild_iface_port_map()
         except Exception:
             traceback.print_exc()
 
@@ -5183,8 +5340,78 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     print(f"[RESET] ⚠️ Erreur notification ZRotate: {e}")
 
-    @Slot(str, int)
-    def _on_reset_completed(self, name: str, returncode: int):
+    def _interface_has_reset(self, name: str) -> bool:
+        iface_cfg = self.config.get("interface_proxies", {}).get(name)
+        reset_script, is_explicit = resolve_interface_reset_script(
+            iface_cfg,
+            self.config.get("reset_script_default", DEFAULT_RESET_SCRIPT),
+        )
+        if is_explicit:
+            return True
+        script_path = resolve_reset_script_path(reset_script, get_app_dir())
+        return is_playwright_reset_script(script_path)
+
+    def _is_general_console_noise(self, message: str) -> bool:
+        stripped = message.strip()
+        if stripped.startswith("[RESET] runtime:"):
+            return True
+        if stripped.startswith("Call log:"):
+            return True
+        if stripped.startswith("- waiting for"):
+            return True
+        if stripped.startswith("- navigating to"):
+            return True
+        if stripped.startswith("- clicking"):
+            return True
+        if stripped.startswith("- filling"):
+            return True
+        return False
+
+    def _resolve_log_interface(self, message: str) -> str | None:
+        iface = self._interface_for_log_message(message)
+        if iface:
+            return iface
+        if len(self._reset_in_progress) == 1:
+            return next(iter(self._reset_in_progress))
+        return None
+
+    def _sync_manual_list_item_height(self, name: str) -> None:
+        widget = self.interface_widgets.get(name)
+        if not widget:
+            return
+        for row in range(self.manual_list.count()):
+            item = self.manual_list.item(row)
+            if self.manual_list.itemWidget(item) is widget:
+                item.setSizeHint(widget.sizeHint())
+                break
+
+    def _record_reset_duration(self, name: str, elapsed_s: float) -> None:
+        if elapsed_s <= 0:
+            return
+        self._reset_duration_sums[name] = (
+            self._reset_duration_sums.get(name, 0.0) + elapsed_s
+        )
+        self._reset_duration_counts[name] = (
+            self._reset_duration_counts.get(name, 0) + 1
+        )
+
+    def _update_reset_avg_ui(self, name: str) -> None:
+        widget = self.interface_widgets.get(name)
+        if not widget:
+            return
+        if not self._interface_has_reset(name):
+            widget.set_reset_avg(None)
+            return
+        count = self._reset_duration_counts.get(name, 0)
+        if count <= 0:
+            widget.set_reset_avg(None)
+            return
+        avg = self._reset_duration_sums[name] / count
+        widget.set_reset_avg(avg)
+        self._sync_manual_list_item_height(name)
+
+    @Slot(str, int, float)
+    def _on_reset_completed(self, name: str, returncode: int, elapsed_s: float):
         """Appelé sur le thread Qt principal après la fin du script de reset (évite les crashes)."""
         self._reset_in_progress.discard(name)
         try:
@@ -5213,6 +5440,10 @@ class MainWindow(QMainWindow):
             print(
                 f"[RESET] ❌ Reset échoué pour l'interface '{name}' (code {returncode}) — pas de remise dans le pool ZRotate"
             )
+
+        if elapsed_s > 0 and returncode not in (-1, -2, -3):
+            self._record_reset_duration(name, elapsed_s)
+            self._update_reset_avg_ui(name)
 
         try:
             self._release_interface_to_zrotate(name, returncode == 0)
@@ -5282,7 +5513,7 @@ class MainWindow(QMainWindow):
         def run_reset():
             is_playwright_reset = is_playwright_reset_script(script_path)
             if not script_path.exists() and not is_playwright_reset:
-                self.reset_completed.emit(name, -1)
+                self.reset_completed.emit(name, -1, 0.0)
                 return
 
             def ui_log(msg: str):
@@ -5307,16 +5538,16 @@ class MainWindow(QMainWindow):
                 ui_log(
                     f"[RESET] ⏱️ Fin reset '{name}' (port {proxy_port}) en {elapsed:.1f}s, code={return_code}"
                 )
-                self.reset_completed.emit(name, return_code)
+                self.reset_completed.emit(name, return_code, elapsed)
             except subprocess.TimeoutExpired:
                 ui_log(
                     f"[RESET] ⏱️ Timeout reset '{name}' (port {proxy_port}) après 120s"
                 )
-                self.reset_completed.emit(name, -2)
+                self.reset_completed.emit(name, -2, 120.0)
             except Exception as e:
                 ui_log(f"[RESET] 💥 Exception reset '{name}' (port {proxy_port}): {e}")
                 traceback.print_exc()
-                self.reset_completed.emit(name, -3)
+                self.reset_completed.emit(name, -3, 0.0)
 
         threading.Thread(target=run_reset, daemon=True).start()
 
@@ -5695,8 +5926,24 @@ class MainWindow(QMainWindow):
         self._save_zrotate_selection_config()
 
     def _clear_zrotate_console(self):
-        """Efface le contenu de la console ZRotate"""
+        """Efface la console actuellement affichée."""
+        self._ensure_console_buffer(self._console_view)
+        self._console_lines[self._console_view] = []
         self.zrotate_log_box.clear()
+
+    def _zrotate_log(self, message: str):
+        """Route les logs vers la console affichée (générale ou interface)."""
+        timestamp = time.strftime("%H:%M:%S")
+        line = f"[{timestamp}] {message}"
+        iface = self._resolve_log_interface(message)
+        buffer_key = iface if iface else None
+        if buffer_key is None and self._is_general_console_noise(message):
+            return
+        self._ensure_console_buffer(buffer_key)
+        self._console_lines[buffer_key].append(line)
+        if self._console_view == buffer_key:
+            self.zrotate_log_box.append(line)
+            self._scroll_console_to_bottom()
 
     @Slot(int, int, int)
     def _on_zrotate_stats_updated(self, total: int, successful: int, rejected: int):
@@ -5763,21 +6010,6 @@ class MainWindow(QMainWindow):
         else:
             for n in names:
                 self.zrotate_quarantine_list.addItem(QListWidgetItem(n))
-
-    def _zrotate_log(self, message: str):
-        """Ajoute un message dans la console ZRotate"""
-        timestamp = time.strftime("%H:%M:%S")
-        self.zrotate_log_box.append(f"[{timestamp}] {message}")
-        # Auto-scroll vers le bas pour afficher toujours la dernière ligne
-        # Déplacer le curseur à la fin du document
-        cursor = self.zrotate_log_box.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.zrotate_log_box.setTextCursor(cursor)
-        # S'assurer que le curseur est visible (scrolle automatiquement)
-        self.zrotate_log_box.ensureCursorVisible()
-        # Forcer le scroll vers le maximum pour garantir l'affichage de la dernière ligne
-        scrollbar = self.zrotate_log_box.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
 
     def _update_zrotate_button_state(self):
         """Met à jour l'état et la couleur du bouton ZRotate"""

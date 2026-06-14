@@ -1,23 +1,22 @@
 """
 Reset modem Xproxy XH22 via Playwright Python avec thread dédié et browser persistant.
-Warmup : navigation jusqu'à la page prête (#cellRotate).
+Warmup : navigation directe (sans proxy) jusqu'à la page prête (#cellRotate).
 Reset : clic sur la page préparée, réutilisée telle quelle entre chaque reset.
 En cas d'erreur UI : redémarrage browser + séquence complète pour retrouver la page.
 """
 
 import atexit
+import logging
 import os
 import queue
 import re
-import select
-import socket
 import sys
 import threading
 import time
 from concurrent.futures import Future
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
 
 import httpx
 from playwright.sync_api import sync_playwright
@@ -41,6 +40,54 @@ HEADLESS = os.environ.get("RESET_XPRO_HEADLESS", "1").strip().lower() not in (
 
 _PORT_OPTIONS: dict[int, dict] = {}
 _PORT_OPTIONS_LOCK = threading.Lock()
+_PLAYWRIGHT_BROWSERS_CONFIGURED = False
+_PLAYWRIGHT_BROWSERS_LOCK = threading.Lock()
+
+
+def _app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _configure_playwright_browsers_path() -> None:
+    """Utilise {app_dir}/browsers si présent, sinon comportement Playwright par défaut."""
+    global _PLAYWRIGHT_BROWSERS_CONFIGURED
+    with _PLAYWRIGHT_BROWSERS_LOCK:
+        if _PLAYWRIGHT_BROWSERS_CONFIGURED:
+            return
+        _PLAYWRIGHT_BROWSERS_CONFIGURED = True
+
+        env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+        if env_path:
+            _log(f"Playwright browsers (PLAYWRIGHT_BROWSERS_PATH): {env_path}")
+            return
+
+        browsers_dir = _app_dir() / "browsers"
+        if browsers_dir.is_dir():
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_dir)
+            _log(f"Playwright browsers (dossier local): {browsers_dir}")
+            return
+
+        _log(
+            "Dossier browsers/ introuvable, fallback Playwright par défaut "
+            "(chrome système si chromium embarqué absent)"
+        )
+
+
+def _local_playwright_chromium_ready() -> bool:
+    """True si un binaire Chromium Playwright est présent dans PLAYWRIGHT_BROWSERS_PATH."""
+    browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if not browsers_root:
+        return False
+    root = Path(browsers_root)
+    if not root.is_dir():
+        return False
+    patterns = (
+        "chromium_headless_shell-*/chrome-headless-shell-win64/chrome-headless-shell.exe",
+        "chromium-*/chrome-win/chrome.exe",
+    )
+    return any(root.glob(pattern) for pattern in patterns)
 
 
 def _normalize_modem_url(gateway: str) -> str:
@@ -96,6 +143,7 @@ def _log(message: str, proxy_port: int | None = None) -> None:
 
 def _get_modem_ip(proxy_port: int) -> str | None:
     """IP publique via le proxy local. ifconfig.me renvoie souvent du HTML (page blocage)."""
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     proxy_url = f"http://127.0.0.1:{proxy_port}"
     services = ["https://icanhazip.com", "https://api.ipify.org"]
     for service in services:
@@ -125,12 +173,18 @@ def _launch_chromium(playwright) -> object:
         "--no-sandbox",
         "--ignore-certificate-errors",
     ]
-    modes = [
-        ("chromium headless", {"headless": HEADLESS, "args": launch_args}),
-        ("chrome channel", {"channel": "chrome", "headless": HEADLESS, "args": launch_args}),
-    ]
-    if not HEADLESS:
-        modes.insert(0, ("chromium visible", {"headless": False, "args": launch_args}))
+    modes: list[tuple[str, dict]] = []
+    if _local_playwright_chromium_ready():
+        if not HEADLESS:
+            modes.append(("chromium visible", {"headless": False, "args": launch_args}))
+        modes.append(("chromium headless", {"headless": HEADLESS, "args": launch_args}))
+    else:
+        _log(
+            "Chromium Playwright absent dans browsers/, lancement via Chrome système"
+        )
+    modes.append(
+        ("chrome channel", {"channel": "chrome", "headless": HEADLESS, "args": launch_args})
+    )
 
     last_err: Exception | None = None
     for label, kwargs in modes:
@@ -141,194 +195,6 @@ def _launch_chromium(playwright) -> object:
             last_err = e
             _log(f"Échec lancement ({label}): {e}")
     raise RuntimeError(f"Impossible de lancer Chromium: {last_err}")
-
-
-def _rewrite_proxy_form_request(request: bytes) -> bytes:
-    """Playwright envoie GET http://host/ ; le modem attend GET / (origin-form)."""
-    head, sep, body = request.partition(b"\r\n\r\n")
-    lines = head.split(b"\r\n")
-    if not lines:
-        return request
-
-    first = lines[0].decode("latin-1", errors="ignore")
-    parts = first.split()
-    if len(parts) < 3:
-        return request
-
-    method, target, version = parts[0], parts[1], parts[2]
-    if not (target.startswith("http://") or target.startswith("https://")):
-        return request
-
-    parsed = urlparse(target)
-    host = parsed.hostname or ""
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    path = parsed.path or "/"
-    if parsed.query:
-        path += "?" + parsed.query
-
-    host_header = host if port in (80, 443) else f"{host}:{port}"
-    lines[0] = f"{method} {path} {version}".encode("latin-1")
-
-    new_lines = [lines[0]]
-    host_written = False
-    for line in lines[1:]:
-        lower = line.lower()
-        if lower.startswith(b"host:"):
-            new_lines.append(f"Host: {host_header}".encode("latin-1"))
-            host_written = True
-        elif lower.startswith(b"proxy-connection:"):
-            continue
-        else:
-            new_lines.append(line)
-    if not host_written:
-        new_lines.insert(1, f"Host: {host_header}".encode("latin-1"))
-
-    return b"\r\n".join(new_lines) + sep + body
-
-
-def _read_http_request(sock: socket.socket) -> bytes:
-    data = b""
-    while b"\r\n\r\n" not in data:
-        chunk = sock.recv(8192)
-        if not chunk:
-            break
-        data += chunk
-    if not data:
-        return b""
-
-    header_end = data.index(b"\r\n\r\n") + 4
-    headers = data[:header_end].decode("latin-1", errors="ignore")
-    content_length = 0
-    for line in headers.split("\r\n"):
-        if line.lower().startswith("content-length:"):
-            try:
-                content_length = int(line.split(":", 1)[1].strip())
-            except ValueError:
-                pass
-            break
-
-    body = data[header_end:]
-    while len(body) < content_length:
-        chunk = sock.recv(8192)
-        if not chunk:
-            break
-        body += chunk
-    return data[:header_end] + body[:content_length]
-
-
-def _relay_sockets(a: socket.socket, b: socket.socket) -> None:
-    sockets = [a, b]
-    a.settimeout(120.0)
-    b.settimeout(120.0)
-    while True:
-        try:
-            readable, _, _ = select.select(sockets, [], [], 120.0)
-        except OSError:
-            break
-        if not readable:
-            break
-        for sock in readable:
-            try:
-                chunk = sock.recv(8192)
-            except OSError:
-                return
-            if not chunk:
-                return
-            other = b if sock is a else a
-            try:
-                other.sendall(chunk)
-            except OSError:
-                return
-
-
-class _ModemAdminForwardProxy:
-    """
-    Proxy local : réécrit proxy-form -> origin-form puis transmet au proxy ProxyZ
-    du port (bind sur la bonne interface). Contourne le 400 du modem sans toucher ProxyZ.
-    """
-
-    def __init__(self, upstream_proxy_port: int) -> None:
-        self.upstream_proxy_port = int(upstream_proxy_port)
-        self.listen_port: int | None = None
-        self._server: socket.socket | None = None
-        self._thread: threading.Thread | None = None
-        self._lock = threading.Lock()
-
-    def start(self) -> int:
-        with self._lock:
-            if self.listen_port is not None:
-                return self.listen_port
-            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind(("127.0.0.1", 0))
-            server.listen(8)
-            self.listen_port = server.getsockname()[1]
-            self._server = server
-            self._thread = threading.Thread(target=self._serve, daemon=True)
-            self._thread.start()
-            return self.listen_port
-
-    def stop(self) -> None:
-        with self._lock:
-            if self._server is not None:
-                try:
-                    self._server.close()
-                except OSError:
-                    pass
-                self._server = None
-            self.listen_port = None
-
-    def _serve(self) -> None:
-        server = self._server
-        if server is None:
-            return
-        while True:
-            try:
-                client, _ = server.accept()
-            except OSError:
-                break
-            threading.Thread(
-                target=self._handle_client,
-                args=(client,),
-                daemon=True,
-            ).start()
-
-    def _handle_client(self, client: socket.socket) -> None:
-        upstream: socket.socket | None = None
-        try:
-            request = _read_http_request(client)
-            if not request:
-                return
-
-            first_line = request.split(b"\r\n", 1)[0].decode("latin-1", errors="ignore")
-            upstream = socket.create_connection(
-                ("127.0.0.1", self.upstream_proxy_port), timeout=30
-            )
-
-            if first_line.upper().startswith("CONNECT "):
-                upstream.sendall(request)
-                reply = upstream.recv(4096)
-                if reply:
-                    client.sendall(reply)
-                if reply and b"200" in reply.split(b"\r\n", 1)[0]:
-                    _relay_sockets(client, upstream)
-                return
-
-            outbound = _rewrite_proxy_form_request(request)
-            upstream.sendall(outbound)
-            _relay_sockets(client, upstream)
-        except Exception as e:
-            _log(f"Mini-proxy erreur: {e}", self.upstream_proxy_port)
-        finally:
-            try:
-                client.close()
-            except OSError:
-                pass
-            if upstream is not None:
-                try:
-                    upstream.close()
-                except OSError:
-                    pass
 
 
 def _dismiss_quick_setup_modal(page, proxy_port: int | None) -> None:
@@ -433,7 +299,6 @@ class _PlaywrightPortWorker:
         self._ready = threading.Event()
         self._playwright = None
         self._browser = None
-        self._admin_proxy: _ModemAdminForwardProxy | None = None
         self._last_activity = time.time()
         self._prepared = False
         self._prepared_context = None
@@ -448,12 +313,6 @@ class _PlaywrightPortWorker:
             self._discard_prepared_session()
         else:
             self._modem_web_url = url
-
-    def _playwright_proxy_url(self) -> str:
-        if self._admin_proxy is None:
-            self._admin_proxy = _ModemAdminForwardProxy(self.proxy_port)
-        listen = self._admin_proxy.start()
-        return f"http://127.0.0.1:{listen}"
 
     def start(self) -> None:
         with self._lock:
@@ -502,6 +361,7 @@ class _PlaywrightPortWorker:
     def _ensure_browser(self) -> None:
         if self._browser is not None:
             return
+        _configure_playwright_browsers_path()
         _log("Initialisation Playwright", self.proxy_port)
         self._playwright = sync_playwright().start()
         self._browser = _launch_chromium(self._playwright)
@@ -536,13 +396,9 @@ class _PlaywrightPortWorker:
 
     def _new_modem_page(self):
         self._ensure_browser()
-        playwright_proxy = self._playwright_proxy_url()
-        _log(
-            f"Proxy Playwright -> mini-proxy -> port {self.proxy_port} ({playwright_proxy})",
-            self.proxy_port,
-        )
+        gateway = self._modem_web_url
+        _log(f"Connexion directe vers passerelle modem ({gateway})", self.proxy_port)
         context = self._browser.new_context(
-            proxy={"server": playwright_proxy},
             viewport={"width": 1280, "height": 720},
             locale="en-US",
             ignore_https_errors=True,
@@ -700,9 +556,6 @@ class _PlaywrightPortWorker:
         except Exception:
             pass
         self._playwright = None
-        if self._admin_proxy is not None:
-            self._admin_proxy.stop()
-            self._admin_proxy = None
         _log("Thread worker terminé", self.proxy_port)
 
 

@@ -1,5 +1,5 @@
 {
-  "reset_script_default": "reset_XPro.py",
+  "reset_script_default": "reset_huawei.py",
   "interface_proxies": {
     "R\u00e9si": {
       "port": 80,
@@ -71,10 +71,6 @@
     },
     "Clef 9": {
       "port": 109,
-      "enabled": true
-    },
-    "Ethernet": {
-      "port": 111,
       "enabled": true
     },
     "Clefs BigBOSEZ": {
@@ -176,11 +172,15 @@
     "Ethernet 4G": {
       "port": 101,
       "enabled": true
+    },
+    "Cle 101": {
+      "port": 101,
+      "enabled": true
     }
   },
   "ui": {
     "last_window_size": [
-      420,
+      1070,
       944
     ]
   },
