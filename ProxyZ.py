@@ -4718,6 +4718,7 @@ class MainWindow(QMainWindow):
     # Signal émis par le thread de reset vers le thread Qt principal (name, returncode: 0=ok, -1=script absent, -2=timeout, autre=échec)
     reset_completed = Signal(str, int, float)
     reset_log = Signal(str)
+    remote_public_ip_updated = Signal(str, str, bool)  # name, public_ip, online
 
     def __init__(self):
         super().__init__()
@@ -4773,6 +4774,9 @@ class MainWindow(QMainWindow):
         self._console_view: str | None = None
         self._console_lines: dict[str | None, list[str]] = {None: []}
         self._iface_by_port: dict[int, str] = {}
+        self._remote_public_ip_inflight: set[str] = set()
+        self._remote_public_ip_inflight_lock = threading.Lock()
+        self._remote_public_ip_last_ok: dict[str, tuple[str, float]] = {}
 
         self._build_ui()
         self._load_config()
@@ -4785,12 +4789,17 @@ class MainWindow(QMainWindow):
         # Connexion du signal reset_completed pour arrêter l'animation après un reset
         self.reset_completed.connect(self._on_reset_completed)
         self.reset_log.connect(self._on_reset_log)
+        self.remote_public_ip_updated.connect(self._on_remote_public_ip_updated)
+        self.interface_manager.public_ip_timer.timeout.connect(
+            self.refresh_remote_public_ips
+        )
 
         # Première sync
         self.on_interfaces_updated(list(self.interface_manager.interfaces.values()))
         self._restore_initial_proxies()
         # Attendre que les ProxyThread soient réellement en écoute avant warmup Playwright.
         QTimer.singleShot(1500, self._start_playwright_browser_warmup)
+        QTimer.singleShot(2000, lambda: self.refresh_remote_public_ips(force=True))
         self._maybe_rebuild_zrotate_interfaces_list(force=True)
         self._set_quarantine_ui_stopped()
 
@@ -5514,14 +5523,17 @@ class MainWindow(QMainWindow):
         self.log_box.append(f"[{timestamp}] {text}")
 
     def _update_window_title(self):
-        # Nombre de connexions actives :
-        # interface up avec IPv4 locale ET IP publique résolue non vide
+        # Connexions actives : IP publique résolue (locales + distantes)
         try:
-            online_count = sum(
-                1
-                for info in self.interface_manager.interfaces.values()
-                if info.is_up and info.local_ip and info.public_ip
-            )
+            online_count = 0
+            for info in self._get_all_interfaces().values():
+                if not info.public_ip:
+                    continue
+                if info.is_remote:
+                    if info.online:
+                        online_count += 1
+                elif info.is_up and info.local_ip:
+                    online_count += 1
         except Exception:
             online_count = 0
 
@@ -5637,6 +5649,47 @@ class MainWindow(QMainWindow):
         merged.update(self._remote_interfaces)
         return merged
 
+    def _build_remote_proxy_entries(self, name: str) -> tuple[dict, dict]:
+        """Entrées synchronisées interface_proxies + remote_interfaces pour une distante."""
+        info = self._remote_interfaces.get(name)
+        if not info:
+            return {}, {}
+        iface_cfg = self.config.get("interface_proxies", {}).get(name) or {}
+        remote_cfg = (self.config.get("remote_interfaces") or {}).get(name) or {}
+
+        try:
+            port = int(iface_cfg.get("port") or remote_cfg.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+
+        enabled = bool(iface_cfg.get("enabled", remote_cfg.get("enabled", False)))
+        reset_script = str(
+            iface_cfg.get("reset_script") or remote_cfg.get("reset_script") or ""
+        ).strip()
+
+        remote_entry: dict = {
+            "upstream_host": info.upstream_host,
+            "upstream_port": info.upstream_port,
+            "port": port or None,
+            "enabled": enabled,
+        }
+        proxy_entry: dict = {
+            "port": port or None,
+            "enabled": enabled,
+            "remote": True,
+        }
+        if reset_script:
+            remote_entry["reset_script"] = reset_script
+            proxy_entry["reset_script"] = reset_script
+        return proxy_entry, remote_entry
+
+    def _apply_remote_proxy_entries(self, name: str, proxy_entry: dict, remote_entry: dict) -> None:
+        """Met à jour self.config (les deux sections) pour une interface distante."""
+        if proxy_entry:
+            self.config.setdefault("interface_proxies", {})[name] = dict(proxy_entry)
+        if remote_entry:
+            self.config.setdefault("remote_interfaces", {})[name] = dict(remote_entry)
+
     def _load_remote_interfaces_from_config(self) -> None:
         self._remote_interfaces.clear()
         remote_cfg = self.config.get("remote_interfaces") or {}
@@ -5652,18 +5705,6 @@ class MainWindow(QMainWindow):
                 upstream_port = 0
             if not host or upstream_port <= 0:
                 continue
-            try:
-                local_port = int(entry.get("port") or 0)
-            except (TypeError, ValueError):
-                local_port = 0
-            iface_proxies = self.config.setdefault("interface_proxies", {})
-            proxy_entry = iface_proxies.setdefault(name, {})
-            if local_port > 0:
-                proxy_entry.setdefault("port", local_port)
-            proxy_entry["remote"] = True
-            reset_script = str(entry.get("reset_script") or "").strip()
-            if reset_script:
-                proxy_entry["reset_script"] = reset_script
             self._remote_interfaces[name] = InterfaceInfo(
                 idx=-1,
                 name=name,
@@ -5678,9 +5719,31 @@ class MainWindow(QMainWindow):
                 upstream_host=host,
                 upstream_port=upstream_port,
             )
+            # Source de vérité au chargement : remote_interfaces → interface_proxies
+            try:
+                local_port = int(entry.get("port") or 0)
+            except (TypeError, ValueError):
+                local_port = 0
+            enabled = bool(entry.get("enabled", False))
+            reset_script = str(entry.get("reset_script") or "").strip()
+            remote_entry: dict = {
+                "upstream_host": host,
+                "upstream_port": upstream_port,
+                "port": local_port or None,
+                "enabled": enabled,
+            }
+            proxy_entry: dict = {
+                "port": local_port or None,
+                "enabled": enabled,
+                "remote": True,
+            }
+            if reset_script:
+                remote_entry["reset_script"] = reset_script
+                proxy_entry["reset_script"] = reset_script
+            self._apply_remote_proxy_entries(name, proxy_entry, remote_entry)
 
     def _save_remote_interfaces_config(self) -> None:
-        """Persiste remote_interfaces dans proxy_configs.json (merge, sans écraser le reste)."""
+        """Persiste remote_interfaces + interface_proxies (entrées distantes) dans proxy_configs.json."""
         try:
             config_path = get_app_dir() / self.CONFIG_FILE
             data: dict = {}
@@ -5691,24 +5754,22 @@ class MainWindow(QMainWindow):
                     data = loaded
 
             remote_payload: dict[str, dict] = {}
-            for name, info in self._remote_interfaces.items():
-                iface_cfg = self.config.get("interface_proxies", {}).get(name) or {}
-                entry: dict = {
-                    "upstream_host": info.upstream_host,
-                    "upstream_port": info.upstream_port,
-                    "port": iface_cfg.get("port"),
-                    "enabled": bool(iface_cfg.get("enabled")),
-                }
-                reset_script = str(iface_cfg.get("reset_script") or "").strip()
-                if reset_script:
-                    entry["reset_script"] = reset_script
-                remote_payload[name] = entry
+            iface_proxies_on_disk = data.setdefault("interface_proxies", {})
+            for name in self._remote_interfaces:
+                proxy_entry, remote_entry = self._build_remote_proxy_entries(name)
+                remote_payload[name] = remote_entry
+                iface_proxies_on_disk[name] = proxy_entry
+                self._apply_remote_proxy_entries(name, proxy_entry, remote_entry)
 
             data["remote_interfaces"] = remote_payload
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
 
             self.config["remote_interfaces"] = remote_payload
+            self.config["interface_proxies"] = {
+                **self.config.get("interface_proxies", {}),
+                **{name: iface_proxies_on_disk[name] for name in remote_payload},
+            }
         except Exception as e:
             print(f"Erreur sauvegarde interfaces distantes: {e}")
 
@@ -5942,6 +6003,7 @@ class MainWindow(QMainWindow):
                 f"Interface distante ajoutée: {new_name} "
                 f"(relais 127.0.0.1:{local_port} → {upstream_host}:{upstream_port})"
             )
+            self._refresh_remote_public_ip(new_name, force=True)
             return True
 
         assert old_name is not None
@@ -5954,7 +6016,9 @@ class MainWindow(QMainWindow):
         remote_interfaces = self.config.setdefault("remote_interfaces", {})
         old_iface_cfg = dict(iface_proxies.get(old_name) or {})
         old_remote_cfg = dict(remote_interfaces.get(old_name) or {})
-        was_enabled = bool(old_iface_cfg.get("enabled"))
+        was_enabled = bool(
+            old_iface_cfg.get("enabled", old_remote_cfg.get("enabled", False))
+        )
 
         if new_name != old_name:
             self._remote_interfaces.pop(old_name, None)
@@ -6011,6 +6075,8 @@ class MainWindow(QMainWindow):
 
         if was_running and widget:
             self._start_proxy_for_widget(widget, local_port, auto=True)
+        else:
+            self._refresh_remote_public_ip(new_name, force=True)
         return True
 
     def _on_add_remote_interface(self):
@@ -6084,47 +6150,95 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         self._append_log(f"Interface distante supprimée: {name}")
 
-    def _refresh_remote_public_ip(self, name: str) -> None:
+    def _refresh_remote_public_ip(self, name: str, force: bool = False) -> None:
         info = self._remote_interfaces.get(name)
-        widget = self.interface_widgets.get(name)
-        if not info or not widget:
+        if not info or not info.upstream_host or not info.upstream_port:
             return
+
+        with self._remote_public_ip_inflight_lock:
+            if name in self._remote_public_ip_inflight:
+                return
+
+        if not force:
+            now = time.monotonic()
+            last_ok = self._remote_public_ip_last_ok.get(name)
+            if (
+                last_ok
+                and info.online
+                and info.public_ip == last_ok[0]
+                and (now - last_ok[1]) < INTERFACE_PUBLIC_IP_STABLE_SKIP_S
+            ):
+                return
+
         iface_cfg = self.config.get("interface_proxies", {}).get(name) or {}
         try:
             proxy_port = int(iface_cfg.get("port") or 0)
         except (TypeError, ValueError):
             proxy_port = 0
-        if proxy_port <= 0 or name not in self._running_proxies:
-            return
+
+        use_local_relay = name in self._running_proxies and proxy_port > 0
+        upstream_host = info.upstream_host
+        upstream_port = int(info.upstream_port)
+
+        with self._remote_public_ip_inflight_lock:
+            self._remote_public_ip_inflight.add(name)
 
         def _worker():
             public_ip = None
             online = False
-            proxy_url = f"http://127.0.0.1:{proxy_port}"
+            proxy_urls: list[str] = []
+            if use_local_relay:
+                proxy_urls.append(f"http://127.0.0.1:{proxy_port}")
+            proxy_urls.append(f"http://{upstream_host}:{upstream_port}")
+
             services = [
                 "https://api.ipify.org",
                 "https://ifconfig.me",
                 "https://icanhazip.com",
             ]
-            for service in services:
-                try:
-                    with httpx.Client(proxy=proxy_url, timeout=8.0) as client:
-                        response = client.get(service)
-                        if response.status_code == 200:
-                            candidate = response.text.strip()
-                            if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", candidate):
-                                public_ip = candidate
-                                online = True
-                                break
-                except Exception:
-                    continue
-            info.public_ip = public_ip
-            info.online = online
-            if widget:
-                widget.update_from_interface(info)
-            self._refresh_zrotate_row_public_ip(name)
+            for proxy_url in proxy_urls:
+                for service in services:
+                    try:
+                        with httpx.Client(proxy=proxy_url, timeout=8.0) as client:
+                            response = client.get(service)
+                            if response.status_code == 200:
+                                candidate = response.text.strip()
+                                if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", candidate):
+                                    public_ip = candidate
+                                    online = True
+                                    break
+                    except Exception:
+                        continue
+                if online:
+                    break
+
+            self.remote_public_ip_updated.emit(name, public_ip or "", online)
+            with self._remote_public_ip_inflight_lock:
+                self._remote_public_ip_inflight.discard(name)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def refresh_remote_public_ips(self, force: bool = False) -> None:
+        for name in list(self._remote_interfaces.keys()):
+            self._refresh_remote_public_ip(name, force=force)
+
+    @Slot(str, str, bool)
+    def _on_remote_public_ip_updated(self, name: str, public_ip: str, online: bool):
+        info = self._remote_interfaces.get(name)
+        widget = self.interface_widgets.get(name)
+        if not info:
+            return
+        prev_ip = info.public_ip or ""
+        prev_online = info.online
+        info.public_ip = public_ip or None
+        info.online = online
+        if online and public_ip:
+            self._remote_public_ip_last_ok[name] = (public_ip, time.monotonic())
+        if widget:
+            widget.update_from_interface(info)
+        if (info.public_ip or "") != prev_ip or online != prev_online:
+            self._update_window_title()
+            self._refresh_zrotate_row_public_ip(name)
 
     def _save_zrotate_selection_config(self) -> None:
         """
@@ -6764,14 +6878,12 @@ class MainWindow(QMainWindow):
         iface_cfg["port"] = port
         iface_cfg["enabled"] = True
         if info.is_remote:
-            iface_cfg["remote"] = True
-            remote_entry = self.config.setdefault("remote_interfaces", {}).setdefault(
-                name, {}
-            )
-            remote_entry["upstream_host"] = info.upstream_host
-            remote_entry["upstream_port"] = info.upstream_port
+            proxy_entry, remote_entry = self._build_remote_proxy_entries(name)
+            proxy_entry["port"] = port
+            proxy_entry["enabled"] = True
             remote_entry["port"] = port
             remote_entry["enabled"] = True
+            self._apply_remote_proxy_entries(name, proxy_entry, remote_entry)
             self._save_remote_interfaces_config()
         self._save_config()
 
@@ -6809,10 +6921,10 @@ class MainWindow(QMainWindow):
         iface_cfg = self.config.setdefault("interface_proxies", {}).setdefault(name, {})
         iface_cfg["enabled"] = False
         if name in self._remote_interfaces:
-            remote_entry = self.config.setdefault("remote_interfaces", {}).setdefault(
-                name, {}
-            )
+            proxy_entry, remote_entry = self._build_remote_proxy_entries(name)
+            proxy_entry["enabled"] = False
             remote_entry["enabled"] = False
+            self._apply_remote_proxy_entries(name, proxy_entry, remote_entry)
             self._save_remote_interfaces_config()
         self._save_config()
 
