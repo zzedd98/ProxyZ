@@ -84,6 +84,19 @@ class ProxyZMiniWindow(MainWindow):
         self.auto_container.setMaximumWidth(620)
         left.addWidget(self.auto_container)
 
+        interfaces_header = QHBoxLayout()
+        interfaces_header.setSpacing(8)
+        interfaces_list_label = QLabel("Interfaces")
+        interfaces_list_label.setObjectName("globalStatus")
+        interfaces_header.addWidget(interfaces_list_label)
+        interfaces_header.addStretch(1)
+        self.add_remote_iface_button = QPushButton("+")
+        self.add_remote_iface_button.setObjectName("addRemoteIfaceButton")
+        self.add_remote_iface_button.setToolTip("Ajouter une interface réseau distante")
+        self.add_remote_iface_button.clicked.connect(self._on_add_remote_interface)
+        interfaces_header.addWidget(self.add_remote_iface_button)
+        left.addLayout(interfaces_header)
+
         self.manual_list = ManualInterfacesList()
         self.manual_list.order_changed.connect(self.on_manual_order_changed)
         self.manual_list.user_interaction.connect(self._mark_user_interaction)
@@ -190,12 +203,14 @@ class ProxyZMiniWindow(MainWindow):
                 self.config.setdefault("ui", {})
                 self.config.setdefault("interface_aliases", {})
                 self.config.setdefault("zrotate", {})
+                self.config.setdefault("remote_interfaces", {})
         except FileNotFoundError:
             self.config = {
                 "interface_proxies": {},
                 "ui": {},
                 "interface_aliases": {},
                 "zrotate": {},
+                "remote_interfaces": {},
             }
         except Exception as e:
             print(f"Erreur de chargement config: {e}")
@@ -204,6 +219,7 @@ class ProxyZMiniWindow(MainWindow):
                 "ui": {},
                 "interface_aliases": {},
                 "zrotate": {},
+                "remote_interfaces": {},
             }
 
         ui = self.config.get("ui", {})
@@ -212,6 +228,8 @@ class ProxyZMiniWindow(MainWindow):
             self.resize(size[0], size[1])
         else:
             self.resize(400, 920)
+
+        self._load_remote_interfaces_from_config()
 
     def _save_config(self):
         return

@@ -180,7 +180,7 @@
   },
   "ui": {
     "last_window_size": [
-      1070,
+      420,
       944
     ]
   },
@@ -193,5 +193,7 @@
     "running": false,
     "auto_start": true,
     "close_haapi_tunnel_after_seconds": 0.0
-  }
+  },
+  "playwright_warmup_enabled": false,
+  "remote_interfaces": {}
 }

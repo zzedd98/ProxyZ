@@ -43,6 +43,8 @@ PERSIST_CONFIG_TO_DISK = False
 # Warmup Playwright au démarrage : délai entre chaque port (éviter burst si activé).
 WARMUP_STAGGER_ENABLED = False
 WARMUP_STAGGER_SECONDS = 2.0
+# Valeur par défaut si absent de proxy_configs.json → "playwright_warmup_enabled"
+DEFAULT_PLAYWRIGHT_WARMUP_ENABLED = True
 
 # Polling interfaces / IP publique (perf CPU-GPU, réactivité préservée sur changement réel)
 INTERFACE_REFRESH_BASE_MS = 5000
@@ -108,6 +110,48 @@ QLabel#autoBadge {
     padding: 2px 8px;
     font-size: 11px;
     font-weight: 600;
+}
+QLabel#distBadge {
+    background-color: rgba(155, 89, 182, 0.22);
+    color: #d2b4de;
+    border-radius: 9px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+QPushButton#remoteDeleteButton {
+    background-color: rgba(231, 76, 60, 0.2);
+    color: #e74c3c;
+    border-radius: 9px;
+    border: 1px solid rgba(231, 76, 60, 0.45);
+    font-size: 13px;
+    font-weight: 700;
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    padding: 0px;
+}
+QPushButton#remoteDeleteButton:hover {
+    background-color: rgba(231, 76, 60, 0.45);
+    color: #ffffff;
+}
+QPushButton#addRemoteIfaceButton {
+    background-color: rgba(46, 204, 113, 0.2);
+    color: #2ecc71;
+    border-radius: 14px;
+    border: 1px solid rgba(46, 204, 113, 0.55);
+    font-size: 16px;
+    font-weight: 700;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+    padding: 0px;
+}
+QPushButton#addRemoteIfaceButton:hover {
+    background-color: rgba(46, 204, 113, 0.45);
+    color: #ffffff;
 }
 QLabel#ipLabel {
     color: #bdc3c7;
@@ -250,6 +294,13 @@ def _qt_apply_properties(widget, properties: dict) -> bool:
     return changed
 
 
+def interface_is_usable(info: "InterfaceInfo") -> bool:
+    """Interface locale (IPv4) ou distante (amont configuré)."""
+    if info.is_remote:
+        return bool(info.is_up and info.upstream_host and info.upstream_port)
+    return bool(info.is_up and info.local_ip)
+
+
 def interfaces_ui_snapshot(interfaces: dict[str, "InterfaceInfo"]) -> tuple:
     """Snapshot hashable pour interfaces_updated (sans IP publique / online)."""
     return tuple(
@@ -260,6 +311,9 @@ def interfaces_ui_snapshot(interfaces: dict[str, "InterfaceInfo"]) -> tuple:
                 info.is_up,
                 info.local_ip,
                 info.automatic,
+                info.is_remote,
+                info.upstream_host,
+                info.upstream_port,
             )
             for name, info in interfaces.items()
         )
@@ -269,12 +323,24 @@ def interfaces_ui_snapshot(interfaces: dict[str, "InterfaceInfo"]) -> tuple:
 def zrotate_visible_structure_signature(interfaces: dict[str, "InterfaceInfo"]) -> tuple:
     """Signature structurelle de la liste ZRotate (interfaces visibles, ordre trié)."""
     return tuple(
-        sorted(
-            name
-            for name, info in interfaces.items()
-            if info.is_up and info.local_ip
-        )
+        sorted(name for name, info in interfaces.items() if interface_is_usable(info))
     )
+
+
+def parse_host_port_field(text: str) -> tuple[str, int] | None:
+    """Parse 'host:port' ou 'ip:port' ; retourne (host, port) ou None."""
+    raw = (text or "").strip()
+    if not raw or ":" not in raw:
+        return None
+    host, port_str = raw.rsplit(":", 1)
+    host = host.strip()
+    port_str = port_str.strip()
+    if not host or not port_str.isdigit():
+        return None
+    port = int(port_str)
+    if port <= 0 or port > 65535:
+        return None
+    return host, port
 
 
 def get_app_dir() -> Path:
@@ -576,6 +642,8 @@ def collect_playwright_warmup_by_script(
     for iface_name, cfg in (config.get("interface_proxies", {}) or {}).items():
         if not cfg or cfg.get("enabled", True) is False:
             continue
+        if cfg.get("remote"):
+            continue
         try:
             port = int(cfg.get("port", 0) or 0)
         except (TypeError, ValueError):
@@ -752,6 +820,9 @@ class ProxyConfig:
     bind_ip: str
     port: int
     interface_name: str
+    is_remote: bool = False
+    upstream_host: str | None = None
+    upstream_port: int | None = None
 
 
 class ProxyThread(QThread):
@@ -771,9 +842,16 @@ class ProxyThread(QThread):
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind(("127.0.0.1", self.config.port))
             self.server_socket.listen(5)
-            print(
-                f"[OK] Proxy écoute sur 127.0.0.1:{self.config.port}, envoi via l'IP source {self.config.bind_ip}"
-            )
+            if self.config.is_remote:
+                print(
+                    f"[OK] Relais proxy sur 127.0.0.1:{self.config.port} "
+                    f"→ amont {self.config.upstream_host}:{self.config.upstream_port}"
+                )
+            else:
+                print(
+                    f"[OK] Proxy écoute sur 127.0.0.1:{self.config.port}, "
+                    f"envoi via l'IP source {self.config.bind_ip}"
+                )
 
             while self.running:
                 try:
@@ -810,6 +888,13 @@ class ProxyThread(QThread):
 
             request_line = request.split(b"\r\n")[0].decode(errors="ignore")
 
+            if self.config.is_remote:
+                if request_line.startswith("CONNECT"):
+                    self.handle_https_tunnel_upstream(client_socket, request_line)
+                else:
+                    self.handle_http_request_upstream(client_socket, request)
+                return
+
             if request_line.startswith("CONNECT"):
                 self.handle_https_tunnel(client_socket, request_line, bind_ip)
             else:
@@ -821,6 +906,57 @@ class ProxyThread(QThread):
                 client_socket.close()
             except Exception:
                 pass
+
+    def _connect_upstream_proxy_socket(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((self.config.upstream_host, int(self.config.upstream_port)))
+        return sock
+
+    def handle_https_tunnel_upstream(self, client_socket, request_line):
+        try:
+            match = re.match(r"CONNECT ([^:]+):(\d+)", request_line)
+            if not match:
+                print("Requête CONNECT mal formée (relais amont)")
+                return
+
+            host, port = match.groups()
+            port = int(port)
+
+            upstream_sock = self._connect_upstream_proxy_socket()
+            try:
+                connect_req = (
+                    f"CONNECT {host}:{port} HTTP/1.1\r\n"
+                    f"Host: {host}:{port}\r\n\r\n"
+                )
+                upstream_sock.sendall(connect_req.encode())
+                response = upstream_sock.recv(4096)
+                if not response or b"200" not in response.split(b"\r\n", 1)[0]:
+                    print("Échec CONNECT via proxy amont")
+                    return
+
+                client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                self.relay_data(client_socket, upstream_sock)
+            finally:
+                try:
+                    upstream_sock.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Erreur HTTPS relais amont: {e}")
+
+    def handle_http_request_upstream(self, client_socket, request):
+        try:
+            upstream_sock = self._connect_upstream_proxy_socket()
+            try:
+                upstream_sock.sendall(request)
+                self.relay_data(client_socket, upstream_sock)
+            finally:
+                try:
+                    upstream_sock.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Erreur HTTP relais amont: {e}")
 
     def handle_http_request(self, client_socket, request, bind_ip):
         try:
@@ -898,6 +1034,9 @@ class InterfaceInfo:
     local_ip: str | None
     public_ip: str | None = None
     online: bool = False
+    is_remote: bool = False
+    upstream_host: str | None = None
+    upstream_port: int | None = None
 
 
 class InterfaceManager(QObject):
@@ -1558,7 +1697,39 @@ class InterfaceQuotaManager:
                 for info in snapshot:
                     name = info.get("name") or ""
                     ip = info.get("ip") or ""
-                    if not name or not ip:
+                    is_remote = bool(info.get("remote"))
+                    proxy_port = info.get("proxy_port")
+                    if not name:
+                        continue
+                    if is_remote:
+                        if not proxy_port:
+                            continue
+                        ok = await async_check_egress_public_internet(
+                            "", timeout=10.0, proxy_port=int(proxy_port)
+                        )
+                        if ok:
+                            logger.info(
+                                f"[QUOTA] Health pool: ✅ {name} (relais 127.0.0.1:{proxy_port}) — Internet OK"
+                            )
+                            continue
+                        logger.warning(
+                            f"[QUOTA] Health pool: ❌ {name} (relais 127.0.0.1:{proxy_port}) — test ipify échoué"
+                        )
+                        async with self._lock:
+                            before = [a["name"] for a in self.available_interfaces]
+                            if name not in before or name in self.resetting_interfaces:
+                                continue
+                            self.available_interfaces = [
+                                i for i in self.available_interfaces if i["name"] != name
+                            ]
+                            self._interface_available_event_clear_if_empty()
+                            self._keys_removed_from_pool.add(name)
+                            logger.warning(
+                                f"[QUOTA] ⚠️ {name} retirée du pool ZRotate (relais distant inaccessible)"
+                            )
+                        continue
+
+                    if not ip:
                         continue
                     local_ok = await asyncio.to_thread(local_ipv4_assigned_on_host, ip)
                     if not local_ok:
@@ -2452,19 +2623,66 @@ async def open_connection_with_bind(
         raise
 
 
+async def open_connection_via_proxy(
+    host: str,
+    port: int,
+    proxy_host: str,
+    proxy_port: int,
+    timeout: float = 10.0,
+) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Ouvre une connexion TCP vers host:port via un proxy HTTP (CONNECT)."""
+    loop = asyncio.get_running_loop()
+    try:
+        infos = socket.getaddrinfo(
+            host,
+            port,
+            family=socket.AF_INET,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+        if not infos:
+            raise OSError(f"No IPv4 address found for {host}:{port}")
+        dest_addr = infos[0][4]
+    except socket.gaierror as e:
+        raise OSError(f"Failed to resolve {host}:{port}: {e}")
+
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(proxy_host, proxy_port),
+        timeout=timeout,
+    )
+    connect_req = (
+        f"CONNECT {dest_addr[0]}:{dest_addr[1]} HTTP/1.1\r\n"
+        f"Host: {dest_addr[0]}:{dest_addr[1]}\r\n\r\n"
+    )
+    writer.write(connect_req.encode("ascii"))
+    await writer.drain()
+    response = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
+    status_line = response.split(b"\r\n", 1)[0]
+    if b"200" not in status_line:
+        writer.close()
+        await writer.wait_closed()
+        raise OSError(f"Proxy CONNECT failed: {status_line.decode(errors='ignore')}")
+    return reader, writer
+
+
 async def async_check_egress_public_internet(
-    source_ip: str, timeout: float = 10.0
+    source_ip: str, timeout: float = 10.0, proxy_port: int | None = None
 ) -> bool:
     """
-    Vérifie qu'on peut atteindre Internet via l'IP locale (egress) et obtenir une IP publique
-    (même test que l'UI : api.ipify.org, corps = IPv4).
+    Vérifie qu'on peut atteindre Internet et obtenir une IP publique
+    (api.ipify.org). Via bind source ou via proxy local (interfaces distantes).
     """
     reader: Optional[asyncio.StreamReader] = None
     writer: Optional[asyncio.StreamWriter] = None
     try:
-        reader, writer = await open_connection_with_bind(
-            "api.ipify.org", 80, source_ip, timeout=timeout
-        )
+        if proxy_port:
+            reader, writer = await open_connection_via_proxy(
+                "api.ipify.org", 80, "127.0.0.1", int(proxy_port), timeout=timeout
+            )
+        else:
+            reader, writer = await open_connection_with_bind(
+                "api.ipify.org", 80, source_ip, timeout=timeout
+            )
         req = (
             "GET /?format=text HTTP/1.1\r\n"
             "Host: api.ipify.org\r\n"
@@ -2752,6 +2970,14 @@ class ZRotateSingleProxyServer:
         # Validation des egress IPs au démarrage
         valid_configs = []
         for cfg in egress_configs:
+            if cfg.get("remote"):
+                if cfg.get("proxy_port"):
+                    valid_configs.append(cfg)
+                else:
+                    logger.error(
+                        f"❌ Interface distante invalide (port relais manquant): {cfg['name']}"
+                    )
+                continue
             if validate_egress_ip(cfg["ip"]):
                 valid_configs.append(cfg)
             else:
@@ -2950,11 +3176,19 @@ class ZRotateSingleProxyServer:
 
             # Traiter la requête selon son type
             if request_type == "CONNECT":
-                # Ouvrir connexion upstream avec bind source
+                # Ouvrir connexion upstream (bind local ou relais amont)
                 try:
-                    upstream_reader, upstream_writer = await open_connection_with_bind(
-                        dest_host, dest_port, egress_info["ip"]
-                    )
+                    if egress_info.get("remote"):
+                        upstream_reader, upstream_writer = await open_connection_via_proxy(
+                            dest_host,
+                            dest_port,
+                            "127.0.0.1",
+                            int(egress_info["proxy_port"]),
+                        )
+                    else:
+                        upstream_reader, upstream_writer = await open_connection_with_bind(
+                            dest_host, dest_port, egress_info["ip"]
+                        )
                 except (
                     OSError,
                     ConnectionRefusedError,
@@ -3056,11 +3290,19 @@ class ZRotateSingleProxyServer:
                     except (ValueError, KeyError):
                         body_remaining = 0
 
-                # Ouvrir connexion upstream avec bind source
+                # Ouvrir connexion upstream (bind local ou relais amont)
                 try:
-                    upstream_reader, upstream_writer = await open_connection_with_bind(
-                        dest_host, dest_port, egress_info["ip"]
-                    )
+                    if egress_info.get("remote"):
+                        upstream_reader, upstream_writer = await open_connection_via_proxy(
+                            dest_host,
+                            dest_port,
+                            "127.0.0.1",
+                            int(egress_info["proxy_port"]),
+                        )
+                    else:
+                        upstream_reader, upstream_writer = await open_connection_with_bind(
+                            dest_host, dest_port, egress_info["ip"]
+                        )
                 except (
                     OSError,
                     ConnectionRefusedError,
@@ -3733,11 +3975,134 @@ class LogHandler(logging.Handler):
             pass
 
 
+class RemoteInterfaceDialog(QDialog):
+    """Popup d'ajout ou modification d'une interface réseau distante."""
+
+    def __init__(self, parent=None, edit_mode: bool = False):
+        super().__init__(parent)
+        self._edit_mode = edit_mode
+        self.setWindowTitle(
+            "Modifier une interface distante"
+            if edit_mode
+            else "Ajouter une interface distante"
+        )
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        help_label = QLabel(
+            "Relais vers un proxy déjà actif sur un autre serveur (même réseau local)."
+        )
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Ex: Serveur clés 1")
+        form.addRow("Nom :", self.name_edit)
+
+        self.upstream_edit = QLineEdit()
+        self.upstream_edit.setPlaceholderText("Ex: 192.168.1.50:101")
+        form.addRow("Proxy amont (IP:port) :", self.upstream_edit)
+
+        self.port_edit = QLineEdit()
+        self.port_edit.setPlaceholderText("Port local du relais (127.0.0.1)")
+        form.addRow("Port relais local :", self.port_edit)
+
+        reset_row = QHBoxLayout()
+        reset_row.setSpacing(6)
+        self.reset_script_edit = QLineEdit()
+        self.reset_script_edit.setPlaceholderText("Optionnel — ex: reset_huawei.py")
+        browse_btn = QPushButton("…")
+        browse_btn.setObjectName("remoteResetBrowseButton")
+        browse_btn.setFixedWidth(34)
+        browse_btn.setToolTip("Parcourir pour choisir un script de reset")
+        browse_btn.clicked.connect(self._browse_reset_script)
+        reset_row.addWidget(self.reset_script_edit, 1)
+        reset_row.addWidget(browse_btn)
+        reset_widget = QWidget()
+        reset_widget.setLayout(reset_row)
+        form.addRow("Script reset :", reset_widget)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def set_values(
+        self,
+        *,
+        name: str,
+        upstream_host: str,
+        upstream_port: int,
+        local_port: int,
+        reset_script: str = "",
+    ) -> None:
+        self.name_edit.setText(name)
+        self.upstream_edit.setText(f"{upstream_host}:{upstream_port}")
+        self.port_edit.setText(str(local_port))
+        self.reset_script_edit.setText(reset_script or "")
+
+    def _browse_reset_script(self) -> None:
+        app_dir = get_app_dir()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choisir un script de reset",
+            str(app_dir),
+            "Scripts Python (*.py);;Tous les fichiers (*.*)",
+        )
+        if not path:
+            return
+        self.reset_script_edit.setText(normalize_reset_script_storage_path(path))
+
+    def values(self) -> tuple[str, str, int, int, str] | None:
+        name = self.name_edit.text().strip()
+        upstream = self.upstream_edit.text().strip()
+        port_text = self.port_edit.text().strip()
+        if not name or not upstream or not port_text.isdigit():
+            return None
+        parsed = parse_host_port_field(upstream)
+        if not parsed:
+            return None
+        port = int(port_text)
+        if port <= 0 or port > 65535:
+            return None
+        host, upstream_port = parsed
+        reset_script = self.reset_script_edit.text().strip()
+        return name, host, upstream_port, port, reset_script
+
+
+def normalize_reset_script_storage_path(path: str) -> str:
+    """Chemin relatif au dossier app si possible, sinon chemin absolu."""
+    raw = (path or "").strip()
+    if not raw:
+        return ""
+    p = Path(raw)
+    if not p.is_absolute():
+        return raw.replace("\\", "/")
+    try:
+        rel = p.resolve().relative_to(get_app_dir().resolve())
+        return str(rel).replace("\\", "/")
+    except ValueError:
+        return str(p.resolve())
+
+
+AddRemoteInterfaceDialog = RemoteInterfaceDialog
+
+
 class InterfaceWidget(QFrame):
     proxy_toggled = Signal(str, bool, int)  # name, enabled, port
     rename_requested = Signal(str)  # name
     settings_requested = Signal(str)  # ouverture des propriétés de la carte
     reset_requested = Signal(str)  # name
+    delete_requested = Signal(str)  # interface distante
+    edit_requested = Signal(str)  # interface distante
     user_interaction = Signal()  # toute interaction utilisateur sur ce widget
 
     def __init__(self, interface: InterfaceInfo, parent=None):
@@ -3756,6 +4121,7 @@ class InterfaceWidget(QFrame):
 
         self.setObjectName("interfaceCard")
         self.setMinimumHeight(84)
+        self.setContextMenuPolicy(Qt.DefaultContextMenu)
         self._build_ui()
         self.setStyleSheet(INTERFACE_CARD_QSS)
         self.update_from_interface(interface)
@@ -3777,11 +4143,23 @@ class InterfaceWidget(QFrame):
         self.name_label.setObjectName("ifaceName")
         header.addWidget(self.name_label, 1)
 
+        self.dist_badge = QLabel("DIST")
+        self.dist_badge.setObjectName("distBadge")
+        self.dist_badge.setVisible(False)
+        header.addWidget(self.dist_badge, 0, Qt.AlignLeft)
+
         # Badge AUTO (métrique automatique) seulement, la métrique numérique est déplacée en bas
         self.auto_badge = QLabel("AUTO")
         self.auto_badge.setObjectName("autoBadge")
         self.auto_badge.setVisible(False)
         header.addWidget(self.auto_badge, 0, Qt.AlignLeft)
+
+        self.delete_button = QPushButton("×")
+        self.delete_button.setObjectName("remoteDeleteButton")
+        self.delete_button.setToolTip("Supprimer cette interface distante")
+        self.delete_button.setVisible(False)
+        self.delete_button.clicked.connect(self._on_delete_clicked)
+        header.addWidget(self.delete_button, 0, Qt.AlignRight)
 
         # IP publique visible en haut à droite, sur la même ligne
         header.addStretch(1)
@@ -3859,18 +4237,29 @@ class InterfaceWidget(QFrame):
     # --- Mise à jour depuis InterfaceInfo ---
     def update_from_interface(self, interface: InterfaceInfo):
         self.interface = interface
+        self.dist_badge.setVisible(interface.is_remote)
+        self.delete_button.setVisible(interface.is_remote)
+        if not interface.is_remote:
+            self.reset_badge.setVisible(True)
+        self.metric_badge.setVisible(not interface.is_remote)
         if self.name_label.text() != interface.name:
             self.name_label.setText(interface.name)
-        metric_txt = f"Metric {interface.metric}"
+        if interface.is_remote:
+            metric_txt = "Relais"
+        else:
+            metric_txt = f"Metric {interface.metric}"
         if self.metric_badge.text() != metric_txt:
             self.metric_badge.setText(metric_txt)
-        self.auto_badge.setVisible(interface.automatic)
+        self.auto_badge.setVisible(interface.automatic and not interface.is_remote)
 
-        local_txt = (
-            f"IPv4 locale: {interface.local_ip}"
-            if interface.local_ip
-            else "IPv4 locale: -"
-        )
+        if interface.is_remote and interface.upstream_host and interface.upstream_port:
+            local_txt = f"Amont: {interface.upstream_host}:{interface.upstream_port}"
+        else:
+            local_txt = (
+                f"IPv4 locale: {interface.local_ip}"
+                if interface.local_ip
+                else "IPv4 locale: -"
+            )
         if self.local_ip_label.text() != local_txt:
             self.local_ip_label.setText(local_txt)
 
@@ -3878,17 +4267,49 @@ class InterfaceWidget(QFrame):
         if self.public_ip_header_label.text() != public_txt:
             self.public_ip_header_label.setText(public_txt)
 
-        has_local = bool(interface.local_ip)
+        has_local = bool(interface.local_ip) or (
+            interface.is_remote
+            and interface.upstream_host
+            and interface.upstream_port
+        )
         if not has_local:
             self.set_proxy_running(False)
+
+        if interface.is_remote:
+            disconnected = False
+            connected = bool(interface.online)
+        else:
+            disconnected = not interface.is_up
+            connected = bool(interface.online and interface.is_up)
 
         _qt_apply_properties(
             self,
             {
-                "disconnected": not interface.is_up,
-                "connected": bool(interface.online and interface.is_up),
+                "disconnected": disconnected,
+                "connected": connected,
             },
         )
+
+    def set_remote_reset_visible(self, visible: bool) -> None:
+        if self.interface.is_remote:
+            self.reset_badge.setVisible(bool(visible))
+
+    def contextMenuEvent(self, event):
+        if not self.interface.is_remote:
+            return super().contextMenuEvent(event)
+        self.user_interaction.emit()
+        menu = QMenu(self)
+        edit_action = menu.addAction("Éditer…")
+        delete_action = menu.addAction("Supprimer…")
+        chosen = menu.exec(event.globalPos())
+        if chosen == edit_action:
+            self.edit_requested.emit(self.interface_name)
+        elif chosen == delete_action:
+            self.delete_requested.emit(self.interface_name)
+
+    def _on_delete_clicked(self):
+        self.user_interaction.emit()
+        self.delete_requested.emit(self.interface_name)
 
     # --- Proxy ---
     def _on_proxy_button_clicked(self):
@@ -3897,11 +4318,18 @@ class InterfaceWidget(QFrame):
         want_enable = self.proxy_status_chip.objectName() != "proxyOnChip"
 
         if want_enable:
-            if not self.interface.local_ip:
+            if not (
+                self.interface.local_ip
+                or (
+                    self.interface.is_remote
+                    and self.interface.upstream_host
+                    and self.interface.upstream_port
+                )
+            ):
                 QMessageBox.warning(
                     self,
                     "Proxy impossible",
-                    "Aucune IPv4 locale valide pour cette interface.",
+                    "Aucune interface valide pour cette entrée.",
                 )
                 return
             if not port_text.isdigit():
@@ -4001,6 +4429,8 @@ class InterfaceWidget(QFrame):
             and obj is self.name_label
             and event.type() == QEvent.MouseButtonDblClick
         ):
+            if self.interface.is_remote:
+                return True
             self.user_interaction.emit()
             self.rename_requested.emit(self.interface_name)
             return True
@@ -4075,7 +4505,13 @@ class ManualInterfacesList(QListWidget):
 class ZRotateInterfaceRow(QFrame):
     toggled = Signal(str, int)  # interface_name, Qt.CheckState
 
-    def __init__(self, interface_name: str, public_ip: str, parent=None):
+    def __init__(
+        self,
+        interface_name: str,
+        public_ip: str,
+        display_name: str | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.interface_name = interface_name
         self._last_zrotate_live: str | None = None
@@ -4087,7 +4523,7 @@ class ZRotateInterfaceRow(QFrame):
         layout.setContentsMargins(8, 5, 8, 5)
         layout.setSpacing(10)
 
-        self.checkbox = QCheckBox(interface_name)
+        self.checkbox = QCheckBox(display_name or interface_name)
         self.checkbox.setObjectName("zrotateInterfaceCheckbox")
         self.checkbox.stateChanged.connect(
             lambda state: self.toggled.emit(self.interface_name, state)
@@ -4299,6 +4735,7 @@ class MainWindow(QMainWindow):
             raise
 
         self.interface_widgets: dict[str, InterfaceWidget] = {}
+        self._remote_interfaces: dict[str, InterfaceInfo] = {}
         self.proxy_threads: dict[str, ProxyThread] = {}
         self.active_proxies = 0
         # Ensemble des noms d'interfaces dont le proxy est réellement en cours d'exécution
@@ -4321,6 +4758,7 @@ class MainWindow(QMainWindow):
         self._last_quarantine_names: tuple[str, ...] | None = None
         self._last_pool_state_for_ui: Dict[str, Dict[str, bool]] | None = None
         self._was_minimized = False
+        self.playwright_warmup_enabled = DEFAULT_PLAYWRIGHT_WARMUP_ENABLED
 
         # Resets en parallèle (un thread par interface) ; suivi pour éviter doublons et refresh en rafale
         self._reset_in_progress: set[str] = set()  # interfaces en cours de reset
@@ -4370,6 +4808,9 @@ class MainWindow(QMainWindow):
         par script Playwright et par port proxy configuré.
         Délai optionnel entre ports : WARMUP_STAGGER_ENABLED / WARMUP_STAGGER_SECONDS.
         """
+        if not self.playwright_warmup_enabled:
+            print("[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)")
+            return
 
         def _warmup():
             try:
@@ -4387,6 +4828,10 @@ class MainWindow(QMainWindow):
                     if not getattr(thread, "running", False):
                         continue
                     cfg = getattr(thread, "config", None)
+                    if cfg and getattr(cfg, "is_remote", False):
+                        continue
+                    if iface_name in self._remote_interfaces:
+                        continue
                     proxy_port = int(getattr(cfg, "port", 0) or 0) if cfg else 0
                     if proxy_port <= 0:
                         continue
@@ -4505,6 +4950,19 @@ class MainWindow(QMainWindow):
         self.global_status_label.setObjectName("globalStatus")
         left.addWidget(self.global_status_label)
 
+        self.playwright_warmup_checkbox = QCheckBox(
+            "Warmup Playwright au démarrage"
+        )
+        self.playwright_warmup_checkbox.setObjectName("playwrightWarmupCheckbox")
+        self.playwright_warmup_checkbox.setToolTip(
+            "Prépare les navigateurs reset (page modem) en arrière-plan au lancement. "
+            "Interfaces distantes toujours exclues."
+        )
+        self.playwright_warmup_checkbox.stateChanged.connect(
+            self._on_playwright_warmup_changed
+        )
+        left.addWidget(self.playwright_warmup_checkbox)
+
         self.auto_container = QWidget()
         self.auto_layout = QVBoxLayout(self.auto_container)
         self.auto_layout.setContentsMargins(0, 0, 0, 0)
@@ -4512,6 +4970,19 @@ class MainWindow(QMainWindow):
         # Largeur raisonnable des cartes pour un rendu équilibré
         self.auto_container.setMaximumWidth(620)
         left.addWidget(self.auto_container)
+
+        interfaces_header = QHBoxLayout()
+        interfaces_header.setSpacing(8)
+        interfaces_list_label = QLabel("Interfaces")
+        interfaces_list_label.setObjectName("globalStatus")
+        interfaces_header.addWidget(interfaces_list_label)
+        interfaces_header.addStretch(1)
+        self.add_remote_iface_button = QPushButton("+")
+        self.add_remote_iface_button.setObjectName("addRemoteIfaceButton")
+        self.add_remote_iface_button.setToolTip("Ajouter une interface réseau distante")
+        self.add_remote_iface_button.clicked.connect(self._on_add_remote_interface)
+        interfaces_header.addWidget(self.add_remote_iface_button)
+        left.addLayout(interfaces_header)
 
         self.manual_list = ManualInterfacesList()
         self.manual_list.order_changed.connect(self.on_manual_order_changed)
@@ -4919,6 +5390,24 @@ class MainWindow(QMainWindow):
                 border: 1px solid #27ae60;
                 border-radius: 3px;
             }
+            QCheckBox#playwrightWarmupCheckbox {
+                color: #bdc3c7;
+                font-size: 12px;
+            }
+            QCheckBox#playwrightWarmupCheckbox::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QCheckBox#playwrightWarmupCheckbox::indicator:unchecked {
+                background-color: #22313f;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 3px;
+            }
+            QCheckBox#playwrightWarmupCheckbox::indicator:checked {
+                background-color: #27ae60;
+                border: 1px solid #27ae60;
+                border-radius: 3px;
+            }
             QTextEdit#zrotateLogBox {
                 background-color: #1a1a1a;
                 border-radius: 6px;
@@ -5044,6 +5533,18 @@ class MainWindow(QMainWindow):
         )
 
     # --- Config / persistance ---
+    def _read_playwright_warmup_enabled_from_config(self) -> bool:
+        val = self.config.get(
+            "playwright_warmup_enabled", DEFAULT_PLAYWRIGHT_WARMUP_ENABLED
+        )
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "on")
+        return DEFAULT_PLAYWRIGHT_WARMUP_ENABLED
+
     def _load_config(self):
         try:
             with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -5061,6 +5562,7 @@ class MainWindow(QMainWindow):
                     "ui": {},
                     "interface_aliases": {},
                     "zrotate": {},
+                    "remote_interfaces": {},
                 }
                 self.config.setdefault("reset_script_default", DEFAULT_RESET_SCRIPT)
                 self._save_config()
@@ -5071,12 +5573,14 @@ class MainWindow(QMainWindow):
                 self.config.setdefault("ui", {})
                 self.config.setdefault("interface_aliases", {})
                 self.config.setdefault("zrotate", {})
+                self.config.setdefault("remote_interfaces", {})
         except FileNotFoundError:
             self.config = {
                 "interface_proxies": {},
                 "ui": {},
                 "interface_aliases": {},
                 "zrotate": {},
+                "remote_interfaces": {},
             }
             self.config.setdefault("reset_script_default", DEFAULT_RESET_SCRIPT)
         except Exception as e:
@@ -5086,6 +5590,7 @@ class MainWindow(QMainWindow):
                 "ui": {},
                 "interface_aliases": {},
                 "zrotate": {},
+                "remote_interfaces": {},
             }
             self.config.setdefault("reset_script_default", DEFAULT_RESET_SCRIPT)
 
@@ -5108,6 +5613,15 @@ class MainWindow(QMainWindow):
                 Qt.Checked if zrotate_cfg["auto_start"] else Qt.Unchecked
             )
 
+        self.playwright_warmup_enabled = self._read_playwright_warmup_enabled_from_config()
+        self.config["playwright_warmup_enabled"] = self.playwright_warmup_enabled
+        if hasattr(self, "playwright_warmup_checkbox"):
+            blocked = self.playwright_warmup_checkbox.blockSignals(True)
+            self.playwright_warmup_checkbox.setCheckState(
+                Qt.Checked if self.playwright_warmup_enabled else Qt.Unchecked
+            )
+            self.playwright_warmup_checkbox.blockSignals(blocked)
+
         ui = self.config.get("ui", {})
         size = ui.get("last_window_size")
         if isinstance(size, list) and len(size) == 2:
@@ -5115,6 +5629,502 @@ class MainWindow(QMainWindow):
         else:
             # Taille de départ qui épouse le panneau central (agrandie de 50% en hauteur et 20% en largeur pour le panel droit)
             self.resize(1070, 920)  # Largeur: 400 + 540 + 20 espacement + marges ≈ 1070
+
+        self._load_remote_interfaces_from_config()
+
+    def _get_all_interfaces(self) -> dict[str, InterfaceInfo]:
+        merged = dict(self.interface_manager.interfaces)
+        merged.update(self._remote_interfaces)
+        return merged
+
+    def _load_remote_interfaces_from_config(self) -> None:
+        self._remote_interfaces.clear()
+        remote_cfg = self.config.get("remote_interfaces") or {}
+        if not isinstance(remote_cfg, dict):
+            return
+        for name, entry in remote_cfg.items():
+            if not isinstance(entry, dict):
+                continue
+            host = str(entry.get("upstream_host") or "").strip()
+            try:
+                upstream_port = int(entry.get("upstream_port") or 0)
+            except (TypeError, ValueError):
+                upstream_port = 0
+            if not host or upstream_port <= 0:
+                continue
+            try:
+                local_port = int(entry.get("port") or 0)
+            except (TypeError, ValueError):
+                local_port = 0
+            iface_proxies = self.config.setdefault("interface_proxies", {})
+            proxy_entry = iface_proxies.setdefault(name, {})
+            if local_port > 0:
+                proxy_entry.setdefault("port", local_port)
+            proxy_entry["remote"] = True
+            reset_script = str(entry.get("reset_script") or "").strip()
+            if reset_script:
+                proxy_entry["reset_script"] = reset_script
+            self._remote_interfaces[name] = InterfaceInfo(
+                idx=-1,
+                name=name,
+                metric=10000,
+                automatic=False,
+                state="connected",
+                is_up=True,
+                local_ip=None,
+                public_ip=None,
+                online=False,
+                is_remote=True,
+                upstream_host=host,
+                upstream_port=upstream_port,
+            )
+
+    def _save_remote_interfaces_config(self) -> None:
+        """Persiste remote_interfaces dans proxy_configs.json (merge, sans écraser le reste)."""
+        try:
+            config_path = get_app_dir() / self.CONFIG_FILE
+            data: dict = {}
+            if config_path.is_file():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+
+            remote_payload: dict[str, dict] = {}
+            for name, info in self._remote_interfaces.items():
+                iface_cfg = self.config.get("interface_proxies", {}).get(name) or {}
+                entry: dict = {
+                    "upstream_host": info.upstream_host,
+                    "upstream_port": info.upstream_port,
+                    "port": iface_cfg.get("port"),
+                    "enabled": bool(iface_cfg.get("enabled")),
+                }
+                reset_script = str(iface_cfg.get("reset_script") or "").strip()
+                if reset_script:
+                    entry["reset_script"] = reset_script
+                remote_payload[name] = entry
+
+            data["remote_interfaces"] = remote_payload
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+
+            self.config["remote_interfaces"] = remote_payload
+        except Exception as e:
+            print(f"Erreur sauvegarde interfaces distantes: {e}")
+
+    def _suggest_next_local_port(self) -> int:
+        ports: set[int] = set()
+        for cfg in self.config.get("interface_proxies", {}).values():
+            if not isinstance(cfg, dict):
+                continue
+            try:
+                port = int(cfg.get("port") or 0)
+            except (TypeError, ValueError):
+                port = 0
+            if port > 0:
+                ports.add(port)
+        for entry in (self.config.get("remote_interfaces") or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                port = int(entry.get("port") or 0)
+            except (TypeError, ValueError):
+                port = 0
+            if port > 0:
+                ports.add(port)
+        for widget in self.interface_widgets.values():
+            try:
+                port = int((widget.port_edit.text() or "").strip())
+            except ValueError:
+                port = 0
+            if port > 0:
+                ports.add(port)
+        return max(max(ports, default=100) + 1, 101)
+
+    def _is_local_port_in_use(self, port: int, exclude_name: str | None = None) -> bool:
+        for name, thread in self.proxy_threads.items():
+            if exclude_name and name == exclude_name:
+                continue
+            cfg = getattr(thread, "config", None)
+            if cfg and getattr(thread, "running", False) and cfg.port == port:
+                return True
+        for name, widget in self.interface_widgets.items():
+            if exclude_name and name == exclude_name:
+                continue
+            try:
+                w_port = int((widget.port_edit.text() or "").strip())
+            except ValueError:
+                continue
+            if w_port == port:
+                return True
+        return False
+
+    def _create_interface_widget(self, info: InterfaceInfo) -> InterfaceWidget:
+        widget = InterfaceWidget(info)
+        widget.proxy_toggled.connect(self.on_proxy_toggled)
+        widget.rename_requested.connect(self.on_interface_rename_requested)
+        widget.settings_requested.connect(self.on_interface_settings_requested)
+        widget.reset_requested.connect(self.on_interface_reset_requested)
+        widget.delete_requested.connect(self.on_remote_interface_delete_requested)
+        widget.edit_requested.connect(self._on_edit_remote_interface)
+        widget.user_interaction.connect(self._mark_user_interaction)
+        self.interface_widgets[info.name] = widget
+
+        iface_cfg = self.config.get("interface_proxies", {}).get(info.name)
+        if iface_cfg:
+            port = iface_cfg.get("port")
+            if port:
+                widget.set_port(port)
+        return widget
+
+    def _remote_iface_reset_script(self, name: str) -> str:
+        iface_cfg = self.config.get("interface_proxies", {}).get(name) or {}
+        remote_cfg = (self.config.get("remote_interfaces") or {}).get(name) or {}
+        return str(
+            iface_cfg.get("reset_script") or remote_cfg.get("reset_script") or ""
+        ).strip()
+
+    def _sync_remote_reset_badge(self, name: str) -> None:
+        widget = self.interface_widgets.get(name)
+        if widget and name in self._remote_interfaces:
+            widget.set_remote_reset_visible(bool(self._remote_iface_reset_script(name)))
+
+    def _prompt_remote_interface_dialog(
+        self, edit_name: str | None = None
+    ) -> tuple[str, str, int, int, str] | None:
+        dialog = RemoteInterfaceDialog(self, edit_mode=edit_name is not None)
+        if edit_name:
+            info = self._remote_interfaces.get(edit_name)
+            if not info:
+                return None
+            iface_cfg = self.config.get("interface_proxies", {}).get(edit_name) or {}
+            remote_cfg = (self.config.get("remote_interfaces") or {}).get(
+                edit_name
+            ) or {}
+            try:
+                local_port = int(
+                    iface_cfg.get("port") or remote_cfg.get("port") or 0
+                )
+            except (TypeError, ValueError):
+                local_port = 0
+            dialog.set_values(
+                name=edit_name,
+                upstream_host=info.upstream_host or "",
+                upstream_port=int(info.upstream_port or 0),
+                local_port=local_port,
+                reset_script=self._remote_iface_reset_script(edit_name),
+            )
+        else:
+            dialog.port_edit.setText(str(self._suggest_next_local_port()))
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        values = dialog.values()
+        if not values:
+            QMessageBox.warning(
+                self,
+                "Champs invalides",
+                "Vérifiez le nom, le proxy amont (IP:port) et le port local du relais.",
+            )
+            return None
+        reset_script = values[4]
+        if reset_script:
+            script_path = resolve_reset_script_path(
+                normalize_reset_script_storage_path(reset_script), get_app_dir()
+            )
+            if not script_path.exists():
+                QMessageBox.warning(
+                    self,
+                    "Script introuvable",
+                    f"Le script de reset est introuvable :\n{script_path}",
+                )
+                return None
+        return values
+
+    def _apply_reset_script_cfg(self, cfg: dict, reset_script: str) -> None:
+        script = normalize_reset_script_storage_path(reset_script)
+        if script:
+            cfg["reset_script"] = script
+        else:
+            cfg.pop("reset_script", None)
+
+    def _apply_remote_interface_config(
+        self,
+        *,
+        old_name: str | None,
+        new_name: str,
+        upstream_host: str,
+        upstream_port: int,
+        local_port: int,
+        reset_script: str,
+        is_new: bool,
+    ) -> bool:
+        if is_new:
+            if new_name in self._get_all_interfaces():
+                QMessageBox.warning(
+                    self,
+                    "Nom déjà utilisé",
+                    f"Une interface nommée « {new_name} » existe déjà.",
+                )
+                return False
+        else:
+            if not old_name or old_name not in self._remote_interfaces:
+                return False
+            if new_name != old_name and new_name in self._get_all_interfaces():
+                QMessageBox.warning(
+                    self,
+                    "Nom déjà utilisé",
+                    f"Une interface nommée « {new_name} » existe déjà.",
+                )
+                return False
+
+        exclude = old_name if old_name and not is_new else None
+        if self._is_local_port_in_use(local_port, exclude_name=exclude):
+            QMessageBox.warning(
+                self,
+                "Port déjà utilisé",
+                f"Le port local {local_port} est déjà utilisé par un autre proxy.",
+            )
+            return False
+
+        was_running = bool(old_name and old_name in self._running_proxies)
+        widget = self.interface_widgets.get(old_name) if old_name else None
+        if widget and was_running:
+            self._stop_proxy_for_widget(widget, silent=True)
+
+        if is_new:
+            info = InterfaceInfo(
+                idx=-1,
+                name=new_name,
+                metric=10000,
+                automatic=False,
+                state="connected",
+                is_up=True,
+                local_ip=None,
+                public_ip=None,
+                online=False,
+                is_remote=True,
+                upstream_host=upstream_host,
+                upstream_port=upstream_port,
+            )
+            self._remote_interfaces[new_name] = info
+            iface_cfg: dict = {
+                "port": local_port,
+                "enabled": False,
+                "remote": True,
+            }
+            self._apply_reset_script_cfg(iface_cfg, reset_script)
+            self.config.setdefault("interface_proxies", {})[new_name] = iface_cfg
+            remote_entry = {
+                "upstream_host": upstream_host,
+                "upstream_port": upstream_port,
+                "port": local_port,
+                "enabled": False,
+            }
+            self._apply_reset_script_cfg(remote_entry, reset_script)
+            self.config.setdefault("remote_interfaces", {})[new_name] = remote_entry
+            self._save_remote_interfaces_config()
+            self.zrotate_selected_interfaces.add(new_name)
+            self._save_zrotate_selection_config()
+
+            widget = self._create_interface_widget(info)
+            widget.update_from_interface(info)
+            widget.set_display_name(self._get_interface_display_name(new_name))
+            self._sync_remote_reset_badge(new_name)
+            item = QListWidgetItem()
+            item.setSizeHint(widget.sizeHint())
+            self.manual_list.addItem(item)
+            self.manual_list.setItemWidget(item, widget)
+
+            self._update_window_title()
+            self._maybe_rebuild_zrotate_interfaces_list(force=True)
+            self._append_log(
+                f"Interface distante ajoutée: {new_name} "
+                f"(relais 127.0.0.1:{local_port} → {upstream_host}:{upstream_port})"
+            )
+            return True
+
+        assert old_name is not None
+        info = self._remote_interfaces[old_name]
+        info.name = new_name
+        info.upstream_host = upstream_host
+        info.upstream_port = upstream_port
+
+        iface_proxies = self.config.setdefault("interface_proxies", {})
+        remote_interfaces = self.config.setdefault("remote_interfaces", {})
+        old_iface_cfg = dict(iface_proxies.get(old_name) or {})
+        old_remote_cfg = dict(remote_interfaces.get(old_name) or {})
+        was_enabled = bool(old_iface_cfg.get("enabled"))
+
+        if new_name != old_name:
+            self._remote_interfaces.pop(old_name, None)
+            self._remote_interfaces[new_name] = info
+            if old_name in self.interface_widgets:
+                self.interface_widgets[new_name] = self.interface_widgets.pop(old_name)
+            if old_name in self.proxy_threads:
+                self.proxy_threads[new_name] = self.proxy_threads.pop(old_name)
+            if old_name in self._running_proxies:
+                self._running_proxies.discard(old_name)
+                self._running_proxies.add(new_name)
+            if old_name in self.zrotate_selected_interfaces:
+                self.zrotate_selected_interfaces.discard(old_name)
+                self.zrotate_selected_interfaces.add(new_name)
+            iface_proxies.pop(old_name, None)
+            remote_interfaces.pop(old_name, None)
+
+        iface_cfg = {
+            **old_iface_cfg,
+            "port": local_port,
+            "enabled": was_enabled,
+            "remote": True,
+        }
+        self._apply_reset_script_cfg(iface_cfg, reset_script)
+        iface_proxies[new_name] = iface_cfg
+
+        remote_entry = {
+            **old_remote_cfg,
+            "upstream_host": upstream_host,
+            "upstream_port": upstream_port,
+            "port": local_port,
+            "enabled": was_enabled,
+        }
+        self._apply_reset_script_cfg(remote_entry, reset_script)
+        remote_interfaces[new_name] = remote_entry
+
+        widget = self.interface_widgets.get(new_name)
+        if widget:
+            widget.interface_name = new_name
+            widget.update_from_interface(info)
+            widget.set_display_name(self._get_interface_display_name(new_name))
+            widget.set_port(local_port)
+            self._sync_remote_reset_badge(new_name)
+            self._sync_manual_list_item_height(new_name)
+
+        self._save_remote_interfaces_config()
+        self._save_zrotate_selection_config()
+        self._maybe_rebuild_zrotate_interfaces_list(force=True)
+        self._update_window_title()
+        self._append_log(
+            f"Interface distante modifiée: {new_name} "
+            f"(relais 127.0.0.1:{local_port} → {upstream_host}:{upstream_port})"
+        )
+
+        if was_running and widget:
+            self._start_proxy_for_widget(widget, local_port, auto=True)
+        return True
+
+    def _on_add_remote_interface(self):
+        self._mark_user_interaction()
+        values = self._prompt_remote_interface_dialog()
+        if not values:
+            return
+        name, upstream_host, upstream_port, local_port, reset_script = values
+        self._apply_remote_interface_config(
+            old_name=None,
+            new_name=name,
+            upstream_host=upstream_host,
+            upstream_port=upstream_port,
+            local_port=local_port,
+            reset_script=reset_script,
+            is_new=True,
+        )
+
+    def _on_edit_remote_interface(self, name: str):
+        if name not in self._remote_interfaces:
+            return
+        self._mark_user_interaction()
+        values = self._prompt_remote_interface_dialog(edit_name=name)
+        if not values:
+            return
+        new_name, upstream_host, upstream_port, local_port, reset_script = values
+        self._apply_remote_interface_config(
+            old_name=name,
+            new_name=new_name,
+            upstream_host=upstream_host,
+            upstream_port=upstream_port,
+            local_port=local_port,
+            reset_script=reset_script,
+            is_new=False,
+        )
+
+    def on_remote_interface_delete_requested(self, name: str):
+        if name not in self._remote_interfaces:
+            return
+        self._mark_user_interaction()
+        answer = QMessageBox.question(
+            self,
+            "Supprimer l'interface distante",
+            f"Supprimer « {name} » et arrêter son relais proxy ?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        widget = self.interface_widgets.get(name)
+        if widget:
+            self._stop_proxy_for_widget(widget, silent=True)
+            for row in range(self.manual_list.count()):
+                item = self.manual_list.item(row)
+                if self.manual_list.itemWidget(item) is widget:
+                    self.manual_list.removeItemWidget(item)
+                    self.manual_list.takeItem(row)
+                    break
+            widget.deleteLater()
+            self.interface_widgets.pop(name, None)
+
+        self._remote_interfaces.pop(name, None)
+        self.config.get("interface_proxies", {}).pop(name, None)
+        self.config.get("remote_interfaces", {}).pop(name, None)
+        if name in self.zrotate_selected_interfaces:
+            self.zrotate_selected_interfaces.discard(name)
+        self._save_remote_interfaces_config()
+        self._save_zrotate_selection_config()
+        self._maybe_rebuild_zrotate_interfaces_list(force=True)
+        self._update_window_title()
+        self._append_log(f"Interface distante supprimée: {name}")
+
+    def _refresh_remote_public_ip(self, name: str) -> None:
+        info = self._remote_interfaces.get(name)
+        widget = self.interface_widgets.get(name)
+        if not info or not widget:
+            return
+        iface_cfg = self.config.get("interface_proxies", {}).get(name) or {}
+        try:
+            proxy_port = int(iface_cfg.get("port") or 0)
+        except (TypeError, ValueError):
+            proxy_port = 0
+        if proxy_port <= 0 or name not in self._running_proxies:
+            return
+
+        def _worker():
+            public_ip = None
+            online = False
+            proxy_url = f"http://127.0.0.1:{proxy_port}"
+            services = [
+                "https://api.ipify.org",
+                "https://ifconfig.me",
+                "https://icanhazip.com",
+            ]
+            for service in services:
+                try:
+                    with httpx.Client(proxy=proxy_url, timeout=8.0) as client:
+                        response = client.get(service)
+                        if response.status_code == 200:
+                            candidate = response.text.strip()
+                            if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", candidate):
+                                public_ip = candidate
+                                online = True
+                                break
+                except Exception:
+                    continue
+            info.public_ip = public_ip
+            info.online = online
+            if widget:
+                widget.update_from_interface(info)
+            self._refresh_zrotate_row_public_ip(name)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _save_zrotate_selection_config(self) -> None:
         """
@@ -5142,12 +6152,36 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Erreur sauvegarde sélection ZRotate: {e}")
 
+    def _save_playwright_warmup_config(self) -> None:
+        """Persiste playwright_warmup_enabled dans proxy_configs.json (merge)."""
+        try:
+            config_path = get_app_dir() / self.CONFIG_FILE
+            data: dict = {}
+            if config_path.is_file():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+
+            data["playwright_warmup_enabled"] = bool(self.playwright_warmup_enabled)
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+
+            self.config["playwright_warmup_enabled"] = bool(
+                self.playwright_warmup_enabled
+            )
+        except Exception as e:
+            print(f"Erreur sauvegarde warmup Playwright: {e}")
+
     def _save_config(self):
         if not PERSIST_CONFIG_TO_DISK:
             return
         try:
             # Ne jamais écraser les clés globales (ex. reset_script_default)
             self.config.setdefault("reset_script_default", DEFAULT_RESET_SCRIPT)
+            self.config["playwright_warmup_enabled"] = bool(
+                self.playwright_warmup_enabled
+            )
 
             # Sauvegarder la configuration ZRotate ; ne jamais écrire max_requests_per_quota < 2
             zrotate_cfg = self.config.setdefault("zrotate", {})
@@ -5174,14 +6208,14 @@ class MainWindow(QMainWindow):
         """Retire les sélections ZRotate pour interfaces hors ligne (sans rebuild liste)."""
         available = {
             name
-            for name, info in self.interface_manager.interfaces.items()
-            if info.is_up and info.local_ip
+            for name, info in self._get_all_interfaces().items()
+            if interface_is_usable(info)
         }
         self.zrotate_selected_interfaces &= available
 
     def _maybe_rebuild_zrotate_interfaces_list(self, force: bool = False) -> None:
         """Rebuild complet uniquement si l'ensemble d'interfaces visibles change."""
-        sig = zrotate_visible_structure_signature(self.interface_manager.interfaces)
+        sig = zrotate_visible_structure_signature(self._get_all_interfaces())
         if not force and sig == self._last_zrotate_structure_sig:
             self._prune_zrotate_selections()
             return
@@ -5199,8 +6233,9 @@ class MainWindow(QMainWindow):
                 traceback.print_exc()
             return
         try:
-            # Mapping nom -> InterfaceInfo renvoyé par InterfaceManager
-            iface_by_name = {i.name: i for i in interfaces}
+            # Mapping nom -> InterfaceInfo (locales + distantes)
+            local_by_name = {i.name: i for i in interfaces}
+            iface_by_name = {**local_by_name, **self._remote_interfaces}
 
             # Supprimer les widgets orphelins (interfaces disparues ou renommées)
             for old_name, w in list(self.interface_widgets.items()):
@@ -5223,49 +6258,21 @@ class MainWindow(QMainWindow):
 
             auto_infos = [i for i in interfaces if i.automatic]
             manual_infos = [i for i in interfaces if not i.automatic]
+            manual_infos.extend(self._remote_interfaces.values())
 
             auto_infos.sort(key=lambda x: (x.metric, x.name.lower()))
-            manual_infos.sort(key=lambda x: (x.metric, x.name.lower()))
+            manual_infos.sort(key=lambda x: (x.is_remote, x.metric, x.name.lower()))
 
             # Créer les widgets manquants pour AUTO
             for info in auto_infos:
                 if info.name not in self.interface_widgets:
-                    widget = InterfaceWidget(info)
-                    widget.proxy_toggled.connect(self.on_proxy_toggled)
-                    widget.rename_requested.connect(self.on_interface_rename_requested)
-                    widget.settings_requested.connect(
-                        self.on_interface_settings_requested
-                    )
-                    widget.reset_requested.connect(self.on_interface_reset_requested)
-                    widget.user_interaction.connect(self._mark_user_interaction)
-                    self.interface_widgets[info.name] = widget
-
-                    iface_cfg = self.config.get("interface_proxies", {}).get(info.name)
-                    if iface_cfg:
-                        port = iface_cfg.get("port")
-                        if port:
-                            widget.set_port(port)
-
+                    widget = self._create_interface_widget(info)
                     self.auto_layout.addWidget(widget)
 
-            # Créer les widgets manquants pour MANUEL
+            # Créer les widgets manquants pour MANUEL (+ distantes)
             for info in manual_infos:
                 if info.name not in self.interface_widgets:
-                    widget = InterfaceWidget(info)
-                    widget.proxy_toggled.connect(self.on_proxy_toggled)
-                    widget.rename_requested.connect(self.on_interface_rename_requested)
-                    widget.settings_requested.connect(
-                        self.on_interface_settings_requested
-                    )
-                    widget.reset_requested.connect(self.on_interface_reset_requested)
-                    widget.user_interaction.connect(self._mark_user_interaction)
-                    self.interface_widgets[info.name] = widget
-
-                    iface_cfg = self.config.get("interface_proxies", {}).get(info.name)
-                    if iface_cfg:
-                        port = iface_cfg.get("port")
-                        if port:
-                            widget.set_port(port)
+                    widget = self._create_interface_widget(info)
 
                     item = QListWidgetItem()
                     item.setSizeHint(widget.sizeHint())
@@ -5278,6 +6285,8 @@ class MainWindow(QMainWindow):
                 if w:
                     w.update_from_interface(info)
                     w.set_display_name(self._get_interface_display_name(name))
+                    if info.is_remote:
+                        self._sync_remote_reset_badge(name)
                     self._update_reset_avg_ui(name)
 
             for row in range(self.manual_list.count()):
@@ -5311,7 +6320,6 @@ class MainWindow(QMainWindow):
         self._refresh_zrotate_row_public_ip(name)
 
     def _get_interface_display_name(self, name: str) -> str:
-        # On retourne toujours le vrai nom Windows : plus d'alias d'affichage
         return name
 
     def _mark_user_interaction(self):
@@ -5341,6 +6349,8 @@ class MainWindow(QMainWindow):
                     print(f"[RESET] ⚠️ Erreur notification ZRotate: {e}")
 
     def _interface_has_reset(self, name: str) -> bool:
+        if name in self._remote_interfaces:
+            return bool(self._remote_iface_reset_script(name))
         iface_cfg = self.config.get("interface_proxies", {}).get(name)
         reset_script, is_explicit = resolve_interface_reset_script(
             iface_cfg,
@@ -5463,11 +6473,19 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def on_interface_reset_requested(self, name: str):
         """Reset manuel ou ZRotate : un thread par interface, en parallèle."""
+        if name in self._remote_interfaces and not self._remote_iface_reset_script(name):
+            QMessageBox.information(
+                self,
+                "Reset distant",
+                "Aucun script de reset configuré pour cette interface distante.\n"
+                "Clic-droit → Éditer pour en définir un.",
+            )
+            return
         if name in self._reset_in_progress:
             print(f"[RESET] ⏳ '{name}' déjà en cours, ignoré.")
             return
 
-        interface_info = self.interface_manager.interfaces.get(name)
+        interface_info = self._get_all_interfaces().get(name)
         if not interface_info:
             QMessageBox.warning(
                 self, "Reset impossible", f"Interface '{name}' introuvable."
@@ -5676,8 +6694,21 @@ class MainWindow(QMainWindow):
 
     def _start_proxy_for_widget(self, widget: InterfaceWidget, port: int, auto: bool):
         name = widget.interface_name
-        info = self.interface_manager.interfaces.get(name)
-        if not info or not info.local_ip:
+        info = self._get_all_interfaces().get(name)
+        if not info:
+            widget.set_proxy_running(False)
+            return
+
+        if info.is_remote:
+            if not info.upstream_host or not info.upstream_port:
+                QMessageBox.warning(
+                    self,
+                    "Relais impossible",
+                    "Proxy amont manquant pour cette interface distante.",
+                )
+                widget.set_proxy_running(False)
+                return
+        elif not info.local_ip:
             QMessageBox.warning(
                 self,
                 "Proxy impossible",
@@ -5701,12 +6732,23 @@ class MainWindow(QMainWindow):
                 self.active_proxies = len(self._running_proxies)
                 self._update_window_title()
 
-        config = ProxyConfig(
-            name=name,
-            bind_ip=info.local_ip,
-            port=port,
-            interface_name=name,
-        )
+        if info.is_remote:
+            config = ProxyConfig(
+                name=name,
+                bind_ip="",
+                port=port,
+                interface_name=name,
+                is_remote=True,
+                upstream_host=info.upstream_host,
+                upstream_port=info.upstream_port,
+            )
+        else:
+            config = ProxyConfig(
+                name=name,
+                bind_ip=info.local_ip,
+                port=port,
+                interface_name=name,
+            )
         thread = ProxyThread(config)
         # Ne pas capturer directement le widget dans le slot, on utilise le nom
         thread.status_changed.connect(
@@ -5721,12 +6763,31 @@ class MainWindow(QMainWindow):
         iface_cfg = self.config.setdefault("interface_proxies", {}).setdefault(name, {})
         iface_cfg["port"] = port
         iface_cfg["enabled"] = True
+        if info.is_remote:
+            iface_cfg["remote"] = True
+            remote_entry = self.config.setdefault("remote_interfaces", {}).setdefault(
+                name, {}
+            )
+            remote_entry["upstream_host"] = info.upstream_host
+            remote_entry["upstream_port"] = info.upstream_port
+            remote_entry["port"] = port
+            remote_entry["enabled"] = True
+            self._save_remote_interfaces_config()
         self._save_config()
 
         if not auto:
-            self._append_log(
-                f"Proxy démarré sur {name} (127.0.0.1:{port}, source {info.local_ip})"
-            )
+            if info.is_remote:
+                self._append_log(
+                    f"Relais démarré sur {name} "
+                    f"(127.0.0.1:{port} → {info.upstream_host}:{info.upstream_port})"
+                )
+            else:
+                self._append_log(
+                    f"Proxy démarré sur {name} (127.0.0.1:{port}, source {info.local_ip})"
+                )
+
+        if info.is_remote:
+            self._refresh_remote_public_ip(name)
 
     def _stop_proxy_for_widget(self, widget: InterfaceWidget, silent: bool = False):
         name = widget.interface_name
@@ -5747,6 +6808,12 @@ class MainWindow(QMainWindow):
 
         iface_cfg = self.config.setdefault("interface_proxies", {}).setdefault(name, {})
         iface_cfg["enabled"] = False
+        if name in self._remote_interfaces:
+            remote_entry = self.config.setdefault("remote_interfaces", {}).setdefault(
+                name, {}
+            )
+            remote_entry["enabled"] = False
+            self._save_remote_interfaces_config()
         self._save_config()
 
         if not silent:
@@ -5766,8 +6833,13 @@ class MainWindow(QMainWindow):
             if not port:
                 continue
             widget = self.interface_widgets.get(name)
-            info = self.interface_manager.interfaces.get(name)
-            if not widget or not info or not info.local_ip:
+            info = self._get_all_interfaces().get(name)
+            if not widget or not info:
+                continue
+            if info.is_remote:
+                if not info.upstream_host or not info.upstream_port:
+                    continue
+            elif not info.local_ip:
                 continue
             # Démarrage silencieux en mode auto (pas de pop-up)
             self._start_proxy_for_widget(widget, port, auto=True)
@@ -5802,18 +6874,16 @@ class MainWindow(QMainWindow):
                 continue
 
         self.zrotate_selected_interfaces.update(current_selections)
+        all_interfaces = self._get_all_interfaces()
         available_interfaces = {
-            name
-            for name in self.interface_manager.interfaces.keys()
-            if self.interface_manager.interfaces[name].is_up
-            and self.interface_manager.interfaces[name].local_ip
+            name for name, info in all_interfaces.items() if interface_is_usable(info)
         }
         self.zrotate_selected_interfaces &= available_interfaces
 
         visible_infos = [
             (name, info)
-            for name, info in sorted(self.interface_manager.interfaces.items())
-            if info.is_up and info.local_ip
+            for name, info in sorted(all_interfaces.items())
+            if interface_is_usable(info)
         ]
 
         scroll_bar = self.zrotate_interfaces_list.verticalScrollBar()
@@ -5834,8 +6904,9 @@ class MainWindow(QMainWindow):
 
         for name, info in visible_infos:
             public_ip = info.public_ip or "-"
+            display_name = self._get_interface_display_name(name)
             item = QListWidgetItem()
-            row_widget = ZRotateInterfaceRow(name, public_ip)
+            row_widget = ZRotateInterfaceRow(name, public_ip, display_name=display_name)
             row_widget.set_checked(name in self.zrotate_selected_interfaces)
             row_widget.toggled.connect(self._on_zrotate_interface_toggled)
             self.zrotate_interfaces_list.addItem(item)
@@ -6023,6 +7094,12 @@ class MainWindow(QMainWindow):
         self.zrotate_start_button.style().unpolish(self.zrotate_start_button)
         self.zrotate_start_button.style().polish(self.zrotate_start_button)
 
+    def _on_playwright_warmup_changed(self, state: int):
+        self.playwright_warmup_enabled = state == Qt.CheckState.Checked
+        self.config["playwright_warmup_enabled"] = self.playwright_warmup_enabled
+        self._save_playwright_warmup_config()
+        self._save_config()
+
     def _on_zrotate_auto_start_changed(self, state: int):
         """Gère le changement de l'option démarrage automatique"""
         self._save_config()
@@ -6079,17 +7156,9 @@ class MainWindow(QMainWindow):
         default_reset = self.config.get("reset_script_default", DEFAULT_RESET_SCRIPT)
 
         for iface_name in self.zrotate_selected_interfaces:
-            interface_info = self.interface_manager.interfaces.get(iface_name)
+            interface_info = self._get_all_interfaces().get(iface_name)
             if not interface_info:
                 missing_ips.append(f"{iface_name} (interface non trouvée)")
-                continue
-
-            if not interface_info.local_ip:
-                missing_ips.append(f"{iface_name} (IP locale manquante)")
-                continue
-
-            if not interface_info.is_up:
-                missing_ips.append(f"{iface_name} (interface inactive)")
                 continue
 
             iface_cfg = self.config.get("interface_proxies", {}).get(iface_name, {})
@@ -6101,6 +7170,41 @@ class MainWindow(QMainWindow):
                         proxy_port = int(widget.port_edit.text().strip())
                     except ValueError:
                         pass
+
+            if interface_info.is_remote:
+                if not interface_info.upstream_host or not interface_info.upstream_port:
+                    missing_ips.append(f"{iface_name} (proxy amont manquant)")
+                    continue
+                if not proxy_port:
+                    missing_ips.append(f"{iface_name} (port relais local manquant)")
+                    continue
+                widget = self.interface_widgets.get(iface_name)
+                if widget and iface_name not in self._running_proxies:
+                    self._start_proxy_for_widget(widget, int(proxy_port), auto=True)
+                cfg = {
+                    "name": iface_name,
+                    "ip": "127.0.0.1",
+                    "remote": True,
+                    "proxy_port": int(proxy_port),
+                    "upstream_host": interface_info.upstream_host,
+                    "upstream_port": interface_info.upstream_port,
+                }
+                reset_script = self._remote_iface_reset_script(iface_name)
+                if reset_script:
+                    cfg["reset_script_path"] = str(
+                        resolve_reset_script_path(reset_script, app_dir)
+                    )
+                egress_configs.append(cfg)
+                continue
+
+            if not interface_info.local_ip:
+                missing_ips.append(f"{iface_name} (IP locale manquante)")
+                continue
+
+            if not interface_info.is_up:
+                missing_ips.append(f"{iface_name} (interface inactive)")
+                continue
+
             reset_script, _ = resolve_interface_reset_script(iface_cfg, default_reset)
             reset_script_path = str(resolve_reset_script_path(reset_script, app_dir))
 
@@ -6119,7 +7223,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "ZRotate",
-                "Aucune interface valide avec IP locale.\n"
+                "Aucune interface valide (locale ou distante).\n"
                 + (
                     "Interfaces ignorées (sans IP ou inactives):\n"
                     + "\n".join(missing_ips)
