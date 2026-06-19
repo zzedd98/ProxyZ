@@ -6569,6 +6569,17 @@ class MainWindow(QMainWindow):
             self._record_reset_duration(name, elapsed_s)
             self._update_reset_avg_ui(name)
 
+        if returncode == 0 and name in self._remote_interfaces:
+            self._remote_public_ip_last_ok.pop(name, None)
+            QTimer.singleShot(
+                2000,
+                lambda n=name: self._refresh_remote_public_ip(n, force=True),
+            )
+            QTimer.singleShot(
+                6000,
+                lambda n=name: self._refresh_remote_public_ip(n, force=True),
+            )
+
         try:
             self._release_interface_to_zrotate(name, returncode == 0)
         except Exception as e:
