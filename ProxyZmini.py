@@ -1,5 +1,4 @@
 import signal
-import json
 import sys
 import traceback
 
@@ -178,66 +177,6 @@ class ProxyZMiniWindow(MainWindow):
             }
             """
         )
-
-    def _load_config(self):
-        try:
-            with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                mapping = {}
-                for entry in data:
-                    iface_name = entry.get("interface_name") or entry.get("name")
-                    port = entry.get("port")
-                    if iface_name and port:
-                        mapping[iface_name] = {"enabled": True, "port": port}
-                self.config = {
-                    "interface_proxies": mapping,
-                    "ui": {},
-                    "interface_aliases": {},
-                    "zrotate": {},
-                }
-                self._save_config()
-            else:
-                self.config = dict(data)
-                self.config.setdefault("interface_proxies", {})
-                self.config.setdefault("ui", {})
-                self.config.setdefault("interface_aliases", {})
-                self.config.setdefault("zrotate", {})
-                self.config.setdefault("remote_interfaces", {})
-        except FileNotFoundError:
-            self.config = {
-                "interface_proxies": {},
-                "ui": {},
-                "interface_aliases": {},
-                "zrotate": {},
-                "remote_interfaces": {},
-            }
-        except Exception as e:
-            print(f"Erreur de chargement config: {e}")
-            self.config = {
-                "interface_proxies": {},
-                "ui": {},
-                "interface_aliases": {},
-                "zrotate": {},
-                "remote_interfaces": {},
-            }
-
-        ui = self.config.get("ui", {})
-        size = ui.get("last_window_size")
-        if isinstance(size, list) and len(size) == 2:
-            self.resize(size[0], size[1])
-        else:
-            self.resize(400, 920)
-
-        self._load_remote_interfaces_from_config()
-
-    def _save_config(self):
-        return
-        try:
-            with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2)
-        except Exception as e:
-            print(f"Erreur de sauvegarde config: {e}")
 
     def _update_window_title(self):
         try:

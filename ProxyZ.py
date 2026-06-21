@@ -5832,6 +5832,77 @@ class MainWindow(QMainWindow):
     def _config_path(self) -> Path:
         return get_app_dir() / self.CONFIG_FILE
 
+    def _load_config_disk(self) -> dict:
+        config_path = self._config_path()
+        if not config_path.is_file():
+            return {}
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            return dict(loaded) if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+    def _merge_write_config_disk(self, merge_fn: Callable[[dict], None]) -> None:
+        """Fusion partielle dans proxy_configs.json (ne remplace pas tout le fichier)."""
+        try:
+            data = self._load_config_disk()
+            merge_fn(data)
+            with open(self._config_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"Erreur sauvegarde config (merge): {e}")
+
+    def _save_interface_proxy_config(self, name: str) -> None:
+        """Persiste port/enabled d'une interface (merge, sans toucher reset_script etc.)."""
+        iface_cfg = (self.config.get("interface_proxies") or {}).get(name)
+        if not iface_cfg:
+            return
+        port = iface_cfg.get("port")
+        enabled = bool(iface_cfg.get("enabled", False))
+        is_remote = bool(name in self._remote_interfaces or iface_cfg.get("remote"))
+
+        def merge(data: dict) -> None:
+            entry = dict((data.get("interface_proxies") or {}).get(name) or {})
+            if port is not None:
+                entry["port"] = port
+            entry["enabled"] = enabled
+            if is_remote:
+                entry["remote"] = True
+            data.setdefault("interface_proxies", {})[name] = entry
+
+        self._merge_write_config_disk(merge)
+
+    def _save_interface_proxy_rename(self, old_name: str, new_name: str) -> None:
+        """Renomme les clés interface dans proxy_configs.json (merge)."""
+
+        def merge(data: dict) -> None:
+            proxies = data.setdefault("interface_proxies", {})
+            if old_name in proxies and new_name not in proxies:
+                proxies[new_name] = proxies.pop(old_name)
+            remote = data.setdefault("remote_interfaces", {})
+            if old_name in remote and new_name not in remote:
+                remote[new_name] = remote.pop(old_name)
+            zrotate = data.setdefault("zrotate", {})
+            selected = zrotate.get("selected_interfaces")
+            if isinstance(selected, list) and old_name in selected:
+                zrotate["selected_interfaces"] = [
+                    new_name if n == old_name else n for n in selected
+                ]
+
+        self._merge_write_config_disk(merge)
+
+    def _save_zrotate_auto_start_config(self) -> None:
+        if not hasattr(self, "zrotate_auto_start_checkbox"):
+            return
+        auto = self.zrotate_auto_start_checkbox.checkState() == Qt.Checked
+        self.config.setdefault("zrotate", {})["auto_start"] = auto
+
+        def merge(data: dict) -> None:
+            data.setdefault("zrotate", {})["auto_start"] = auto
+
+        self._merge_write_config_disk(merge)
+
     def _zrotate_selection_from_ui(self) -> set[str]:
         selected: set[str] = set()
         rows = getattr(self, "_zrotate_interface_rows", None) or {}
@@ -5876,7 +5947,11 @@ class MainWindow(QMainWindow):
                     "remote_interfaces": {},
                 }
                 self.config.setdefault("reset_script_default", DEFAULT_RESET_SCRIPT)
-                self._save_config()
+
+                def merge(data: dict) -> None:
+                    data.setdefault("interface_proxies", {}).update(mapping)
+
+                self._merge_write_config_disk(merge)
             else:
                 # Garder tout le JSON (dont reset_script_default) et s'assurer que les clés attendues existent
                 self.config = dict(data)
@@ -5919,7 +5994,7 @@ class MainWindow(QMainWindow):
         zrotate_cfg["server_url"] = self.zrotate_server_url
         if "selected_interfaces" in zrotate_cfg:
             self.zrotate_selected_interfaces = set(zrotate_cfg["selected_interfaces"])
-        if "auto_start" in zrotate_cfg:
+        if "auto_start" in zrotate_cfg and hasattr(self, "zrotate_auto_start_checkbox"):
             self.zrotate_auto_start_checkbox.setCheckState(
                 Qt.Checked if zrotate_cfg["auto_start"] else Qt.Unchecked
             )
@@ -6589,35 +6664,8 @@ class MainWindow(QMainWindow):
             print(f"Erreur sauvegarde warmup Playwright: {e}")
 
     def _save_config(self):
-        if not PERSIST_CONFIG_TO_DISK:
-            return
-        try:
-            # Ne jamais écraser les clés globales (ex. reset_script_default)
-            self.config.setdefault("reset_script_default", DEFAULT_RESET_SCRIPT)
-            self.config["playwright_warmup_enabled"] = bool(
-                self.playwright_warmup_enabled
-            )
-
-            # Sauvegarder la configuration ZRotate ; ne jamais écrire max_requests_per_quota < 2
-            zrotate_cfg = self.config.setdefault("zrotate", {})
-            _max_req = zrotate_cfg.get("max_requests_per_quota", 2)
-            if not isinstance(_max_req, int) or _max_req < 2:
-                _max_req = 2
-            zrotate_cfg["max_requests_per_quota"] = _max_req
-            zrotate_cfg.setdefault("quota_timeout_seconds", 60.0)
-            zrotate_cfg["server_url"] = getattr(
-                self, "zrotate_server_url", "http://127.0.0.1:9999"
-            )
-            zrotate_cfg["selected_interfaces"] = list(self.zrotate_selected_interfaces)
-            zrotate_cfg["running"] = self.zrotate_running
-            zrotate_cfg["auto_start"] = (
-                self.zrotate_auto_start_checkbox.checkState() == Qt.Checked
-            )
-
-            with open(self._config_path(), "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2)
-        except Exception as e:
-            print(f"Erreur de sauvegarde config: {e}")
+        """Écriture complète désactivée — utiliser les _save_* merge par changement."""
+        return
 
     def _prune_zrotate_selections(self) -> None:
         """Retire les sélections ZRotate pour interfaces hors ligne (sans rebuild liste)."""
@@ -7074,7 +7122,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 traceback.print_exc()
 
-        self._save_config()
+        self._save_interface_proxy_rename(current, new_name)
         # Forcer un refresh des interfaces pour récupérer le nouveau nom
         self._last_zrotate_structure_sig = None
         self.interface_manager.request_immediate_refresh()
@@ -7200,7 +7248,7 @@ class MainWindow(QMainWindow):
             remote_entry["enabled"] = True
             self._apply_remote_proxy_entries(name, proxy_entry, remote_entry)
             self._save_remote_interfaces_config()
-        self._save_config()
+        self._save_interface_proxy_config(name)
 
         if not auto:
             if info.is_remote:
@@ -7241,7 +7289,7 @@ class MainWindow(QMainWindow):
             remote_entry["enabled"] = False
             self._apply_remote_proxy_entries(name, proxy_entry, remote_entry)
             self._save_remote_interfaces_config()
-        self._save_config()
+        self._save_interface_proxy_config(name)
 
         if not silent:
             self._append_log(f"Proxy arrêté pour {name}")
@@ -7533,11 +7581,10 @@ class MainWindow(QMainWindow):
         self.playwright_warmup_enabled = state == Qt.CheckState.Checked
         self.config["playwright_warmup_enabled"] = self.playwright_warmup_enabled
         self._save_playwright_warmup_config()
-        self._save_config()
 
     def _on_zrotate_auto_start_changed(self, state: int):
         """Gère le changement de l'option démarrage automatique"""
-        self._save_config()
+        self._save_zrotate_auto_start_config()
 
     def _auto_start_zrotate(self):
         """Démarre ZRotate automatiquement au lancement"""
@@ -7750,7 +7797,6 @@ class MainWindow(QMainWindow):
         self._zrotate_log(f"   {len(egress_configs)} clé(s) Huawei configurée(s):")
         for cfg in egress_configs:
             self._zrotate_log(f"      - {cfg['name']}: {cfg['ip']}")
-        self._save_config()
         # État quarantaine jusqu'au 1er tick du thread (~1s)
         self._on_quarantine_updated([])
         self._last_pool_state_for_ui = None
@@ -7809,7 +7855,6 @@ class MainWindow(QMainWindow):
                 w.set_reset_badge_in_use(False)
 
         self._zrotate_log("⏹️ ZRotate arrêté")
-        self._save_config()
 
     def changeEvent(self, event):
         if event.type() == QEvent.Type.WindowStateChange:
