@@ -7052,7 +7052,7 @@ class MainWindow(QMainWindow):
         row_widget = rows.get(name)
         if row_widget is None:
             return
-        info = self.interface_manager.interfaces.get(name)
+        info = self._get_all_interfaces().get(name)
         if not info:
             return
         try:
