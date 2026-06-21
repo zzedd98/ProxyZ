@@ -7076,15 +7076,21 @@ class MainWindow(QMainWindow):
                 except RuntimeError:
                     pass
             return
-        if not state:
-            return
+
+        selected = self.zrotate_selected_interfaces
         for name, row in rows.items():
             try:
+                checked = row.is_checked() and name in selected
                 snap = state.get(name)
-                if snap is None:
-                    row.set_live_pool_state(True, {"not_in_session": True})
-                else:
+                if checked:
+                    # Cochée dans le pool : même brillance que les autres (pas de gris « hors session »)
+                    if snap is None:
+                        snap = {"in_pool": True}
                     row.set_live_pool_state(True, snap)
+                elif snap is not None:
+                    row.set_live_pool_state(True, snap)
+                else:
+                    row.set_live_pool_state(True, {"not_in_session": True})
             except RuntimeError:
                 continue
 
@@ -7107,6 +7113,8 @@ class MainWindow(QMainWindow):
             self.zrotate_selected_interfaces.add(interface_name)
         else:
             self.zrotate_selected_interfaces.discard(interface_name)
+        self._last_pool_state_for_ui = None
+        self._sync_zrotate_row_pool_styles()
 
         # Si ZRotate est en cours d'exécution, redémarrer pour prendre en compte les changements
         if self.zrotate_running:
@@ -7440,6 +7448,8 @@ class MainWindow(QMainWindow):
         self._save_config()
         # État quarantaine jusqu'au 1er tick du thread (~1s)
         self._on_quarantine_updated([])
+        self._last_pool_state_for_ui = None
+        self._sync_zrotate_row_pool_styles()
 
     def _stop_zrotate(self, wait_timeout_ms: int = 500):
         """Arrête le serveur ZRotate.
@@ -7557,6 +7567,14 @@ if __name__ == "__main__":
 
         window = MainWindow()
         window.show()
+
+        try:
+            from proxyz_update import schedule_proxyz_update_check
+
+            schedule_proxyz_update_check()
+        except Exception as exc:
+            print(f"[UPDATE] Controle automatique desactive ({exc}).")
+
         sys.exit(app.exec())
     except KeyboardInterrupt:
         print("[SHUTDOWN] KeyboardInterrupt reçu dans main, arrêt immédiat.")
