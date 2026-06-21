@@ -5829,9 +5829,36 @@ class MainWindow(QMainWindow):
             return val.strip().lower() in ("1", "true", "yes", "on")
         return DEFAULT_PLAYWRIGHT_WARMUP_ENABLED
 
+    def _config_path(self) -> Path:
+        return get_app_dir() / self.CONFIG_FILE
+
+    def _zrotate_selection_from_ui(self) -> set[str]:
+        selected: set[str] = set()
+        rows = getattr(self, "_zrotate_interface_rows", None) or {}
+        for name, row_widget in rows.items():
+            if not isinstance(row_widget, ZRotateInterfaceRow):
+                continue
+            try:
+                if row_widget.is_checked():
+                    selected.add(name)
+            except RuntimeError:
+                continue
+        return selected
+
+    def _sync_zrotate_selection_from_ui(self) -> None:
+        """Source de vérité : cases cochées visibles dans la liste ZRotate."""
+        rows = getattr(self, "_zrotate_interface_rows", None) or {}
+        if not rows:
+            return
+        visible = set(rows.keys())
+        ui_checked = self._zrotate_selection_from_ui()
+        self.zrotate_selected_interfaces = (
+            (self.zrotate_selected_interfaces - visible) | ui_checked
+        )
+
     def _load_config(self):
         try:
-            with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(self._config_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
                 # Ancien format -> migration simple vers mapping interfaces
@@ -6017,7 +6044,7 @@ class MainWindow(QMainWindow):
     def _save_remote_interfaces_config(self) -> None:
         """Persiste remote_interfaces + interface_proxies (entrées distantes) dans proxy_configs.json."""
         try:
-            config_path = get_app_dir() / self.CONFIG_FILE
+            config_path = self._config_path()
             data: dict = {}
             if config_path.is_file():
                 with open(config_path, "r", encoding="utf-8") as f:
@@ -6519,7 +6546,9 @@ class MainWindow(QMainWindow):
         écraser le reste du fichier édité à la main.
         """
         try:
-            config_path = get_app_dir() / self.CONFIG_FILE
+            self._sync_zrotate_selection_from_ui()
+
+            config_path = self._config_path()
             data: dict = {}
             if config_path.is_file():
                 with open(config_path, "r", encoding="utf-8") as f:
@@ -6541,7 +6570,7 @@ class MainWindow(QMainWindow):
     def _save_playwright_warmup_config(self) -> None:
         """Persiste playwright_warmup_enabled dans proxy_configs.json (merge)."""
         try:
-            config_path = get_app_dir() / self.CONFIG_FILE
+            config_path = self._config_path()
             data: dict = {}
             if config_path.is_file():
                 with open(config_path, "r", encoding="utf-8") as f:
@@ -6585,19 +6614,22 @@ class MainWindow(QMainWindow):
                 self.zrotate_auto_start_checkbox.checkState() == Qt.Checked
             )
 
-            with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
+            with open(self._config_path(), "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
         except Exception as e:
             print(f"Erreur de sauvegarde config: {e}")
 
     def _prune_zrotate_selections(self) -> None:
         """Retire les sélections ZRotate pour interfaces hors ligne (sans rebuild liste)."""
+        before = set(self.zrotate_selected_interfaces)
         available = {
             name
             for name, info in self._get_all_interfaces().items()
             if interface_is_usable(info)
         }
         self.zrotate_selected_interfaces &= available
+        if self.zrotate_selected_interfaces != before:
+            self._save_zrotate_selection_config()
 
     def _maybe_rebuild_zrotate_interfaces_list(self, force: bool = False) -> None:
         """Rebuild complet uniquement si l'ensemble d'interfaces visibles change."""
@@ -7257,18 +7289,15 @@ class MainWindow(QMainWindow):
     # --- ZRotate ---
     def _update_zrotate_interfaces_list(self):
         """Met à jour la liste des interfaces dans le panel ZRotate (rebuild complet, stable)."""
-        # Sauvegarder les cases cochées actuellement (tolérant aux widgets supprimés).
-        current_selections = set()
-        for row_widget in list(getattr(self, "_zrotate_interface_rows", {}).values()):
-            if not isinstance(row_widget, ZRotateInterfaceRow):
-                continue
-            try:
-                if row_widget.is_checked():
-                    current_selections.add(row_widget.interface_name)
-            except RuntimeError:
-                continue
+        prev_selected = set(self.zrotate_selected_interfaces)
+        visible_in_rows = set(getattr(self, "_zrotate_interface_rows", {}) or {})
+        current_selections = self._zrotate_selection_from_ui()
+        if visible_in_rows:
+            self.zrotate_selected_interfaces = (
+                (self.zrotate_selected_interfaces - visible_in_rows)
+                | current_selections
+            )
 
-        self.zrotate_selected_interfaces.update(current_selections)
         all_interfaces = self._get_all_interfaces()
         available_interfaces = {
             name for name, info in all_interfaces.items() if interface_is_usable(info)
@@ -7317,6 +7346,9 @@ class MainWindow(QMainWindow):
             sb.setValue(min(saved_scroll_value, sb.maximum()))
 
         QTimer.singleShot(0, _restore_zrotate_list_scroll)
+
+        if self.zrotate_selected_interfaces != prev_selected:
+            self._save_zrotate_selection_config()
 
     def _refresh_zrotate_row_public_ip(self, name: str):
         """Met à jour l'IP affichée sur une ligne ZRotate sans reconstruire toute la liste."""
@@ -7543,6 +7575,7 @@ class MainWindow(QMainWindow):
 
         # Mettre à jour self.zrotate_selected_interfaces avec les sélections actuelles
         self.zrotate_selected_interfaces = selected_interfaces
+        self._save_zrotate_selection_config()
 
         if not self.zrotate_selected_interfaces:
             QMessageBox.warning(
