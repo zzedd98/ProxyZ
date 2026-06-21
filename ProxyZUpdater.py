@@ -14,6 +14,7 @@ import json
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -429,6 +430,8 @@ class UpdaterApp:
 
         btn_row = ttk.Frame(frm, style="PZ.TFrame")
         btn_row.pack(pady=(10, 0))
+        self._btn_row = btn_row
+        self._btn_close_packed = False
 
         self.btn_install = RoundedButton(
             btn_row,
@@ -441,6 +444,17 @@ class UpdaterApp:
             bg_hover="#22C55E",
         )
         self.btn_install.pack()
+
+        self.btn_close = RoundedButton(
+            btn_row,
+            text="FERMER",
+            command=self.root.destroy,
+            width=170,
+            height=54,
+            radius=18,
+            bg="#334155",
+            bg_hover="#475569",
+        )
 
         self._apply_state_from_args_or_fetch()
 
@@ -555,6 +569,40 @@ class UpdaterApp:
         self.btn_install.set_palette("#16A34A", "#22C55E")
         self.btn_install.set_enabled(True)
 
+    def _show_dual_button_row(self) -> None:
+        if self._btn_close_packed:
+            return
+        self.btn_install.pack_forget()
+        self.btn_install.pack(side=tk.LEFT, padx=(0, 10))
+        self.btn_close.pack(side=tk.LEFT)
+        self._btn_close_packed = True
+
+    def _launch_target_app(self) -> None:
+        target = os.path.abspath(self.target_exe)
+        if not os.path.isfile(target):
+            self._set_body(f"{self.app_name} est introuvable.")
+            return
+        try:
+            subprocess.Popen(
+                [target],
+                cwd=os.path.dirname(target),
+                close_fds=not sys.platform.startswith("win"),
+            )
+        except Exception as exc:
+            self._set_body(f"Impossible de lancer {self.app_name} ({exc}).")
+            return
+        self.root.destroy()
+
+    def _show_post_update_ui(self) -> None:
+        self.lbl_title.configure(text="Mise a jour terminee")
+        self._set_body(f"{self.app_name} a ete mis a jour avec succes.")
+        self.lbl_progress.configure(text="")
+        self.btn_install.set_text(f"LANCER {self.app_name}")
+        self.btn_install.set_command(self._launch_target_app)
+        self.btn_install.set_palette("#16A34A", "#22C55E")
+        self.btn_install.set_enabled(True)
+        self._show_dual_button_row()
+
     def _on_install(self) -> None:
         if not self.download_url:
             return
@@ -622,12 +670,7 @@ class UpdaterApp:
                             )
                         except Exception:
                             pass
-                        self.lbl_title.configure(text="Mise a jour terminee")
-                        self._set_body("Mise a jour terminee. Relance manuelle de ProxyZ.")
-                        self.lbl_progress.configure(text="")
-                        self.btn_install.set_text("FERMER")
-                        self.btn_install.set_command(self.root.destroy)
-                        self.btn_install.set_enabled(True)
+                        self._show_post_update_ui()
                         reschedule = False
                         return
                     except Exception as e:
