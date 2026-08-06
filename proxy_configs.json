@@ -189,13 +189,13 @@
     },
     "zoglamatique": {
       "port": 112,
-      "enabled": true,
+      "enabled": false,
       "remote": true
     }
   },
   "ui": {
     "last_window_size": [
-      420,
+      1070,
       944
     ]
   },
@@ -204,20 +204,11 @@
     "max_requests_per_quota": 2,
     "quota_timeout_seconds": 60.0,
     "server_url": "http://127.0.0.1:9999",
-    "selected_interfaces": [
-      "zoglamatique"
-    ],
+    "selected_interfaces": [],
     "running": false,
     "auto_start": true,
     "close_haapi_tunnel_after_seconds": 0.0
   },
   "playwright_warmup_enabled": false,
-  "remote_interfaces": {
-    "zoglamatique": {
-      "upstream_host": "192.168.1.84",
-      "upstream_port": 122,
-      "port": 112,
-      "enabled": true
-    }
-  }
+  "remote_interfaces": {}
 }

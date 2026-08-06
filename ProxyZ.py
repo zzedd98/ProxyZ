@@ -12,6 +12,7 @@ from PySide6.QtGui import *
 import psutil
 import select
 import socket
+import ssl
 from dataclasses import dataclass
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -57,6 +58,18 @@ INTERFACE_PUBLIC_IP_WORKERS = 4
 INTERFACE_PUBLIC_IP_STABLE_SKIP_S = 45.0
 INTERFACE_STABLE_CYCLES_BEFORE_SLOW = 5
 INTERFACE_SLOW_MULTIPLIER = 2
+# Hystérésis : ne déclarer une interface "hors ligne" (IP publique) qu'après ce
+# nombre d'échecs consécutifs, pour ne pas vider le pool sur un incident réseau
+# transitoire (ou un fournisseur ipify momentanément indisponible).
+INTERFACE_PUBLIC_IP_FAIL_THRESHOLD = 3
+# Fournisseurs d'IP publique interrogés dans l'ordre (HTTPS sauf repli). Plusieurs
+# sources évitent qu'une panne d'un service ne fasse croire à une coupure globale.
+PUBLIC_IP_PROVIDERS = (
+    ("api.ipify.org", 443, "/?format=text", True),
+    ("ifconfig.me", 443, "/ip", True),
+    ("icanhazip.com", 443, "/", True),
+    ("api.ipify.org", 80, "/?format=text", False),
+)
 
 # Scripts reset Playwright avec navigateur persistant (warmup page + reset rapide)
 PLAYWRIGHT_RESET_SCRIPT_NAMES = frozenset(
@@ -330,6 +343,13 @@ def zrotate_visible_structure_signature(interfaces: dict[str, "InterfaceInfo"]) 
     )
 
 
+def _natural_sort_key(text: str):
+    """Clé de tri naturel/croissant : « cle2 » < « cle10 » (nombres comparés
+    numériquement), et A-Z insensible à la casse pour le reste."""
+    parts = re.split(r"(\d+)", str(text or ""))
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+
 def parse_host_port_field(text: str) -> tuple[str, int] | None:
     """Parse 'host:port' ou 'ip:port' ; retourne (host, port) ou None."""
     raw = (text or "").strip()
@@ -355,6 +375,43 @@ def get_app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
+
+
+# Verrou global sérialisant toutes les écritures de configuration sur disque.
+_CONFIG_WRITE_LOCK = threading.RLock()
+
+
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """
+    Écrit un fichier de façon atomique : écriture dans un fichier temporaire du
+    même dossier, fsync, puis os.replace (atomique sur NTFS). Évite qu'un crash
+    ou une écriture concurrente ne tronque/corrompe proxy_configs.json.
+    """
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding=encoding, newline="") as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        raise
+
+
+def _atomic_write_json(path: Path, data, indent: int = 2) -> None:
+    """Sérialise `data` en JSON et l'écrit de façon atomique, sous verrou global."""
+    payload = json.dumps(data, indent=indent)
+    with _CONFIG_WRITE_LOCK:
+        _atomic_write_text(Path(path), payload)
 
 
 def _read_embedded_build_id() -> str:
@@ -728,6 +785,84 @@ def build_reset_command(script_path: Path, proxy_port: int) -> list[str]:
 _RESET_MODULE_CACHE: dict[str, tuple] = {}
 
 
+def _terminate_process_tree(proc, timeout: float = 5.0) -> None:
+    """
+    Tue un process ET tous ses enfants. subprocess.run/Popen ne tuent que le
+    parent direct : un reset Playwright lancé en subprocess laisse sinon des
+    Chromium orphelins. On descend l'arbre via psutil.
+    """
+    if proc is None:
+        return
+    parent = None
+    procs = []
+    try:
+        parent = psutil.Process(proc.pid)
+        procs = parent.children(recursive=True)
+        procs.append(parent)
+    except Exception:
+        parent = None
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    alive = []
+    try:
+        _gone, alive = psutil.wait_procs(procs, timeout=timeout)
+    except Exception:
+        alive = procs
+    for p in alive:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=1)
+    except Exception:
+        pass
+
+
+def _run_subprocess_tree(cmd, timeout, cwd, creationflags: int = 0, on_process_start=None) -> int:
+    """
+    Lance un subprocess et renvoie son code de retour. En cas de timeout, tue
+    tout l'arbre de process avant de propager subprocess.TimeoutExpired.
+    `on_process_start(proc)` est appelé dès le démarrage pour permettre une
+    interruption externe (ex. re-clic sur RESET → kill de l'arbre de process).
+    """
+    proc = subprocess.Popen(cmd, cwd=cwd, creationflags=creationflags)
+    if on_process_start is not None:
+        try:
+            on_process_start(proc)
+        except Exception:
+            pass
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(proc)
+        raise
+    except BaseException:
+        _terminate_process_tree(proc)
+        raise
+
+
+def shutdown_all_reset_browsers() -> None:
+    """
+    Ferme les navigateurs Playwright persistants des drivers reset chargés
+    en-process (contrat optionnel `shutdown_browser_service`). No-op pour les
+    drivers sans navigateur (ex. reset_XPro_dist).
+    """
+    for cached in list(_RESET_MODULE_CACHE.values()):
+        module = cached[3] if len(cached) >= 4 else None
+        if module is None:
+            continue
+        fn = getattr(module, "shutdown_browser_service", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+
 class _LineForwarder:
     """Redirige stdout/stderr vers un callback ligne par ligne."""
 
@@ -990,7 +1125,24 @@ def _ensure_playwright_runtime(python_exe: str, log_fn=None) -> bool:
     if _run([python_exe, "-c", "import playwright"], 25):
         return True
 
-    _log("[RESET] Playwright manquant, installation automatique en cours...")
+    # Par défaut on NE lance PLUS pip/playwright install ici : cela bloquait le
+    # reset jusqu'à ~25 min (pip 600s + chromium 900s), gelant la clé hors pool.
+    # L'installation doit se faire une fois, hors du chemin critique de reset.
+    # Escape hatch pour retrouver l'ancien comportement : PROXYZ_AUTO_INSTALL_PLAYWRIGHT=1
+    auto_install = (os.environ.get("PROXYZ_AUTO_INSTALL_PLAYWRIGHT") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not auto_install:
+        _log(
+            "[RESET] ⚠️ Playwright indisponible pour ce Python. Installez-le une "
+            "fois hors reset : `pip install playwright` puis `playwright install "
+            "chromium` (ou PROXYZ_AUTO_INSTALL_PLAYWRIGHT=1 pour l'auto-install)."
+        )
+        return False
+
+    _log("[RESET] Playwright manquant, installation automatique en cours (PROXYZ_AUTO_INSTALL_PLAYWRIGHT=1)...")
     if not _run([python_exe, "-m", "pip", "install", "-U", "playwright"], 600):
         return False
     if not _run([python_exe, "-m", "playwright", "install", "chromium"], 900):
@@ -1004,6 +1156,7 @@ def _run_playwright_reset_subprocess(
     timeout_seconds: int,
     log_fn=None,
     reset_options: dict | None = None,
+    on_process_start=None,
 ) -> int | None:
     """Lance le reset en subprocess Python système. Retourne None si indisponible."""
     if not script_path.exists():
@@ -1023,13 +1176,13 @@ def _run_playwright_reset_subprocess(
         log_fn(
             f"[RESET] fallback subprocess: {' '.join(cmd)} | cwd={str(get_app_dir())}"
         )
-    result = subprocess.run(
+    return _run_subprocess_tree(
         cmd,
         timeout=timeout_seconds,
         cwd=str(get_app_dir()),
         creationflags=CREATE_NO_WINDOW,
+        on_process_start=on_process_start,
     )
-    return result.returncode
 
 
 def run_reset_script(
@@ -1038,12 +1191,15 @@ def run_reset_script(
     timeout_seconds: int = 120,
     log_fn=None,
     reset_options: dict | None = None,
+    on_process_start=None,
 ) -> int:
     """
     Exécute un reset:
     - scripts Playwright (reset_modem, reset_XPro, reset_huawei) en-process.
     - autres scripts Python en subprocess.
     Retourne un code process-like (0 succès, 1 échec).
+    `on_process_start(proc)` (optionnel) est appelé quand un subprocess démarre,
+    pour permettre de l'interrompre (kill) depuis l'extérieur.
     """
     in_process = is_playwright_reset_script(script_path)
 
@@ -1058,6 +1214,7 @@ def run_reset_script(
                     timeout_seconds,
                     log_fn=log_fn,
                     reset_options=reset_options,
+                    on_process_start=on_process_start,
                 )
                 if code is not None:
                     return code
@@ -1078,12 +1235,12 @@ def run_reset_script(
     cmd = build_reset_command(script_path, proxy_port)
     if log_fn:
         log_fn(f"[RESET] subprocess: {' '.join(cmd)} | cwd={str(get_app_dir())}")
-    result = subprocess.run(
+    return _run_subprocess_tree(
         cmd,
         timeout=timeout_seconds,
         cwd=str(get_app_dir()),
+        on_process_start=on_process_start,
     )
-    return result.returncode
 
 
 @dataclass
@@ -1097,23 +1254,84 @@ class ProxyConfig:
     upstream_port: int | None = None
 
 
+# Robustesse ProxyThread (relais par interface)
+PROXY_MAX_CLIENT_THREADS = 256          # plafonne la création de threads clients
+PROXY_HEADER_READ_TIMEOUT_S = 20.0      # lecture des en-têtes de requête cliente
+PROXY_UPSTREAM_CONNECT_TIMEOUT_S = 12.0  # connexion vers destination / amont
+
+
 class ProxyThread(QThread):
     status_changed = Signal(bool)
 
-    def __init__(self, config: ProxyConfig):
+    def __init__(self, config: ProxyConfig, bind_ip_provider=None):
         super().__init__()
         self.config = config
         self.running = False
         self.server_socket = None
+        self._client_pool = None
+        # Fournit l'IP source COURANTE de l'interface, relue à chaque connexion,
+        # pour ne jamais binder une IP figée devenue périmée (sinon on risque de
+        # sortir par la mauvaise clé). None => interface distante (bind inutile).
+        self._bind_ip_provider = bind_ip_provider
+
+    def _read_request_headers(self, sock, max_bytes: int = 65536) -> bytes:
+        """Lit la requête cliente jusqu'à la fin des en-têtes (\\r\\n\\r\\n) au lieu
+        d'un unique recv(4096) qui tronquait les gros en-têtes. Timeout borné,
+        puis repasse la socket en bloquant pour le relais."""
+        try:
+            sock.settimeout(PROXY_HEADER_READ_TIMEOUT_S)
+        except Exception:
+            pass
+        buffer = b""
+        try:
+            while len(buffer) < max_bytes:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                if b"\r\n\r\n" in buffer:
+                    break
+        except (socket.timeout, OSError):
+            pass
+        finally:
+            try:
+                sock.settimeout(None)
+            except Exception:
+                pass
+        return buffer
+
+    def _resolve_bind_ip(self):
+        """IP source à utiliser pour le bind, relue à chaud. Retourne None si
+        aucune IP valide n'est disponible : on refuse alors la connexion plutôt
+        que de binder au hasard."""
+        candidate = None
+        if self._bind_ip_provider is not None:
+            try:
+                candidate = self._bind_ip_provider()
+            except Exception:
+                candidate = None
+        if candidate:
+            return candidate
+        # Repli sur l'IP initiale, SEULEMENT si elle est encore assignée localement.
+        fallback = self.config.bind_ip
+        if fallback and local_ipv4_assigned_on_host(fallback):
+            return fallback
+        return None
 
     def run(self):
         self.running = True
         self.status_changed.emit(True)
+        # Pool borné de threads clients : plafonne la création de threads (un
+        # client qui ouvre des milliers de connexions ne peut plus épuiser la RAM).
+        self._client_pool = ThreadPoolExecutor(
+            max_workers=PROXY_MAX_CLIENT_THREADS,
+            thread_name_prefix=f"proxy-{self.config.port}",
+        )
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind(("127.0.0.1", self.config.port))
-            self.server_socket.listen(5)
+            self.server_socket.listen(128)
             if self.config.is_remote:
                 print(
                     f"[OK] Relais proxy sur 127.0.0.1:{self.config.port} "
@@ -1127,13 +1345,16 @@ class ProxyThread(QThread):
 
             while self.running:
                 try:
-                    client_socket, client_address = self.server_socket.accept()
-                    client_thread = threading.Thread(
-                        target=self.handle_client,
-                        args=(client_socket, self.config.bind_ip),
-                    )
-                    client_thread.daemon = True
-                    client_thread.start()
+                    client_socket, _client_address = self.server_socket.accept()
+                    try:
+                        self._client_pool.submit(self.handle_client, client_socket)
+                    except RuntimeError:
+                        # Pool en cours d'arrêt : on ferme la connexion proprement.
+                        try:
+                            client_socket.close()
+                        except Exception:
+                            pass
+                        break
                 except Exception:
                     if self.running:
                         print("Erreur lors de l'acceptation de la connexion")
@@ -1142,6 +1363,13 @@ class ProxyThread(QThread):
             print(f"Erreur du serveur proxy: {str(e)}")
         finally:
             self.running = False
+            pool = self._client_pool
+            self._client_pool = None
+            if pool is not None:
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    pool.shutdown(wait=False)
             self.status_changed.emit(False)
 
     def stop(self):
@@ -1152,9 +1380,9 @@ class ProxyThread(QThread):
             except Exception:
                 pass
 
-    def handle_client(self, client_socket, bind_ip):
+    def handle_client(self, client_socket):
         try:
-            request = client_socket.recv(4096)
+            request = self._read_request_headers(client_socket)
             if not request:
                 return
 
@@ -1165,6 +1393,20 @@ class ProxyThread(QThread):
                     self.handle_https_tunnel_upstream(client_socket, request_line)
                 else:
                     self.handle_http_request_upstream(client_socket, request)
+                return
+
+            # Interface locale : relire l'IP source COURANTE (jamais l'IP figée).
+            bind_ip = self._resolve_bind_ip()
+            if not bind_ip:
+                print(
+                    f"[PROXY] Connexion refusée sur 127.0.0.1:{self.config.port} : "
+                    f"aucune IP source valide pour '{self.config.interface_name}' "
+                    f"(clé absente ou IP locale changée)."
+                )
+                try:
+                    client_socket.sendall(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+                except Exception:
+                    pass
                 return
 
             if request_line.startswith("CONNECT"):
@@ -1181,18 +1423,19 @@ class ProxyThread(QThread):
 
     def _connect_upstream_proxy_socket(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(PROXY_UPSTREAM_CONNECT_TIMEOUT_S)
         sock.connect((self.config.upstream_host, int(self.config.upstream_port)))
+        sock.settimeout(None)  # bloquant pour le relais
         return sock
 
     def handle_https_tunnel_upstream(self, client_socket, request_line):
         try:
-            match = re.match(r"CONNECT ([^:]+):(\d+)", request_line)
-            if not match:
+            dest = parse_connect_request(request_line)
+            if not dest:
                 print("Requête CONNECT mal formée (relais amont)")
                 return
 
-            host, port = match.groups()
-            port = int(port)
+            host, port = dest
 
             upstream_sock = self._connect_upstream_proxy_socket()
             try:
@@ -1251,7 +1494,9 @@ class ProxyThread(QThread):
 
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
                 server_socket.bind((bind_ip, 0))
+                server_socket.settimeout(PROXY_UPSTREAM_CONNECT_TIMEOUT_S)
                 server_socket.connect((host, port))
+                server_socket.settimeout(None)  # bloquant pour le relais
                 server_socket.sendall(request)
 
                 self.relay_data(client_socket, server_socket)
@@ -1260,17 +1505,18 @@ class ProxyThread(QThread):
 
     def handle_https_tunnel(self, client_socket, request_line, bind_ip):
         try:
-            match = re.match(r"CONNECT ([^:]+):(\d+)", request_line)
-            if not match:
+            dest = parse_connect_request(request_line)
+            if not dest:
                 print("Requête CONNECT mal formée")
                 return
 
-            host, port = match.groups()
-            port = int(port)
+            host, port = dest
 
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
                 server_socket.bind((bind_ip, 0))
+                server_socket.settimeout(PROXY_UPSTREAM_CONNECT_TIMEOUT_S)
                 server_socket.connect((host, port))
+                server_socket.settimeout(None)  # bloquant pour le relais
 
                 client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
@@ -1309,6 +1555,20 @@ class InterfaceInfo:
     is_remote: bool = False
     upstream_host: str | None = None
     upstream_port: int | None = None
+    mac: str | None = None  # adresse matérielle de l'adaptateur (identité stable)
+
+    @property
+    def stable_id(self) -> str:
+        """Identifiant stable de l'adaptateur, indépendant du nom d'affichage
+        (renommable). Préfère la MAC, puis l'index netsh, puis le nom en dernier
+        recours (interfaces distantes = pas de MAC → identité par nom)."""
+        if self.mac:
+            return f"mac:{self.mac.lower()}"
+        if self.is_remote:
+            return f"remote:{self.name}"
+        if isinstance(self.idx, int) and self.idx >= 0:
+            return f"idx:{self.idx}"
+        return f"name:{self.name}"
 
 
 class InterfaceManager(QObject):
@@ -1318,6 +1578,9 @@ class InterfaceManager(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Verrou réentrant protégeant self.interfaces (lu/écrit par le thread Qt
+        # ET par les workers d'IP publique / les ProxyThread).
+        self._interfaces_lock = threading.RLock()
         self.interfaces: dict[str, InterfaceInfo] = {}
         self._last_ui_snapshot: tuple | None = None
         self._stable_refresh_cycles = 0
@@ -1333,6 +1596,8 @@ class InterfaceManager(QObject):
         self._public_ip_inflight: set[str] = set()
         self._public_ip_inflight_lock = threading.Lock()
         self._public_ip_last_ok: dict[str, tuple[str, float]] = {}
+        # Compteur d'échecs consécutifs de détection d'IP publique (hystérésis).
+        self._public_ip_fail_counts: dict[str, int] = {}
 
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(
@@ -1370,6 +1635,13 @@ class InterfaceManager(QObject):
         self._recompute_timer_intervals()
         self.refresh_interfaces(force_netsh=True)
         self.refresh_public_ips(force=True)
+
+    def get_local_ip(self, name: str) -> Optional[str]:
+        """IP source (IPv4 locale) COURANTE d'une interface, ou None si absente.
+        Utilisé par les ProxyThread pour relire l'IP de bind à chaud."""
+        with self._interfaces_lock:
+            info = self.interfaces.get(name)
+            return info.local_ip if info else None
 
     def _recompute_timer_intervals(self) -> None:
         mult = 1
@@ -1483,15 +1755,27 @@ class InterfaceManager(QObject):
         if not netsh_data:
             return
 
+        # Snapshot cohérent de l'état précédent (identité stable via MAC/IP locale).
+        with self._interfaces_lock:
+            current_interfaces = dict(self.interfaces)
+
         new_interfaces: dict[str, InterfaceInfo] = {}
 
         for name, info in netsh_data.items():
             local_ip = None
+            mac = None
             if name in addrs:
                 for addr in addrs[name]:
-                    if addr.family == socket.AF_INET and addr.address != "127.0.0.1":
+                    if (
+                        addr.family == socket.AF_INET
+                        and addr.address != "127.0.0.1"
+                        and local_ip is None  # garder la 1re IPv4 (comportement d'origine)
+                    ):
                         local_ip = addr.address
-                        break
+                    elif getattr(addr, "family", None) == psutil.AF_LINK:
+                        raw_mac = (addr.address or "").strip()
+                        if raw_mac and raw_mac not in ("00:00:00:00:00:00", "00-00-00-00-00-00"):
+                            mac = raw_mac
             # Ne garder que les interfaces "internet" :
             # - IPv4 locale présente
             # - pas d'adresse APIPA 169.254.x.x
@@ -1506,14 +1790,35 @@ class InterfaceManager(QObject):
             if name in stats:
                 is_up = stats[name].isup
 
-            prev = self.interfaces.get(name)
-            public_ip = prev.public_ip if prev else None
-            # Si l'interface vient de passer hors ligne, on considère qu'elle n'est plus "online"
+            prev = current_interfaces.get(name)
+            # N'hériter de l'IP publique/online QUE si c'est le même adaptateur
+            # physique (même IP locale ET MAC compatible). Sinon on repart à vide
+            # pour ne pas afficher l'IP publique d'une autre clé. La MAC "compatible"
+            # (égale, ou inconnue d'un côté) tolère une lecture MAC ponctuellement
+            # absente sans invalider l'héritage.
+            mac_compatible = (
+                prev is None
+                or prev.mac is None
+                or mac is None
+                or prev.mac == mac
+            )
+            same_adapter = (
+                prev is not None
+                and prev.local_ip == local_ip
+                and mac_compatible
+            )
+            if same_adapter and is_up:
+                public_ip = prev.public_ip
+                online = prev.online
+            else:
+                public_ip = None
+                online = False
+                if prev is not None and not same_adapter:
+                    # Identité changée sous ce nom : réinitialiser l'hystérésis.
+                    self._public_ip_fail_counts.pop(name, None)
             if not is_up:
                 online = False
                 public_ip = None
-            else:
-                online = prev.online if prev else False
 
             new_interfaces[name] = InterfaceInfo(
                 idx=info["idx"],
@@ -1525,26 +1830,30 @@ class InterfaceManager(QObject):
                 local_ip=local_ip,
                 public_ip=public_ip,
                 online=online,
+                mac=mac,
             )
 
         snapshot = interfaces_ui_snapshot(new_interfaces)
         if snapshot == self._last_ui_snapshot:
             self._stable_refresh_cycles += 1
-        else:
-            self._stable_refresh_cycles = 0
-            self._last_ui_snapshot = snapshot
-            self.interfaces = new_interfaces
-            self.interfaces_updated.emit(list(self.interfaces.values()))
+            with self._interfaces_lock:
+                self.interfaces = new_interfaces
             self._recompute_timer_intervals()
             return
 
-        self.interfaces = new_interfaces
+        self._stable_refresh_cycles = 0
+        self._last_ui_snapshot = snapshot
+        with self._interfaces_lock:
+            self.interfaces = new_interfaces
+        self.interfaces_updated.emit(list(new_interfaces.values()))
         self._recompute_timer_intervals()
 
     # --- Public IP / connectivité ---
     def refresh_public_ips(self, force: bool = False):
         now = time.monotonic()
-        for name, info in list(self.interfaces.items()):
+        with self._interfaces_lock:
+            snapshot = list(self.interfaces.items())
+        for name, info in snapshot:
             if not info.is_up or not info.local_ip:
                 continue
             with self._public_ip_inflight_lock:
@@ -1565,69 +1874,96 @@ class InterfaceManager(QObject):
                 self._public_ip_worker_thread, name, info.local_ip
             )
 
-    def _public_ip_worker_thread(self, name: str, local_ip: str, timeout: float = 4.0):
-        public_ip = None
-        online = False
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            s.bind((local_ip, 0))
-            s.connect(("api.ipify.org", 80))
-            req = (
-                "GET /?format=text HTTP/1.1\r\n"
-                "Host: api.ipify.org\r\n"
-                "Connection: close\r\n\r\n"
-            )
-            s.sendall(req.encode("ascii"))
-            chunks = []
-            while True:
-                data = s.recv(4096)
-                if not data:
-                    break
-                chunks.append(data)
-            raw = b"".join(chunks).decode(errors="ignore")
-            parts = raw.split("\r\n\r\n", 1)
-            if len(parts) == 2:
-                body = parts[1].strip()
-                if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", body):
-                    public_ip = body
-                    online = True
-        except Exception:
-            online = False
-        finally:
+    def _fetch_public_ip_bound(self, local_ip: str, timeout: float) -> Optional[str]:
+        """Interroge plusieurs fournisseurs d'IP publique en forçant la sortie par
+        `local_ip` (bind source), HTTPS d'abord puis repli HTTP. Retourne la
+        première IP valide, ou None si tous échouent. Plusieurs sources évitent
+        qu'une panne d'ipify ne fasse croire à une coupure de la clé."""
+        for host, port, path, use_tls in PUBLIC_IP_PROVIDERS:
+            s = None
             try:
-                s.close()
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.bind((local_ip, 0))
+                s.connect((host, port))
+                if use_tls:
+                    ctx = ssl.create_default_context()
+                    s = ctx.wrap_socket(s, server_hostname=host)
+                req = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    "User-Agent: ProxyZ/1.0\r\n"
+                    "Connection: close\r\n\r\n"
+                )
+                s.sendall(req.encode("ascii"))
+                chunks = []
+                while True:
+                    data = s.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+                raw = b"".join(chunks).decode(errors="ignore")
+                parts = raw.split("\r\n\r\n", 1)
+                if len(parts) != 2:
+                    continue
+                m = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", parts[1])
+                if m:
+                    return m.group(0)
             except Exception:
-                pass
+                continue
+            finally:
+                try:
+                    if s is not None:
+                        s.close()
+                except Exception:
+                    pass
+        return None
+
+    def _public_ip_worker_thread(self, name: str, local_ip: str, timeout: float = 4.0):
+        public_ip = self._fetch_public_ip_bound(local_ip, timeout)
+        ok = public_ip is not None
+        emit_args = None
         try:
-            prev_ip = ""
-            prev_online = False
-            if name in self.interfaces:
-                info = self.interfaces[name]
+            with self._interfaces_lock:
+                info = self.interfaces.get(name)
+                # Garde d'identité : si l'interface a disparu ou changé d'IP locale
+                # depuis le lancement du worker, ne PAS attribuer ce résultat (il
+                # appartiendrait à une autre clé).
+                if info is None or info.local_ip != local_ip:
+                    return
                 prev_ip = info.public_ip or ""
                 prev_online = info.online
-                new_ip = public_ip or info.public_ip
-                info.public_ip = new_ip
-                info.online = online
-                self.interfaces[name] = info
-                if online and new_ip:
-                    self._public_ip_last_ok[name] = (new_ip, time.monotonic())
-            new_ip_str = public_ip or prev_ip or ""
-            if new_ip_str != prev_ip or online != prev_online:
-                self.public_ip_updated.emit(name, new_ip_str, online)
+                if ok:
+                    self._public_ip_fail_counts[name] = 0
+                    info.public_ip = public_ip
+                    info.online = True
+                    self._public_ip_last_ok[name] = (public_ip, time.monotonic())
+                else:
+                    fails = self._public_ip_fail_counts.get(name, 0) + 1
+                    self._public_ip_fail_counts[name] = fails
+                    # Hystérésis : ne basculer "hors ligne" qu'après N échecs
+                    # consécutifs, sinon conserver l'état précédent.
+                    if fails >= INTERFACE_PUBLIC_IP_FAIL_THRESHOLD:
+                        info.online = False
+                new_ip = info.public_ip or ""
+                new_online = info.online
+                if new_ip != prev_ip or new_online != prev_online:
+                    emit_args = (name, new_ip, new_online)
         except Exception:
             traceback.print_exc()
         finally:
             with self._public_ip_inflight_lock:
                 self._public_ip_inflight.discard(name)
+        if emit_args is not None:
+            self.public_ip_updated.emit(*emit_args)
 
     @Slot(str, str, bool)
     def _on_public_ip_result(self, name: str, public_ip: str, online: bool):
-        if name in self.interfaces:
-            info = self.interfaces[name]
-            info.public_ip = public_ip or info.public_ip
-            info.online = online
-            self.interfaces[name] = info
+        with self._interfaces_lock:
+            info = self.interfaces.get(name)
+            if info is not None:
+                info.public_ip = public_ip or info.public_ip
+                info.online = online
         self.public_ip_updated.emit(name, public_ip, online)
 
     # --- Mise à jour des métriques après drag & drop ---
@@ -1639,7 +1975,8 @@ class InterfaceManager(QObject):
         print(f"[METRIC] apply_manual_order(manual_names={manual_names})")
         errors: list[str] = []
         for index, name in enumerate(manual_names):
-            info = self.interfaces.get(name)
+            with self._interfaces_lock:
+                info = self.interfaces.get(name)
             if not info or info.automatic:
                 continue
             metric_value = 1 + index * 10
@@ -1670,8 +2007,9 @@ class InterfaceManager(QObject):
                     print(msg)
                 else:
                     # Netsh a accepté : mettre aussi à jour la valeur en mémoire
-                    info.metric = metric_value
-                    self.interfaces[name] = info
+                    with self._interfaces_lock:
+                        if name in self.interfaces:
+                            self.interfaces[name].metric = metric_value
                     print(f"[METRIC] Metric appliquée pour '{name}' -> {metric_value}")
             except Exception as e:
                 msg = f"Exception netsh set metric ({name}, metric={metric_value}): {e}"
@@ -1846,6 +2184,10 @@ class InterfaceQuotaManager:
         self._keys_removed_from_pool: set = set()
         self._consecutive_reset_failures: Dict[str, int] = {}
         self._quarantine_interfaces: set = set()
+        # Reprise automatique de quarantaine (backoff exponentiel) : une clé en
+        # quarantaine n'est plus un cul-de-sac, on retente un reset de temps en temps.
+        self._quarantine_backoff: Dict[str, float] = {}
+        self._quarantine_next_retry: Dict[str, float] = {}
         self._pool_health_task: Optional[asyncio.Task] = None
         # Event pour réveiller les requêtes en attente quand une interface redevient disponible
         self._interface_available_event = asyncio.Event()
@@ -1862,6 +2204,40 @@ class InterfaceQuotaManager:
             )
         except asyncio.TimeoutError:
             pass
+
+    async def acquire_interface_for_request(
+        self,
+        request_type: str,
+        host: str,
+        port: int,
+        connection_id: int,
+        wait_budget: float = 5.0,
+    ) -> Optional[Dict[str, str]]:
+        """Comme get_interface_for_request, mais avec une courte attente bornée
+        (backpressure) avant d'abandonner : au lieu de renvoyer 503 immédiatement
+        quand tout est plein / en reset, on laisse le temps à une clé de se
+        libérer (fin de reset). Évite les rafales de 503 pendant les rotations."""
+        info = await self.get_interface_for_request(
+            request_type, host, port, connection_id
+        )
+        if info is not None or wait_budget <= 0:
+            return info
+        end = time.monotonic() + wait_budget
+        while time.monotonic() < end:
+            remaining = end - time.monotonic()
+            try:
+                await self.wait_for_interface_available(
+                    timeout=min(1.0, max(0.05, remaining))
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)
+            info = await self.get_interface_for_request(
+                request_type, host, port, connection_id
+            )
+            if info is not None:
+                return info
+        return None
 
     def _interface_available_event_set(self) -> None:
         """À appeler quand une interface est ajoutée à available_interfaces."""
@@ -1920,6 +2296,8 @@ class InterfaceQuotaManager:
                     for key_name in list(self._keys_removed_from_pool):
                         if key_name in self._quarantine_interfaces:
                             continue
+                        if key_name in self.resetting_interfaces:
+                            continue  # un reset est déjà en cours : pas de double
                         if key_name in (a["name"] for a in self.available_interfaces):
                             continue  # déjà remise
                         if not self._reset_callback:
@@ -1938,11 +2316,43 @@ class InterfaceQuotaManager:
             except Exception as e:
                 logger.error(f"[QUOTA] Erreur dans _retry_reset_loop: {e}")
 
+    async def _recover_quarantined_interfaces(self) -> None:
+        """Reprise de quarantaine (backoff) : retente périodiquement un reset des
+        clés quarantorées au lieu de les laisser hors pool indéfiniment. Un reset
+        réussi les sort automatiquement de la quarantaine."""
+        now_mono = time.monotonic()
+        async with self._lock:
+            candidates = [
+                n
+                for n in list(self._quarantine_interfaces)
+                if n not in self.resetting_interfaces
+                and now_mono >= self._quarantine_next_retry.get(n, 0.0)
+            ]
+            for name in candidates:
+                # Prochain essai avec backoff exponentiel (plafond 30 min).
+                backoff = min(self._quarantine_backoff.get(name, 60.0) * 2, 1800.0)
+                self._quarantine_backoff[name] = backoff
+                self._quarantine_next_retry[name] = time.monotonic() + backoff
+                if not self._reset_callback:
+                    continue
+                self.resetting_interfaces.add(name)
+                try:
+                    self._reset_callback.reset_interface(name)
+                    logger.info(
+                        f"[QUOTA] ♻️ Reprise quarantaine : nouvelle tentative de "
+                        f"reset pour {name} (prochain essai dans {int(backoff)}s)"
+                    )
+                except Exception as e:
+                    logger.error(f"[QUOTA] Erreur reprise quarantaine {name}: {e}")
+                    self.resetting_interfaces.discard(name)
+
     async def _pool_health_loop(self):
         """Toutes les 30s : retire du pool les clés qui n'obtiennent pas d'IP publique via leur egress."""
         while True:
             try:
                 await asyncio.sleep(30)
+                # Tenter de sortir les clés quarantorées (backoff).
+                await self._recover_quarantined_interfaces()
                 async with self._lock:
                     snapshot = [
                         dict(x)
@@ -2498,13 +2908,13 @@ class InterfaceQuotaManager:
             )
             proxy_port = entry.get("proxy_port") if entry else None
             if proxy_port is None:
-                match = re.search(r"(\d+)", interface_name)
-                if not match:
-                    logger.error(
-                        f"[QUOTA] Impossible d'extraire le port depuis '{interface_name}'"
-                    )
-                    return
-                proxy_port = int(match.group(1))
+                # Ne JAMAIS deviner le port depuis le nom (ex. "Clef 1 XPro" -> 1,
+                # ce qui viserait la mauvaise clé). Le port doit venir de la config.
+                logger.error(
+                    f"[QUOTA] Reset direct annulé pour '{interface_name}' : "
+                    f"aucun proxy_port en configuration (port non deviné depuis le nom)."
+                )
+                return
 
             script_path = None
             if entry and entry.get("reset_script_path"):
@@ -2613,6 +3023,43 @@ class InterfaceQuotaManager:
         """Remet une interface en disponibilité après reset (appelé depuis ProxyZ)"""
         await self._release_interface_after_reset(interface_name, reset_succeeded)
 
+    async def cancel_interface_reset(self, interface_name: str):
+        """
+        Annulation MANUELLE d'un reset (kill par l'utilisateur). Contrairement à
+        un échec de reset, on NE compte PAS d'échec, on NE relance PAS de reset et
+        on NE remet PAS la clé au pool (son IP est indéterminée après un kill).
+        On nettoie simplement tout l'état « en cours / à retenter » : la clé
+        redevient inactive (relancer un reset la réintégrera au pool si succès).
+        """
+        async with self._lock:
+            # Repartir sur des quotas propres.
+            if interface_name in self.quotas:
+                for request_type in list(self.quotas[interface_name].keys()):
+                    for domain in list(self.quotas[interface_name][request_type].keys()):
+                        self.quotas[interface_name][request_type][domain].reset()
+            self._pending_gets[interface_name] = 0
+            # Sortir de TOUS les états de reset/retry (pas de relance auto).
+            self.resetting_interfaces.discard(interface_name)
+            self._keys_removed_from_pool.discard(interface_name)
+            self._consecutive_reset_failures.pop(interface_name, None)
+            self._interface_failure_count[interface_name] = 0
+            self._quarantine_backoff.pop(interface_name, None)
+            self._quarantine_next_retry.pop(interface_name, None)
+            # Ne PAS ré-ajouter au pool (IP indéterminée après kill).
+            self.available_interfaces = [
+                i for i in self.available_interfaces if i["name"] != interface_name
+            ]
+            self._interface_available_event_clear_if_empty()
+            logger.info(
+                f"[QUOTA] ⛔ Reset de {interface_name} annulé — état réinitialisé, "
+                f"clé hors pool (relancez un reset pour la réintégrer)"
+            )
+        if self._usage_callback:
+            try:
+                self._usage_callback(interface_name, False)
+            except Exception:
+                pass
+
     async def _release_interface_after_reset(
         self, interface_name: str, reset_succeeded: bool = True
     ):
@@ -2661,6 +3108,9 @@ class InterfaceQuotaManager:
             if reset_succeeded:
                 self._consecutive_reset_failures.pop(interface_name, None)
                 self._quarantine_interfaces.discard(interface_name)
+                # Sortie de quarantaine réussie : réinitialiser le backoff.
+                self._quarantine_backoff.pop(interface_name, None)
+                self._quarantine_next_retry.pop(interface_name, None)
                 if interface_info:
                     names_in_available = [a["name"] for a in self.available_interfaces]
                     if interface_name not in names_in_available:
@@ -2685,10 +3135,16 @@ class InterfaceQuotaManager:
                     already_q = interface_name in self._quarantine_interfaces
                     self._quarantine_interfaces.add(interface_name)
                     self._keys_removed_from_pool.discard(interface_name)
+                    # Programmer une reprise automatique (backoff) : la quarantaine
+                    # n'est plus définitive, on retentera un reset plus tard.
+                    self._quarantine_backoff.setdefault(interface_name, 60.0)
+                    self._quarantine_next_retry[interface_name] = (
+                        time.monotonic() + self._quarantine_backoff[interface_name]
+                    )
                     if not already_q:
                         logger.error(
                             f"[QUOTA] 🛑 {interface_name} en quarantaine après {n} échec(s) de reset consécutifs "
-                            f"(seuil {MAX_CONSECUTIVE_RESET_FAILURES}) — plus de reset automatique, clé hors pool"
+                            f"(seuil {MAX_CONSECUTIVE_RESET_FAILURES}) — reprise auto (backoff) programmée"
                         )
                 else:
                     self._keys_removed_from_pool.add(interface_name)
@@ -3414,7 +3870,9 @@ class ZRotateSingleProxyServer:
 
             # Sélectionner l'interface selon le système utilisé
             if self._use_quotas:
-                egress_info = await self.quota_manager.get_interface_for_request(
+                # Backpressure : petite attente bornée avant de renvoyer 503, pour
+                # laisser une clé se libérer (fin de reset) au lieu d'échouer sec.
+                egress_info = await self.quota_manager.acquire_interface_for_request(
                     request_type, dest_host, dest_port, connection_id
                 )
 
@@ -5010,8 +5468,9 @@ class MainWindow(QMainWindow):
         self.interface_widgets: dict[str, InterfaceWidget] = {}
         self._remote_interfaces: dict[str, InterfaceInfo] = {}
         self.proxy_threads: dict[str, ProxyThread] = {}
-        self.active_proxies = 0
-        # Ensemble des noms d'interfaces dont le proxy est réellement en cours d'exécution
+        # Ensemble des noms d'interfaces dont le proxy est réellement en cours
+        # d'exécution. SOURCE DE VÉRITÉ unique du nombre de proxys actifs :
+        # `active_proxies` en est dérivé (propriété), il n'est plus tenu à la main.
         self._running_proxies: set[str] = set()
         self.config = {
             "interface_proxies": {},
@@ -5026,6 +5485,9 @@ class MainWindow(QMainWindow):
         self.zrotate_proxy_server: Optional[ZRotateProxyServer] = None
         self.zrotate_selected_interfaces: set[str] = set()
         self.zrotate_running = False
+        # Anciens threads ZRotate en cours d'arrêt (redémarrage non bloquant) :
+        # on garde une référence jusqu'à leur fin pour éviter un crash Qt.
+        self._zrotate_dying_threads: list = []
         self._last_zrotate_pool_state: Dict[str, Dict[str, bool]] = {}
         self._last_zrotate_structure_sig: tuple | None = None
         self._last_quarantine_names: tuple[str, ...] | None = None
@@ -5035,6 +5497,11 @@ class MainWindow(QMainWindow):
 
         # Resets en parallèle (un thread par interface) ; suivi pour éviter doublons et refresh en rafale
         self._reset_in_progress: set[str] = set()  # interfaces en cours de reset
+        # Interruption d'un reset : Popen du subprocess en cours par interface, et
+        # noms des resets annulés par l'utilisateur (re-clic sur RESET).
+        self._reset_procs: dict[str, "subprocess.Popen"] = {}
+        self._reset_cancelled: set[str] = set()
+        self._reset_procs_lock = threading.Lock()
         self._reset_duration_sums: dict[str, float] = {}
         self._reset_duration_counts: dict[str, int] = {}
         self._refresh_after_reset_timer = QTimer(self)
@@ -5082,6 +5549,12 @@ class MainWindow(QMainWindow):
             if self.zrotate_selected_interfaces:
                 # Attendre un peu que les proxies soient prêts
                 QTimer.singleShot(2000, self._auto_start_zrotate)
+
+    @property
+    def active_proxies(self) -> int:
+        """Nombre de proxys réellement actifs — DÉRIVÉ de _running_proxies (source
+        de vérité unique), pour éviter les compteurs désynchronisés."""
+        return len(self._running_proxies)
 
     def _start_playwright_browser_warmup(self):
         """
@@ -5848,8 +6321,7 @@ class MainWindow(QMainWindow):
         try:
             data = self._load_config_disk()
             merge_fn(data)
-            with open(self._config_path(), "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            _atomic_write_json(self._config_path(), data)
         except Exception as e:
             print(f"Erreur sauvegarde config (merge): {e}")
 
@@ -6136,8 +6608,7 @@ class MainWindow(QMainWindow):
                 self._apply_remote_proxy_entries(name, proxy_entry, remote_entry)
 
             data["remote_interfaces"] = remote_payload
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            _atomic_write_json(config_path, data)
 
             self.config["remote_interfaces"] = remote_payload
             self.config["interface_proxies"] = {
@@ -6635,8 +7106,7 @@ class MainWindow(QMainWindow):
             selected = sorted(self.zrotate_selected_interfaces)
             zrotate_cfg["selected_interfaces"] = selected
 
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            _atomic_write_json(config_path, data)
 
             self.config.setdefault("zrotate", {})["selected_interfaces"] = list(selected)
         except Exception as e:
@@ -6654,8 +7124,7 @@ class MainWindow(QMainWindow):
                     data = loaded
 
             data["playwright_warmup_enabled"] = bool(self.playwright_warmup_enabled)
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            _atomic_write_json(config_path, data)
 
             self.config["playwright_warmup_enabled"] = bool(
                 self.playwright_warmup_enabled
@@ -6814,6 +7283,23 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     print(f"[RESET] ⚠️ Erreur notification ZRotate: {e}")
 
+    def _cancel_interface_in_zrotate(self, name: str):
+        """Notifie ZRotate qu'un reset a été ANNULÉ (kill utilisateur) : nettoyage
+        d'état sans compter d'échec ni relancer de reset (voir cancel_interface_reset)."""
+        if self.zrotate_proxy_server and getattr(
+            self.zrotate_proxy_server, "proxy_server", None
+        ):
+            qm = getattr(self.zrotate_proxy_server.proxy_server, "quota_manager", None)
+            loop = getattr(self.zrotate_proxy_server, "loop", None)
+            if qm and loop and loop.is_running():
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        qm.cancel_interface_reset(name),
+                        loop,
+                    )
+                except Exception as e:
+                    print(f"[RESET] ⚠️ Erreur annulation ZRotate: {e}")
+
     def _interface_has_reset(self, name: str) -> bool:
         if name in self._remote_interfaces:
             return bool(self._remote_iface_reset_script(name))
@@ -6890,6 +7376,8 @@ class MainWindow(QMainWindow):
     def _on_reset_completed(self, name: str, returncode: int, elapsed_s: float):
         """Appelé sur le thread Qt principal après la fin du script de reset (évite les crashes)."""
         self._reset_in_progress.discard(name)
+        was_cancelled = name in self._reset_cancelled
+        self._reset_cancelled.discard(name)
         try:
             widget = self.interface_widgets.get(name)
             if widget:
@@ -6897,7 +7385,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[RESET] ⚠️ Erreur mise à jour widget: {e}")
 
-        if returncode == -1:
+        if returncode == -4 or was_cancelled:
+            print(f"[RESET] ⛔ Reset de '{name}' interrompu par l'utilisateur")
+        elif returncode == -1:
             try:
                 QMessageBox.warning(
                     self,
@@ -6917,7 +7407,7 @@ class MainWindow(QMainWindow):
                 f"[RESET] ❌ Reset échoué pour l'interface '{name}' (code {returncode}) — pas de remise dans le pool ZRotate"
             )
 
-        if elapsed_s > 0 and returncode not in (-1, -2, -3):
+        if elapsed_s > 0 and returncode not in (-1, -2, -3, -4) and not was_cancelled:
             self._record_reset_duration(name, elapsed_s)
             self._update_reset_avg_ui(name)
 
@@ -6933,7 +7423,13 @@ class MainWindow(QMainWindow):
             )
 
         try:
-            self._release_interface_to_zrotate(name, returncode == 0)
+            if returncode == -4 or was_cancelled:
+                # Annulation utilisateur : nettoyer l'état SANS compter d'échec ni
+                # relancer de reset (sinon le quota manager en redéclenche un aussitôt,
+                # d'où l'impression que « ça ne s'arrête pas »).
+                self._cancel_interface_in_zrotate(name)
+            else:
+                self._release_interface_to_zrotate(name, returncode == 0)
         except Exception as e:
             print(f"[RESET] ⚠️ Erreur release ZRotate: {e}")
         # Un seul refresh 2s après le dernier reset (évite 6 refresh en rafale)
@@ -6959,7 +7455,8 @@ class MainWindow(QMainWindow):
             )
             return
         if name in self._reset_in_progress:
-            print(f"[RESET] ⏳ '{name}' déjà en cours, ignoré.")
+            # Re-clic pendant l'animation = interrompre le reset en cours.
+            self._cancel_reset(name)
             return
 
         interface_info = self._get_all_interfaces().get(name)
@@ -7028,23 +7525,76 @@ class MainWindow(QMainWindow):
                     120,
                     log_fn=ui_log,
                     reset_options=reset_options or None,
+                    on_process_start=lambda p, n=name: self._register_reset_proc(n, p),
                 )
                 elapsed = time.time() - t0
-                ui_log(
-                    f"[RESET] ⏱️ Fin reset '{name}' (port {proxy_port}) en {elapsed:.1f}s, code={return_code}"
-                )
-                self.reset_completed.emit(name, return_code, elapsed)
+                # Reset interrompu par l'utilisateur (kill du process) → code -4.
+                if name in self._reset_cancelled:
+                    ui_log(f"[RESET] ⛔ Reset '{name}' interrompu par l'utilisateur")
+                    self.reset_completed.emit(name, -4, elapsed)
+                else:
+                    ui_log(
+                        f"[RESET] ⏱️ Fin reset '{name}' (port {proxy_port}) en {elapsed:.1f}s, code={return_code}"
+                    )
+                    self.reset_completed.emit(name, return_code, elapsed)
             except subprocess.TimeoutExpired:
                 ui_log(
                     f"[RESET] ⏱️ Timeout reset '{name}' (port {proxy_port}) après 120s"
                 )
                 self.reset_completed.emit(name, -2, 120.0)
             except Exception as e:
-                ui_log(f"[RESET] 💥 Exception reset '{name}' (port {proxy_port}): {e}")
-                traceback.print_exc()
-                self.reset_completed.emit(name, -3, 0.0)
+                if name in self._reset_cancelled:
+                    ui_log(f"[RESET] ⛔ Reset '{name}' interrompu par l'utilisateur")
+                    self.reset_completed.emit(name, -4, 0.0)
+                else:
+                    ui_log(f"[RESET] 💥 Exception reset '{name}' (port {proxy_port}): {e}")
+                    traceback.print_exc()
+                    self.reset_completed.emit(name, -3, 0.0)
+            finally:
+                with self._reset_procs_lock:
+                    self._reset_procs.pop(name, None)
 
         threading.Thread(target=run_reset, daemon=True).start()
+
+    def _register_reset_proc(self, name: str, proc) -> None:
+        """Mémorise le subprocess d'un reset en cours pour pouvoir le tuer."""
+        with self._reset_procs_lock:
+            self._reset_procs[name] = proc
+        # Course : si l'annulation est arrivée AVANT l'enregistrement du process
+        # (clic très rapide), on tue le process immédiatement.
+        if name in self._reset_cancelled:
+            threading.Thread(
+                target=_terminate_process_tree, args=(proc,), daemon=True
+            ).start()
+
+    def _cancel_reset(self, name: str) -> None:
+        """Interrompt un reset en cours : tue l'arbre de process du subprocess de
+        reset (cas reset_XPro_dist). Un reset Playwright en-process ne peut pas
+        être tué à mi-course : on le signale."""
+        self._reset_cancelled.add(name)
+        # Retour visuel immédiat : couper l'animation du bouton tout de suite
+        # (l'état complet sera nettoyé par _on_reset_completed dès la mort du process).
+        widget = self.interface_widgets.get(name)
+        if widget:
+            try:
+                widget.set_reset_loading(False)
+            except Exception:
+                pass
+        with self._reset_procs_lock:
+            proc = self._reset_procs.get(name)
+        if proc is not None:
+            self._zrotate_log(f"⛔ Interruption du reset de '{name}' demandée…")
+            # Tuer l'arbre de process en tâche de fond pour ne pas geler l'UI :
+            # le proc.wait() du thread de reset se débloquera dès la mort du process.
+            threading.Thread(
+                target=_terminate_process_tree, args=(proc,), daemon=True
+            ).start()
+        else:
+            # Pas de subprocess (reset Playwright en-process) : non interruptible.
+            self._zrotate_log(
+                f"⚠️ Reset de '{name}' non interruptible (processus interne) — "
+                "il se terminera de lui-même."
+            )
 
     @Slot(str)
     def on_interface_settings_requested(self, name: str):
@@ -7206,7 +7756,6 @@ class MainWindow(QMainWindow):
             # S'assurer que ce proxy n'est plus comptabilisé comme actif
             if name in self._running_proxies:
                 self._running_proxies.remove(name)
-                self.active_proxies = len(self._running_proxies)
                 self._update_window_title()
 
         if info.is_remote:
@@ -7226,7 +7775,14 @@ class MainWindow(QMainWindow):
                 port=port,
                 interface_name=name,
             )
-        thread = ProxyThread(config)
+        # Interface locale : fournir l'IP source COURANTE relue à chaque connexion
+        # (via InterfaceManager), pour ne jamais binder une IP figée périmée.
+        bind_ip_provider = (
+            None
+            if info.is_remote
+            else (lambda n=name: self.interface_manager.get_local_ip(n))
+        )
+        thread = ProxyThread(config, bind_ip_provider=bind_ip_provider)
         # Ne pas capturer directement le widget dans le slot, on utilise le nom
         thread.status_changed.connect(
             lambda running, iface=name, p=port: self._on_thread_status_changed(
@@ -7277,7 +7833,6 @@ class MainWindow(QMainWindow):
         # Retirer immédiatement ce proxy des actifs pour garder le compteur cohérent
         if name in self._running_proxies:
             self._running_proxies.remove(name)
-            self.active_proxies = len(self._running_proxies)
             self._update_window_title()
         widget.set_proxy_running(False)
 
@@ -7328,7 +7883,6 @@ class MainWindow(QMainWindow):
         else:
             if iface_name in self._running_proxies:
                 self._running_proxies.remove(iface_name)
-        self.active_proxies = len(self._running_proxies)
         widget = self.interface_widgets.get(iface_name)
         if widget:
             widget.set_proxy_running(running, port if running else None)
@@ -7352,11 +7906,20 @@ class MainWindow(QMainWindow):
         }
         self.zrotate_selected_interfaces &= available_interfaces
 
-        visible_infos = [
-            (name, info)
-            for name, info in sorted(all_interfaces.items())
-            if interface_is_usable(info)
-        ]
+        # Ordre d'affichage : interfaces SÉLECTIONNÉES (pool) en haut, puis les
+        # autres, chaque groupe trié par ordre croissant/naturel (A-Z, cle1<cle2<…).
+        selected_now = self.zrotate_selected_interfaces
+        visible_infos = sorted(
+            (
+                (name, info)
+                for name, info in all_interfaces.items()
+                if interface_is_usable(info)
+            ),
+            key=lambda ni: (
+                0 if ni[0] in selected_now else 1,
+                _natural_sort_key(ni[0]),
+            ),
+        )
 
         scroll_bar = self.zrotate_interfaces_list.verticalScrollBar()
         saved_scroll_value = scroll_bar.value()
@@ -7456,7 +8019,7 @@ class MainWindow(QMainWindow):
         self._sync_zrotate_row_pool_styles()
 
     def _on_zrotate_interface_toggled(self, interface_name: str, state: int):
-        """Gère le changement d'état d'une checkbox d'interface"""
+        """Gère le changement d'état d'une checkbox d'interface."""
         self._mark_user_interaction()  # Marquer l'interaction pour éviter les mises à jour pendant la sélection
         row_widget = getattr(self, "_zrotate_interface_rows", {}).get(interface_name)
         if isinstance(row_widget, ZRotateInterfaceRow):
@@ -7467,17 +8030,36 @@ class MainWindow(QMainWindow):
             self.zrotate_selected_interfaces.discard(interface_name)
         self._last_pool_state_for_ui = None
         self._sync_zrotate_row_pool_styles()
+        self._save_zrotate_selection_config()
 
-        # Si ZRotate est en cours d'exécution, redémarrer pour prendre en compte les changements
+        # Re-tri + redémarrage du serveur DIFFÉRÉS (singleShot 0) : le handler rend
+        # la main immédiatement → la case et l'UI réagissent instantanément, le
+        # travail lourd (rebuild liste + stop/start serveur) se fait juste après
+        # sans figer l'interface.
+        QTimer.singleShot(0, self._apply_zrotate_selection_change)
+
+    def _apply_zrotate_selection_change(self):
+        """Applique un changement de sélection : re-tri de la liste puis
+        redémarrage NON bloquant du serveur (à chaque ajout/retrait)."""
+        # Re-trier d'abord (sélectionnées en haut) — visuel quasi instantané.
+        self._maybe_rebuild_zrotate_interfaces_list(force=True)
         if self.zrotate_running:
             self._zrotate_log(
-                "⚠️ Redémarrage de ZRotate pour prendre en compte les changements..."
+                "⚠️ Redémarrage de ZRotate (changement de sélection)..."
             )
-            self._stop_zrotate()
-            # Redémarrer après un court délai
-            QTimer.singleShot(500, self._start_zrotate)
+            # Arrêt NON bloquant : on ferme le socket d'écoute (port libéré) sans
+            # attendre la fin complète du thread, puis on redémarre aussitôt.
+            self._stop_zrotate(block=False)
+            self._start_zrotate()
 
-        self._save_zrotate_selection_config()
+    def _reap_dying_zrotate(self, thread) -> None:
+        """Retire un ancien thread ZRotate de la liste une fois qu'il s'est
+        terminé (garder la référence évite un crash 'QThread destroyed while
+        running' pendant un redémarrage non bloquant)."""
+        try:
+            self._zrotate_dying_threads.remove(thread)
+        except (ValueError, AttributeError):
+            pass
 
     def _clear_zrotate_console(self):
         """Efface la console actuellement affichée."""
@@ -7802,15 +8384,19 @@ class MainWindow(QMainWindow):
         self._last_pool_state_for_ui = None
         self._sync_zrotate_row_pool_styles()
 
-    def _stop_zrotate(self, wait_timeout_ms: int = 500):
-        """Arrête le serveur ZRotate.
+    def _stop_zrotate(self, wait_timeout_ms: int = 3000, block: bool = True):
+        """Arrête le serveur ZRotate de façon gracieuse.
 
-        wait_timeout_ms contrôle le temps maximum (en ms) pendant lequel
-        on attend l'arrêt propre du thread avant de le tuer de force.
-        Par défaut on garde cette valeur très basse pour éviter de bloquer l'UI
-        quand l'utilisateur clique sur le bouton Arrêter ZRotate.
+        `thread.stop()` ferme d'abord le serveur asyncio (ce qui LIBÈRE le socket
+        d'écoute 9999) puis arrête la boucle.
+        - block=True (défaut, fermeture app / arrêt manuel) : on attend la fin
+          complète du thread ; terminate() en tout dernier recours.
+        - block=False (redémarrage sur changement de sélection) : on N'ATTEND PAS
+          la fin du thread pour ne pas figer l'UI. Le port étant déjà libéré par
+          thread.stop(), on peut redémarrer aussitôt ; l'ancien thread finit son
+          nettoyage seul (gardé référencé dans _zrotate_dying_threads).
         """
-        if not self.zrotate_running:
+        if not self.zrotate_running and self.zrotate_proxy_server is None:
             return  # Déjà arrêté
 
         self.zrotate_running = False  # Marquer comme arrêté immédiatement
@@ -7824,27 +8410,41 @@ class MainWindow(QMainWindow):
 
         if self.zrotate_proxy_server:
             thread = self.zrotate_proxy_server
-            # Demander un arrêt propre du serveur (non bloquant)
+            self.zrotate_proxy_server = None
+            # Demander un arrêt propre du serveur (ferme le serveur asyncio et
+            # libère le socket, puis arrête la boucle) — voir ZRotateProxyServer.stop().
             try:
                 thread.stop()
             except Exception:
-                pass
+                traceback.print_exc()
 
-            # Attendre un court instant pour laisser le temps au thread
-            # de s'arrêter sans geler l'UI, puis le tuer si nécessaire.
-            if thread.isRunning():
-                try:
-                    if not thread.wait(wait_timeout_ms):
-                        thread.terminate()
-                        thread.wait(1000)
-                except Exception:
-                    # En cas de problème, on tente quand même de forcer l'arrêt
+            if not block:
+                # Redémarrage réactif : ne pas bloquer l'UI en attendant la fin du
+                # thread. On le garde référencé jusqu'à sa terminaison réelle.
+                if thread.isRunning():
+                    self._zrotate_dying_threads.append(thread)
+                    thread.finished.connect(
+                        lambda t=thread: self._reap_dying_zrotate(t)
+                    )
+            else:
+                # Laisser le temps à la boucle asyncio de se dénouer proprement.
+                if thread.isRunning():
+                    stopped = False
                     try:
-                        thread.terminate()
-                        thread.wait(1000)
+                        stopped = thread.wait(max(1000, int(wait_timeout_ms)))
                     except Exception:
-                        pass
-            self.zrotate_proxy_server = None
+                        stopped = False
+                    if not stopped:
+                        # Dernier recours uniquement : le thread n'a pas rendu la main.
+                        self._zrotate_log(
+                            "⚠️ ZRotate ne s'est pas arrêté proprement — arrêt forcé "
+                            "(le port peut mettre un instant à se libérer)."
+                        )
+                        try:
+                            thread.terminate()
+                            thread.wait(2000)
+                        except Exception:
+                            traceback.print_exc()
 
         self._set_quarantine_ui_stopped()
 
@@ -7894,6 +8494,13 @@ class MainWindow(QMainWindow):
                 self._stop_zrotate(wait_timeout_ms=5000)
             except Exception:
                 traceback.print_exc()
+
+        # Fermer les navigateurs Playwright persistants des drivers reset (si présents).
+        # No-op pour reset_XPro_dist (aucun navigateur).
+        try:
+            shutdown_all_reset_browsers()
+        except Exception:
+            traceback.print_exc()
 
         # Arrêter proprement InterfaceManager (timers + PublicIpWorker)
         try:
