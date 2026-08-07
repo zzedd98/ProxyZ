@@ -13,6 +13,8 @@ import psutil
 import select
 import socket
 import ssl
+import hmac
+import ipaddress
 from dataclasses import dataclass
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -28,9 +30,10 @@ from enum import Enum
 from typing import Optional, Dict, Callable, Awaitable, Tuple
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Sous Windows, empêche l'ouverture de consoles éphémères pour netsh / control.exe
 if sys.platform.startswith("win"):
@@ -1233,6 +1236,13 @@ def run_reset_script(
         return 0 if ok else 1
 
     cmd = build_reset_command(script_path, proxy_port)
+    # Serveur/passerelle de reset passé en argument au script (reset_XPro_dist.py
+    # attend [port] [reset_server]). Sans ça, il utilise son serveur par défaut.
+    server = (reset_options or {}).get("reset_server") or (reset_options or {}).get(
+        "modem_gateway"
+    )
+    if server:
+        cmd.append(str(server))
     if log_fn:
         log_fn(f"[RESET] subprocess: {' '.join(cmd)} | cwd={str(get_app_dir())}")
     return _run_subprocess_tree(
@@ -4705,6 +4715,251 @@ class LogHandler(logging.Handler):
             pass
 
 
+class _ResetRequestHandler(BaseHTTPRequestHandler):
+    """
+    Handler du mini-serveur de reset. Répond à :
+        GET /reset?proxy=p:<port>[&token=<token>]
+    Émet un signal Qt vers ProxyZ (thread-safe) qui déclenche le reset de la clé
+    associée à <port>. Répond immédiatement (le déclenchement est asynchrone).
+    """
+
+    protocol_version = "HTTP/1.1"
+
+    def _reply(self, code: int, message: str) -> None:
+        body = (message + "\n").encode("utf-8", errors="replace")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _client_ip(self) -> str:
+        try:
+            return self.client_address[0] if self.client_address else ""
+        except Exception:
+            return ""
+
+    def do_GET(self):
+        owner = getattr(self.server, "owner", None)
+        if owner is None:
+            self._reply(500, "server not ready")
+            return
+        client_ip = self._client_ip()
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path.rstrip("/") not in ("/reset", ""):
+                self._reply(404, "not found (use /reset?proxy=p:PORT)")
+                return
+
+            # 1) Liste blanche d'IP (si configurée) : refuser les autres sources.
+            if not owner.ip_allowed(client_ip):
+                owner.emit_log(f"⛔ Reset refusé — IP non autorisée : {client_ip}")
+                self._reply(403, "forbidden (ip not allowed)")
+                return
+
+            qs = parse_qs(parsed.query)
+
+            # 2) Token (authentification). Comparaison à temps constant.
+            if not owner.token_ok((qs.get("token") or [""])[0]):
+                owner.emit_log(f"⛔ Reset refusé — token invalide/absent (depuis {client_ip})")
+                self._reply(403, "forbidden (bad or missing token)")
+                return
+
+            # 3) Port cible (proxy=p:4001).
+            proxy_val = (qs.get("proxy") or [""])[0]
+            m = re.search(r"(\d+)", proxy_val)
+            if not m:
+                self._reply(400, "bad or missing 'proxy' param (expected p:PORT)")
+                return
+            port = int(m.group(1))
+            if not owner.is_known_port(port):
+                self._reply(404, f"unknown proxy port {port}")
+                return
+
+            # 4) Anti-spam : cooldown par clé.
+            if not owner.check_rate_limit(port):
+                owner.emit_log(
+                    f"⏳ Reset ignoré — cooldown actif sur le port {port} (depuis {client_ip})"
+                )
+                self._reply(429, f"too many requests (cooldown actif sur le port {port})")
+                return
+
+            owner.reset_requested.emit(port)
+            self._reply(200, f"reset triggered for proxy port {port}")
+        except Exception as exc:
+            self._reply(500, f"error: {exc}")
+
+    # HEAD utile pour un simple test de disponibilité
+    def do_HEAD(self):
+        self._reply(200, "")
+
+    def log_message(self, fmt, *args):
+        # Ne pas écrire sur stderr (None en .exe windowed) : router vers le signal.
+        try:
+            owner = getattr(self.server, "owner", None)
+            if owner is not None:
+                owner.log_message.emit(
+                    f"[RESET-HTTP] {self.address_string()} {fmt % args}"
+                )
+        except Exception:
+            pass
+
+
+class ResetHttpServer(QThread):
+    """
+    Mini-serveur HTTP de reset (thread Qt). Écoute sur host:port et, sur
+    GET /reset?proxy=p:<port>, émet reset_requested(<port>) vers ProxyZ.
+    Un seul port partagé gère toutes les clés (le port cible est dans l'URL).
+    """
+
+    reset_requested = Signal(int)  # port proxy cible
+    log_message = Signal(str)
+
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8080,
+        token: str = "",
+        min_interval: float = 0.0,
+        allowed_ips=None,
+    ):
+        super().__init__()
+        self.host = host
+        self.port = int(port)
+        self.token = (token or "").strip()
+        # Anti-spam : intervalle minimum (s) entre deux resets acceptés pour une même clé.
+        self.min_interval = max(0.0, float(min_interval or 0.0))
+        # Liste blanche d'IP/CIDR (vide = pas de restriction).
+        self._allowed_nets = []
+        for entry in allowed_ips or []:
+            entry = str(entry).strip()
+            if not entry:
+                continue
+            for candidate in (entry, entry + "/32"):
+                try:
+                    self._allowed_nets.append(
+                        ipaddress.ip_network(candidate, strict=False)
+                    )
+                    break
+                except Exception:
+                    continue
+        self._httpd = None
+        self._known_ports: set[int] = set()
+        self._known_ports_lock = threading.Lock()
+        self._last_reset_ts: dict[int, float] = {}
+        self._rate_lock = threading.Lock()
+
+    def emit_log(self, msg: str) -> None:
+        """Log thread-safe vers l'app + stdout (appelé depuis le handler)."""
+        self._log(f"[RESET-HTTP] {msg}")
+
+    def set_known_ports(self, ports) -> None:
+        with self._known_ports_lock:
+            self._known_ports = {int(p) for p in ports if p}
+
+    def is_known_port(self, port: int) -> bool:
+        with self._known_ports_lock:
+            return int(port) in self._known_ports
+
+    def ip_allowed(self, ip: str) -> bool:
+        """True si l'IP source est autorisée (liste blanche vide = tout autorisé)."""
+        if not self._allowed_nets:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip)
+        except Exception:
+            return False
+        return any(addr in net for net in self._allowed_nets)
+
+    def token_ok(self, provided: str) -> bool:
+        """Authentification : token vide = ouvert ; sinon comparaison à temps constant."""
+        if not self.token:
+            return True
+        try:
+            return hmac.compare_digest(str(provided or ""), self.token)
+        except Exception:
+            return False
+
+    def check_rate_limit(self, port: int) -> bool:
+        """True si un reset est autorisé maintenant pour ce port (et l'enregistre) ;
+        False s'il est trop tôt (cooldown anti-spam)."""
+        if self.min_interval <= 0:
+            return True
+        now = time.monotonic()
+        with self._rate_lock:
+            last = self._last_reset_ts.get(int(port), 0.0)
+            if now - last < self.min_interval:
+                return False
+            self._last_reset_ts[int(port)] = now
+            return True
+
+    def _log(self, msg: str) -> None:
+        # Double sortie : signal Qt (console de l'app) + stdout (terminal en mode .py).
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
+        try:
+            self.log_message.emit(msg)
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            httpd = ThreadingHTTPServer((self.host, self.port), _ResetRequestHandler)
+            httpd.daemon_threads = True
+            httpd.owner = self
+            self._httpd = httpd
+            self._log(
+                f"✅ Serveur de reset HTTP démarré sur {self.host}:{self.port} "
+                f"(URL: /reset?proxy=p:PORT)"
+            )
+            # Récapitulatif sécurité + avertissement si l'endpoint est ouvert.
+            protections = []
+            if self.token:
+                protections.append("token")
+            if self._allowed_nets:
+                protections.append(f"liste blanche IP ({len(self._allowed_nets)})")
+            if self.min_interval > 0:
+                protections.append(f"cooldown {self.min_interval:g}s/clé")
+            if protections:
+                self._log(f"🔒 Sécurité reset : {', '.join(protections)}")
+            if not self.token and not self._allowed_nets:
+                self._log(
+                    "⚠️ Serveur de reset SANS authentification (ni token ni liste blanche IP) : "
+                    "n'importe qui pouvant joindre le port peut reset tes clés. "
+                    "Renseigne 'reset_server_token' dans proxy_configs.json."
+                )
+            httpd.serve_forever(poll_interval=0.5)
+        except OSError as exc:
+            self._log(
+                f"❌ Serveur de reset : impossible d'écouter sur "
+                f"{self.host}:{self.port} ({exc}) — port déjà utilisé ou bloqué ?"
+            )
+        except Exception as exc:
+            self._log(f"❌ Serveur de reset : erreur {exc}")
+        finally:
+            self._httpd = None
+            self._log("⏹️ Serveur de reset HTTP arrêté")
+
+    def stop(self):
+        httpd = self._httpd
+        if httpd is not None:
+            # shutdown() doit être appelé depuis un AUTRE thread que serve_forever().
+            try:
+                httpd.shutdown()
+            except Exception:
+                pass
+            try:
+                httpd.server_close()
+            except Exception:
+                pass
+
+
 class RemoteInterfaceDialog(QDialog):
     """Popup d'ajout ou modification d'une interface réseau distante."""
 
@@ -5495,6 +5750,15 @@ class MainWindow(QMainWindow):
         self._was_minimized = False
         self.playwright_warmup_enabled = DEFAULT_PLAYWRIGHT_WARMUP_ENABLED
 
+        # Serveur HTTP de reset (activable) : un générateur externe peut demander
+        # le reset d'une clé via GET /reset?proxy=p:PORT sur ce serveur.
+        self.reset_http_server: Optional[ResetHttpServer] = None
+        self.reset_server_enabled = False
+        self.reset_server_port = 8080
+        self.reset_server_token = ""
+        self.reset_server_min_interval = 10.0  # anti-spam : cooldown par clé (s)
+        self.reset_server_allowed_ips: list = []  # liste blanche IP/CIDR (vide = tout)
+
         # Resets en parallèle (un thread par interface) ; suivi pour éviter doublons et refresh en rafale
         self._reset_in_progress: set[str] = set()  # interfaces en cours de reset
         # Interruption d'un reset : Popen du subprocess en cours par interface, et
@@ -5549,6 +5813,16 @@ class MainWindow(QMainWindow):
             if self.zrotate_selected_interfaces:
                 # Attendre un peu que les proxies soient prêts
                 QTimer.singleShot(2000, self._auto_start_zrotate)
+
+        # Démarrer le serveur de reset HTTP si activé (après que les ports soient mappés).
+        print(
+            f"[BOOT] Serveur de reset HTTP : "
+            f"{'ACTIVÉ' if self.reset_server_enabled else 'désactivé'} "
+            f"(port {self.reset_server_port}) — case à cocher dans le panneau gauche",
+            flush=True,
+        )
+        if self.reset_server_enabled:
+            QTimer.singleShot(1500, self._start_reset_http_server)
 
     @property
     def active_proxies(self) -> int:
@@ -5716,6 +5990,17 @@ class MainWindow(QMainWindow):
             self._on_playwright_warmup_changed
         )
         left.addWidget(self.playwright_warmup_checkbox)
+
+        # Serveur HTTP de reset : permet à un générateur externe de reset une clé
+        # via GET /reset?proxy=p:PORT. Port/token configurables dans proxy_configs.json.
+        self.reset_server_checkbox = QCheckBox("Serveur de reset HTTP")
+        self.reset_server_checkbox.setObjectName("playwrightWarmupCheckbox")
+        self.reset_server_checkbox.setToolTip(
+            "Expose GET /reset?proxy=p:PORT pour déclencher le reset d'une clé "
+            "depuis un outil externe (générateur). Port/token dans proxy_configs.json."
+        )
+        self.reset_server_checkbox.stateChanged.connect(self._on_reset_server_toggled)
+        left.addWidget(self.reset_server_checkbox)
 
         self.auto_container = QWidget()
         self.auto_layout = QVBoxLayout(self.auto_container)
@@ -6193,6 +6478,8 @@ class MainWindow(QMainWindow):
             if port > 0:
                 mapping[port] = name
         self._iface_by_port = mapping
+        # Tenir à jour la liste des ports connus du serveur de reset HTTP.
+        self._push_reset_server_known_ports()
 
     def _interface_for_log_message(self, message: str) -> str | None:
         port_match = re.search(r"\[port (\d+)\]", message)
@@ -6479,6 +6766,40 @@ class MainWindow(QMainWindow):
                 Qt.Checked if self.playwright_warmup_enabled else Qt.Unchecked
             )
             self.playwright_warmup_checkbox.blockSignals(blocked)
+
+        # --- Serveur de reset HTTP ---
+        self.reset_server_enabled = bool(self.config.get("reset_server_enabled", False))
+        try:
+            self.reset_server_port = int(self.config.get("reset_server_port", 8080) or 8080)
+        except (TypeError, ValueError):
+            self.reset_server_port = 8080
+        self.reset_server_token = str(self.config.get("reset_server_token", "") or "").strip()
+        try:
+            self.reset_server_min_interval = float(
+                self.config.get("reset_server_min_interval_seconds", 10.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            self.reset_server_min_interval = 10.0
+        allowed = self.config.get("reset_server_allowed_ips", [])
+        if isinstance(allowed, str):
+            allowed = [x.strip() for x in allowed.split(",") if x.strip()]
+        self.reset_server_allowed_ips = list(allowed) if isinstance(allowed, list) else []
+        self.config["reset_server_enabled"] = self.reset_server_enabled
+        self.config["reset_server_port"] = self.reset_server_port
+        self.config["reset_server_token"] = self.reset_server_token
+        self.config["reset_server_min_interval_seconds"] = self.reset_server_min_interval
+        self.config["reset_server_allowed_ips"] = self.reset_server_allowed_ips
+        if hasattr(self, "reset_server_checkbox"):
+            blocked = self.reset_server_checkbox.blockSignals(True)
+            self.reset_server_checkbox.setCheckState(
+                Qt.Checked if self.reset_server_enabled else Qt.Unchecked
+            )
+            self.reset_server_checkbox.blockSignals(blocked)
+            self.reset_server_checkbox.setToolTip(
+                f"Expose GET /reset?proxy=p:PORT sur le port {self.reset_server_port} "
+                f"pour déclencher le reset d'une clé depuis un outil externe. "
+                f"Port/token modifiables dans proxy_configs.json."
+            )
 
         ui = self.config.get("ui", {})
         size = ui.get("last_window_size")
@@ -7445,26 +7766,71 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def on_interface_reset_requested(self, name: str):
-        """Reset manuel ou ZRotate : un thread par interface, en parallèle."""
-        if name in self._remote_interfaces and not self._remote_iface_reset_script(name):
-            QMessageBox.information(
-                self,
-                "Reset distant",
-                "Aucun script de reset configuré pour cette interface distante.\n"
-                "Clic-droit → Éditer pour en définir un.",
-            )
-            return
+        """Clic sur le bouton RESET : lance un reset, ou l'ANNULE si déjà en cours."""
         if name in self._reset_in_progress:
             # Re-clic pendant l'animation = interrompre le reset en cours.
             self._cancel_reset(name)
             return
+        self._start_reset(name, interactive=True)
+
+    @Slot(str)
+    def _on_zrotate_reset_requested(self, name: str):
+        """Reset demandé par ZRotate (quota/santé) : coalescé, jamais d'annulation."""
+        self._trigger_reset_coalesced(name)
+
+    @Slot(int)
+    def _on_http_reset_requested(self, port: int):
+        """Reset demandé par le serveur HTTP externe (générateur) pour un port proxy."""
+        name = self._iface_by_port.get(int(port))
+        if not name:
+            self._zrotate_log(
+                f"[RESET-HTTP] Port {port} inconnu (aucune interface associée) — ignoré"
+            )
+            return
+        self._zrotate_log(f"[RESET-HTTP] Reset demandé pour '{name}' (port {port})")
+        self._trigger_reset_coalesced(name)
+
+    def _trigger_reset_coalesced(self, name: str) -> None:
+        """Déclenchement AUTOMATIQUE (ZRotate/HTTP) : on ignore si un reset est déjà
+        en cours (au lieu de l'annuler, comme le fait le bouton)."""
+        if name in self._reset_in_progress:
+            self._zrotate_log(
+                f"[RESET] {name} : reset déjà en cours, nouvelle demande ignorée"
+            )
+            return
+        self._start_reset(name, interactive=False)
+
+    def _start_reset(self, name: str, *, interactive: bool = True) -> bool:
+        """Cœur du reset : résout port + script et lance le thread de reset.
+        interactive=True (bouton) → pop-up en cas d'erreur ; sinon (ZRotate/HTTP)
+        simples logs. Retourne True si le reset a démarré."""
+        if name in self._reset_in_progress:
+            return False
+
+        def _err(title: str, msg: str):
+            if interactive:
+                QMessageBox.warning(self, title, msg)
+            else:
+                self._zrotate_log(f"[RESET] {msg}")
+
+        if name in self._remote_interfaces and not self._remote_iface_reset_script(name):
+            if interactive:
+                QMessageBox.information(
+                    self,
+                    "Reset distant",
+                    "Aucun script de reset configuré pour cette interface distante.\n"
+                    "Clic-droit → Éditer pour en définir un.",
+                )
+            else:
+                self._zrotate_log(
+                    f"[RESET] {name} : aucun script de reset configuré (interface distante)"
+                )
+            return False
 
         interface_info = self._get_all_interfaces().get(name)
         if not interface_info:
-            QMessageBox.warning(
-                self, "Reset impossible", f"Interface '{name}' introuvable."
-            )
-            return
+            _err("Reset impossible", f"Interface '{name}' introuvable.")
+            return False
 
         widget = self.interface_widgets.get(name)
         proxy_port = None
@@ -7480,12 +7846,11 @@ class MainWindow(QMainWindow):
                     pass
 
         if not proxy_port:
-            QMessageBox.warning(
-                self,
+            _err(
                 "Reset impossible",
                 f"Aucun port proxy configuré pour l'interface '{name}'.",
             )
-            return
+            return False
 
         reset_script, _ = resolve_interface_reset_script(
             iface_cfg,
@@ -7512,10 +7877,22 @@ class MainWindow(QMainWindow):
                 self.reset_log.emit(msg)
 
             reset_options = extract_interface_reset_options(iface_cfg)
-            gw = reset_options.get("modem_gateway")
+            # Interface distante (dist) : le serveur de reset est l'hôte amont (la
+            # même machine que le proxy, ex. 192.168.1.157), sauf serveur explicite
+            # en config. Corrige le défaut .158 codé en dur dans reset_XPro_dist.py.
+            if not reset_options.get("modem_gateway"):
+                explicit_server = ""
+                if iface_cfg:
+                    explicit_server = str(iface_cfg.get("reset_server") or "").strip()
+                remote_info = self._remote_interfaces.get(name)
+                if explicit_server:
+                    reset_options["reset_server"] = explicit_server
+                elif remote_info and remote_info.upstream_host:
+                    reset_options["reset_server"] = remote_info.upstream_host
+            gw = reset_options.get("modem_gateway") or reset_options.get("reset_server")
             ui_log(
                 f"[RESET] 🚀 Lancement {script_path.name} pour '{name}' (port {proxy_port}"
-                + (f", gateway {gw})" if gw else ")")
+                + (f", serveur {gw})" if gw else ")")
             )
             try:
                 t0 = time.time()
@@ -7555,6 +7932,7 @@ class MainWindow(QMainWindow):
                     self._reset_procs.pop(name, None)
 
         threading.Thread(target=run_reset, daemon=True).start()
+        return True
 
     def _register_reset_proc(self, name: str, proc) -> None:
         """Mémorise le subprocess d'un reset en cours pour pouvoir le tuer."""
@@ -8164,6 +8542,92 @@ class MainWindow(QMainWindow):
         self.config["playwright_warmup_enabled"] = self.playwright_warmup_enabled
         self._save_playwright_warmup_config()
 
+    # --- Serveur de reset HTTP ---
+    def _on_reset_server_toggled(self, state: int):
+        # Lire l'état directement sur la case (robuste, pas de comparaison d'enum).
+        enabled = self.reset_server_checkbox.isChecked()
+        self.reset_server_enabled = enabled
+        self.config["reset_server_enabled"] = enabled
+        self._save_reset_server_config()
+        # Log IMMÉDIAT (console + stdout) pour confirmer que le clic est bien pris en compte.
+        msg = (
+            f"[RESET-HTTP] Activation du serveur de reset (port {self.reset_server_port})…"
+            if enabled
+            else "[RESET-HTTP] Désactivation du serveur de reset"
+        )
+        print(msg, flush=True)
+        self._zrotate_log(msg)
+        if enabled:
+            self._start_reset_http_server()
+        else:
+            self._stop_reset_http_server()
+
+    def _push_reset_server_known_ports(self) -> None:
+        """Communique au serveur de reset la liste des ports proxy connus."""
+        srv = self.reset_http_server
+        if srv is not None:
+            try:
+                srv.set_known_ports(self._iface_by_port.keys())
+            except Exception:
+                pass
+
+    def _start_reset_http_server(self) -> None:
+        if self.reset_http_server is not None:
+            try:
+                if self.reset_http_server.isRunning():
+                    return  # déjà démarré
+            except Exception:
+                pass
+            # Thread précédent mort (ex. échec de bind) : nettoyer avant de relancer.
+            self._stop_reset_http_server()
+        try:
+            srv = ResetHttpServer(
+                host="0.0.0.0",
+                port=int(self.reset_server_port),
+                token=self.reset_server_token,
+                min_interval=self.reset_server_min_interval,
+                allowed_ips=self.reset_server_allowed_ips,
+            )
+            srv.reset_requested.connect(self._on_http_reset_requested)
+            srv.log_message.connect(self._zrotate_log)
+            self.reset_http_server = srv
+            srv.set_known_ports(self._iface_by_port.keys())
+            srv.start()
+            print(
+                f"[RESET-HTTP] Thread serveur lancé sur 0.0.0.0:{self.reset_server_port} "
+                f"({len(self._iface_by_port)} port(s) connus)",
+                flush=True,
+            )
+        except Exception as e:
+            self.reset_http_server = None
+            emsg = f"❌ Serveur de reset : démarrage impossible ({e})"
+            print(emsg, flush=True)
+            self._zrotate_log(emsg)
+
+    def _stop_reset_http_server(self) -> None:
+        srv = self.reset_http_server
+        self.reset_http_server = None
+        if srv is not None:
+            try:
+                srv.stop()
+                srv.wait(2000)
+            except Exception:
+                pass
+
+    def _save_reset_server_config(self) -> None:
+        """Persiste reset_server_enabled dans proxy_configs.json (merge). Les autres
+        réglages (port/token/cooldown/liste blanche) sont posés par défaut s'ils
+        n'existent pas, puis modifiables à la main dans le JSON."""
+        def merge(data: dict) -> None:
+            data["reset_server_enabled"] = bool(self.reset_server_enabled)
+            data.setdefault("reset_server_port", int(self.reset_server_port))
+            data.setdefault("reset_server_token", self.reset_server_token)
+            data.setdefault(
+                "reset_server_min_interval_seconds", self.reset_server_min_interval
+            )
+            data.setdefault("reset_server_allowed_ips", self.reset_server_allowed_ips)
+        self._merge_write_config_disk(merge)
+
     def _on_zrotate_auto_start_changed(self, state: int):
         """Gère le changement de l'option démarrage automatique"""
         self._save_zrotate_auto_start_config()
@@ -8345,9 +8809,10 @@ class MainWindow(QMainWindow):
             close_haapi_tunnel_after_seconds=close_haapi_after,
         )
         self.zrotate_proxy_server.log_message.connect(self._zrotate_log)
-        # Connecter le signal de reset pour déclencher le reset avec animation
+        # Reset demandé par ZRotate : chemin COALESCÉ (ignore si déjà en cours),
+        # surtout PAS on_interface_reset_requested qui annulerait un reset en cours.
         self.zrotate_proxy_server.reset_interface_requested.connect(
-            self.on_interface_reset_requested
+            self._on_zrotate_reset_requested
         )
         # Badge RESET → "In use" quand la clé a une requête/connexion en cours
         self.zrotate_proxy_server.interface_usage_changed.connect(
@@ -8494,6 +8959,12 @@ class MainWindow(QMainWindow):
                 self._stop_zrotate(wait_timeout_ms=5000)
             except Exception:
                 traceback.print_exc()
+
+        # Arrêter le serveur de reset HTTP si actif.
+        try:
+            self._stop_reset_http_server()
+        except Exception:
+            traceback.print_exc()
 
         # Fermer les navigateurs Playwright persistants des drivers reset (si présents).
         # No-op pour reset_XPro_dist (aucun navigateur).
