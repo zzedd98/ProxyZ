@@ -1,0 +1,149 @@
+
+========== session 2026-08-27 13:15:46 ==========
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN][MINI] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN][MINI] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN][MINI] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:15:59 ==========
+[UPDATE] Mise a jour disponible (local=27906983728-4cf7ac13dc351e35be6a35ac77f154fda42a82d7 -> distant=31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3).
+[UPDATE] ProxyZUpdater lance.
+[UPDATE] ProxyZ ne demarre pas — utilisez le bouton « Lancer ProxyZ » dans ProxyZUpdater une fois la mise a jour terminee.
+
+========== session 2026-08-27 13:16:52 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[RESET-HTTP] Activation du serveur de reset (port 8080)…
+[2026-08-27 13:17:15] [ZRotate] [RESET-HTTP] Activation du serveur de reset (port 8080)…
+[RESET-HTTP] Thread serveur lancé sur 0.0.0.0:8080 (1 port(s) connus)
+✅ Serveur de reset HTTP démarré sur 0.0.0.0:8080 (URL: /reset?proxy=p:PORT)
+🔒 Sécurité reset : cooldown 10s/clé
+⚠️ Serveur de reset SANS authentification (ni token ni liste blanche IP) : n'importe qui pouvant joindre le port peut reset tes clés. Renseigne 'reset_server_token' dans proxy_configs.json.
+[2026-08-27 13:17:15] [ZRotate] ✅ Serveur de reset HTTP démarré sur 0.0.0.0:8080 (URL: /reset?proxy=p:PORT)
+[2026-08-27 13:17:15] [ZRotate] 🔒 Sécurité reset : cooldown 10s/clé
+[2026-08-27 13:17:15] [ZRotate] ⚠️ Serveur de reset SANS authentification (ni token ni liste blanche IP) : n'importe qui pouvant joindre le port peut reset tes clés. Renseigne 'reset_server_token' dans proxy_configs.json.
+[RESET-HTTP] Désactivation du serveur de reset
+[2026-08-27 13:17:16] [ZRotate] [RESET-HTTP] Désactivation du serveur de reset
+⏹️ Serveur de reset HTTP arrêté
+[2026-08-27 13:17:16] [ZRotate] ⏹️ Serveur de reset HTTP arrêté
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:19:32 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:23:28 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:24:31 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:24:48 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:25:23 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:26:42 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:29:38 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:32:38 ==========
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN][MINI] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN][MINI] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN][MINI] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:32:48 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:35:06 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:38:01 ==========
+[UPDATE] 31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)
+[SHUTDOWN] closeEvent reçu, arrêt de l'application...
+[SHUTDOWN] Arrêt des ProxyThread...
+[SHUTDOWN] Arrêt proxy pour interface 'Cle 101'...
+[SHUTDOWN] Fermeture de la fenêtre principale.
+
+========== session 2026-08-27 13:53:28 ==========
+[UPDATE] Mise a jour disponible (local=31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 -> distant=33068303247-9d709b6f2b49ba3384b5b1254d4391ca0e25e12d).
+[UPDATE] ProxyZUpdater lance.
+[UPDATE] ProxyZ ne demarre pas — utilisez le bouton « Lancer ProxyZ » dans ProxyZUpdater une fois la mise a jour terminee.
