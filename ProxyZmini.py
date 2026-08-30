@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
     QMainWindow,
@@ -30,11 +31,9 @@ class ProxyZMiniWindow(MainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ProxyZmini - 0 Co / 0 Prox")
-        self.resize(400, 900)
+        self.resize(420, 900)
         self.setMinimumWidth(420)
         self.setMaximumWidth(420)
-        # self.setMinimumHeight(920)
-        # self.setMaximumHeight(920)
 
     def _build_ui(self):
         central = QWidget()
@@ -42,12 +41,14 @@ class ProxyZMiniWindow(MainWindow):
         self.setCentralWidget(central)
 
         main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(0, 24, 0, 24)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
         interfaces_panel = QWidget(central)
         interfaces_panel.setObjectName("interfacesPanel")
-        interfaces_panel.setFixedSize(400, 900)
+        interfaces_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
 
         left = QVBoxLayout(interfaces_panel)
         left.setContentsMargins(12, 12, 12, 12)
@@ -55,10 +56,6 @@ class ProxyZMiniWindow(MainWindow):
 
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
-
-        title = QLabel("ProxyZmini")
-        title.setObjectName("titleLabel")
-        title_row.addWidget(title)
 
         self.global_settings_button = QPushButton()
         self.global_settings_button.setObjectName("globalSettingsButton")
@@ -68,13 +65,16 @@ class ProxyZMiniWindow(MainWindow):
         self.global_settings_button.clicked.connect(
             lambda: self.on_interface_settings_requested("")
         )
-        title_row.addStretch(1)
+        self.add_remote_iface_button = QPushButton("+")
+        self.add_remote_iface_button.setObjectName("addRemoteIfaceButton")
+        self.add_remote_iface_button.setToolTip("Ajouter une interface réseau distante")
+        self.add_remote_iface_button.setFixedHeight(34)
+        self.add_remote_iface_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_remote_iface_button.clicked.connect(self._on_add_remote_interface)
         title_row.addWidget(self.global_settings_button)
+        title_row.addWidget(self.add_remote_iface_button)
+        title_row.addStretch(1)
         left.addLayout(title_row)
-
-        self.global_status_label = QLabel("0 connexion / 0 proxy")
-        self.global_status_label.setObjectName("globalStatus")
-        left.addWidget(self.global_status_label)
 
         self.auto_container = QWidget()
         self.auto_layout = QVBoxLayout(self.auto_container)
@@ -82,19 +82,6 @@ class ProxyZMiniWindow(MainWindow):
         self.auto_layout.setSpacing(6)
         self.auto_container.setMaximumWidth(620)
         left.addWidget(self.auto_container)
-
-        interfaces_header = QHBoxLayout()
-        interfaces_header.setSpacing(8)
-        interfaces_list_label = QLabel("Interfaces")
-        interfaces_list_label.setObjectName("globalStatus")
-        interfaces_header.addWidget(interfaces_list_label)
-        interfaces_header.addStretch(1)
-        self.add_remote_iface_button = QPushButton("+")
-        self.add_remote_iface_button.setObjectName("addRemoteIfaceButton")
-        self.add_remote_iface_button.setToolTip("Ajouter une interface réseau distante")
-        self.add_remote_iface_button.clicked.connect(self._on_add_remote_interface)
-        interfaces_header.addWidget(self.add_remote_iface_button)
-        left.addLayout(interfaces_header)
 
         self.manual_list = ManualInterfacesList()
         self.manual_list.order_changed.connect(self.on_manual_order_changed)
@@ -123,21 +110,14 @@ class ProxyZMiniWindow(MainWindow):
         self.setStyleSheet(
             """
             QMainWindow {
-                background-color: #000b1a;
+                background-color: #011324;
             }
             QWidget#mainWidget {
-                background: qradialgradient(
-                    cx:0.5, cy:0.25, radius:1.1,
-                    fx:0.5, fy:0.25,
-                    stop:0   #0a7ce5,
-                    stop:0.55 #0258b8,
-                    stop:1   #02173a
-                );
+                background-color: #011324;
             }
             QWidget#interfacesPanel {
                 background-color: #011324;
-                border-radius: 18px;
-                border: 1px solid rgba(15, 23, 42, 0.9);
+                border: none;
             }
             QLabel#titleLabel {
                 color: #ecf0f1;
@@ -175,6 +155,27 @@ class ProxyZMiniWindow(MainWindow):
             QPushButton#globalSettingsButton:hover {
                 background-color: #2563eb;
             }
+            QPushButton#addRemoteIfaceButton {
+                background-color: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #34d399,
+                    stop:0.55 #22c55e,
+                    stop:1 #16a34a
+                );
+                color: #f9fafb;
+                border-radius: 17px;
+                border: 1px solid rgba(15, 23, 42, 0.9);
+                font-size: 13px;
+                font-weight: 600;
+                letter-spacing: 0.02em;
+                min-height: 34px;
+                max-height: 34px;
+                padding: 0 18px;
+            }
+            QPushButton#addRemoteIfaceButton:hover {
+                background-color: #22c55e;
+                color: #ffffff;
+            }
             """
         )
 
@@ -190,10 +191,6 @@ class ProxyZMiniWindow(MainWindow):
 
         self.setWindowTitle(
             f"ProxyZmini - {online_count} Co / {self.active_proxies} Prox"
-        )
-        self.global_status_label.setText(
-            f"{online_count} connexion{'s' if online_count != 1 else ''} / "
-            f"{self.active_proxies} proxy actif{'s' if self.active_proxies != 1 else ''}"
         )
 
     # Neutralisation des hooks ZRotate appelés par la classe parente.

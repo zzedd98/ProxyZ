@@ -147,3 +147,9 @@
 [UPDATE] Mise a jour disponible (local=31166090867-5c56d0ac76114bb9b342325f8c7148f9b6b1c9c3 -> distant=33068303247-9d709b6f2b49ba3384b5b1254d4391ca0e25e12d).
 [UPDATE] ProxyZUpdater lance.
 [UPDATE] ProxyZ ne demarre pas — utilisez le bouton « Lancer ProxyZ » dans ProxyZUpdater une fois la mise a jour terminee.
+
+========== session 2026-08-27 14:46:52 ==========
+[UPDATE] 33069377589-020c0701bdd4920c14cc324dfc7d78c9124d17d3 — logiciel a jour.
+[OK] Proxy écoute sur 127.0.0.1:101, envoi via l'IP source 192.168.8.101
+[BOOT] Serveur de reset HTTP : désactivé (port 8080) — case à cocher dans le panneau gauche
+[RESET] Warmup Playwright désactivé (playwright_warmup_enabled=false)

@@ -197,7 +197,10 @@
     "last_window_size": [
       1070,
       944
-    ]
+    ],
+    "zrotate_logs_enabled": false,
+    "connection_stats_enabled": false,
+    "stats_panel_enabled": false
   },
   "interface_aliases": {},
   "zrotate": {

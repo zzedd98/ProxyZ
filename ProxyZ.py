@@ -51,7 +51,7 @@ PERSIST_CONFIG_TO_DISK = False
 WARMUP_STAGGER_ENABLED = False
 WARMUP_STAGGER_SECONDS = 2.0
 # Valeur par défaut si absent de proxy_configs.json → "playwright_warmup_enabled"
-DEFAULT_PLAYWRIGHT_WARMUP_ENABLED = True
+DEFAULT_PLAYWRIGHT_WARMUP_ENABLED = False
 
 # Polling interfaces / IP publique (perf CPU-GPU, réactivité préservée sur changement réel)
 INTERFACE_REFRESH_BASE_MS = 5000
@@ -122,6 +122,14 @@ QLabel#resetAvgBadge {
     font-size: 11px;
     font-weight: 600;
 }
+QLabel#connStatsBadge {
+    background-color: rgba(46, 204, 113, 0.16);
+    color: #6ee7b7;
+    border-radius: 9px;
+    padding: 1px 6px;
+    font-size: 11px;
+    font-weight: 600;
+}
 QLabel#autoBadge {
     background-color: rgba(52, 152, 219, 0.18);
     color: #3498db;
@@ -156,20 +164,24 @@ QPushButton#remoteDeleteButton:hover {
     color: #ffffff;
 }
 QPushButton#addRemoteIfaceButton {
-    background-color: rgba(46, 204, 113, 0.2);
-    color: #2ecc71;
-    border-radius: 14px;
-    border: 1px solid rgba(46, 204, 113, 0.55);
-    font-size: 16px;
-    font-weight: 700;
-    min-width: 28px;
-    max-width: 28px;
-    min-height: 28px;
-    max-height: 28px;
-    padding: 0px;
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 #34d399,
+        stop:0.55 #22c55e,
+        stop:1 #16a34a
+    );
+    color: #f9fafb;
+    border-radius: 17px;
+    border: 1px solid rgba(15, 23, 42, 0.9);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    min-height: 34px;
+    max-height: 34px;
+    padding: 0 18px;
 }
 QPushButton#addRemoteIfaceButton:hover {
-    background-color: rgba(46, 204, 113, 0.45);
+    background-color: #22c55e;
     color: #ffffff;
 }
 QLabel#ipLabel {
@@ -603,6 +615,9 @@ class ProxyZUpdateInfo:
 
 
 def is_update_check_enabled() -> bool:
+    # En mode script (dev), inutile de vérifier les mises à jour au lancement.
+    if not getattr(sys, "frozen", False):
+        return False
     if (os.environ.get("PROXYZ_SKIP_UPDATE_CHECK") or "").strip() in (
         "1",
         "true",
@@ -1268,6 +1283,19 @@ class ProxyConfig:
 PROXY_MAX_CLIENT_THREADS = 256          # plafonne la création de threads clients
 PROXY_HEADER_READ_TIMEOUT_S = 20.0      # lecture des en-têtes de requête cliente
 PROXY_UPSTREAM_CONNECT_TIMEOUT_S = 12.0  # connexion vers destination / amont
+PROXY_RELAY_SOCKET_TIMEOUT_S = 180.0    # timeout relais TCP (auth peut durer ~3 min)
+
+# Robustesse ZRotate
+DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS = 180.0
+ZROTATE_MAX_CONCURRENT_CLIENTS = 1000
+ZROTATE_MAX_TUNNELS_PER_INTERFACE = 32
+CONSOLE_MAX_LINES = 2000
+DEFAULT_ZROTATE_LOGS_UI_ENABLED = True
+CONNECTION_STATS_REFRESH_MS = 2000
+DEFAULT_CONNECTION_STATS_UI_ENABLED = False
+DEFAULT_STATS_PANEL_ENABLED = True
+APP_BG_COLOR = "#011324"
+APP_PANEL_INNER_BG = "#0a2238"
 
 
 class ProxyThread(QThread):
@@ -1279,6 +1307,10 @@ class ProxyThread(QThread):
         self.running = False
         self.server_socket = None
         self._client_pool = None
+        self._client_slots = None
+        self._active_client_count = 0
+        self._active_client_lock = threading.Lock()
+        self._track_active_clients = True
         # Fournit l'IP source COURANTE de l'interface, relue à chaque connexion,
         # pour ne jamais binder une IP figée devenue périmée (sinon on risque de
         # sortir par la mauvaise clé). None => interface distante (bind inutile).
@@ -1328,6 +1360,17 @@ class ProxyThread(QThread):
             return fallback
         return None
 
+    @property
+    def active_client_count(self) -> int:
+        with self._active_client_lock:
+            return self._active_client_count
+
+    def set_track_active_clients(self, enabled: bool) -> None:
+        self._track_active_clients = bool(enabled)
+        if not self._track_active_clients:
+            with self._active_client_lock:
+                self._active_client_count = 0
+
     def run(self):
         self.running = True
         self.status_changed.emit(True)
@@ -1337,6 +1380,7 @@ class ProxyThread(QThread):
             max_workers=PROXY_MAX_CLIENT_THREADS,
             thread_name_prefix=f"proxy-{self.config.port}",
         )
+        self._client_slots = threading.Semaphore(PROXY_MAX_CLIENT_THREADS)
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1356,9 +1400,20 @@ class ProxyThread(QThread):
             while self.running:
                 try:
                     client_socket, _client_address = self.server_socket.accept()
+                    slots = self._client_slots
+                    if slots is not None and not slots.acquire(blocking=False):
+                        try:
+                            client_socket.close()
+                        except Exception:
+                            pass
+                        continue
                     try:
-                        self._client_pool.submit(self.handle_client, client_socket)
+                        self._client_pool.submit(
+                            self._run_client_with_slot, client_socket
+                        )
                     except RuntimeError:
+                        if slots is not None:
+                            slots.release()
                         # Pool en cours d'arrêt : on ferme la connexion proprement.
                         try:
                             client_socket.close()
@@ -1389,6 +1444,24 @@ class ProxyThread(QThread):
                 self.server_socket.close()
             except Exception:
                 pass
+
+    def _run_client_with_slot(self, client_socket):
+        """Relais client avec libération du slot backpressure."""
+        if self._track_active_clients:
+            with self._active_client_lock:
+                self._active_client_count += 1
+        try:
+            self.handle_client(client_socket)
+        finally:
+            if self._track_active_clients:
+                with self._active_client_lock:
+                    self._active_client_count = max(0, self._active_client_count - 1)
+            slots = self._client_slots
+            if slots is not None:
+                try:
+                    slots.release()
+                except ValueError:
+                    pass
 
     def handle_client(self, client_socket):
         try:
@@ -1536,19 +1609,33 @@ class ProxyThread(QThread):
 
     def relay_data(self, client_socket, server_socket):
         sockets = [client_socket, server_socket]
-        while self.running:
-            try:
-                readable, _, _ = select.select(sockets, [], [], 1)
-                for sock in readable:
-                    data = sock.recv(4096)
-                    if not data:
-                        return
-                    if sock is client_socket:
-                        server_socket.sendall(data)
-                    else:
-                        client_socket.sendall(data)
-            except Exception:
-                break
+        try:
+            client_socket.settimeout(PROXY_RELAY_SOCKET_TIMEOUT_S)
+            server_socket.settimeout(PROXY_RELAY_SOCKET_TIMEOUT_S)
+        except Exception:
+            pass
+        try:
+            while self.running:
+                try:
+                    readable, _, _ = select.select(sockets, [], [], 1)
+                    for sock in readable:
+                        data = sock.recv(4096)
+                        if not data:
+                            return
+                        if sock is client_socket:
+                            server_socket.sendall(data)
+                        else:
+                            client_socket.sendall(data)
+                except (socket.timeout, TimeoutError, OSError):
+                    return
+                except Exception:
+                    break
+        finally:
+            for sock in sockets:
+                try:
+                    sock.settimeout(None)
+                except Exception:
+                    pass
 
 
 @dataclass
@@ -2143,10 +2230,9 @@ def _host_is_ip_only(host: str) -> bool:
 class InterfaceQuotaManager:
     """Gestionnaire de quotas par interface.
 
-    - GET : 2 requêtes max par interface (ex. ipinfo.io/ip).
-    - CONNECT vers une IP (x.x.x.x, sans lettres) : 2 requêtes max par interface.
-    Les CONNECT vers des noms (haapi.ankama.com, waf, etc.) ne sont pas comptées.
-    Le reset est déclenché dès que le quota CONNECT game server atteint 2/2.
+    - CONNECT vers une IP (x.x.x.x, sans lettres) : N requêtes max par interface.
+    Les CONNECT vers des noms (haapi.ankama.com, waf, etc.) et les GET ne sont pas comptés.
+    Le reset est déclenché dès que le quota CONNECT game server atteint le max.
     """
 
     def __init__(
@@ -2154,12 +2240,14 @@ class InterfaceQuotaManager:
         egress_configs: list,
         quota_timeout_seconds: float = 60.0,
         max_requests_per_quota: int = 2,
+        max_tunnels_per_interface: int = ZROTATE_MAX_TUNNELS_PER_INTERFACE,
     ):
         """
         Args:
             egress_configs: Liste de dicts avec 'name' et 'ip' pour les proxies disponibles
             quota_timeout_seconds: Timeout pour réinitialiser les quotas partiels (défaut: 60s)
             max_requests_per_quota: Nombre maximum de requêtes par quota (défaut: 2)
+            max_tunnels_per_interface: Plafond tunnels CONNECT hostname par interface
         """
         self.egress_configs = egress_configs.copy()
         # Structure: {interface_name: {request_type: {domain: QuotaInfo}}}
@@ -2172,6 +2260,7 @@ class InterfaceQuotaManager:
         self._lock = asyncio.Lock()
         self.quota_timeout_seconds = quota_timeout_seconds
         self.max_requests_per_quota = max_requests_per_quota
+        self.max_tunnels_per_interface = max(1, int(max_tunnels_per_interface))
         self._cleanup_task: Optional[asyncio.Task] = None
         self._retry_reset_task: Optional[asyncio.Task] = None
         self._reset_callback: Optional[Callable] = (
@@ -2259,9 +2348,7 @@ class InterfaceQuotaManager:
             self._interface_available_event.clear()
 
     def _is_important_request(self, request_type: str, host: str, port: int) -> bool:
-        """Compte : GET (tous), et CONNECT vers une IP (chiffres et points uniquement)."""
-        if request_type == "GET":
-            return True
+        """Compte uniquement les CONNECT vers une IP (game server). Les GET ne consomment plus de quota."""
         if request_type == "CONNECT":
             return _host_is_ip_only(host)
         return False
@@ -2269,9 +2356,7 @@ class InterfaceQuotaManager:
     def _get_quota_key_for_important(
         self, request_type: str, host: str, port: int
     ) -> str:
-        """Clé de quota : GET → 'get', CONNECT IP → 'game_server'."""
-        if request_type == "GET":
-            return GET_QUOTA_KEY
+        """Clé de quota : CONNECT IP → 'game_server'."""
         return GAME_SERVER_QUOTA_KEY
 
     def set_reset_callback(self, callback: Callable):
@@ -2589,6 +2674,14 @@ class InterfaceQuotaManager:
         """Génère une clé de domaine pour le quota"""
         return f"{host}:{port}"
 
+    def _count_non_important_tunnels(self, interface_name: str) -> int:
+        return sum(
+            1
+            for c in self._active_connections.values()
+            if c.get("interface_name") == interface_name
+            and not c.get("is_important", False)
+        )
+
     async def get_interface_for_request(
         self, request_type: str, host: str, port: int, connection_id: int
     ) -> Optional[Dict[str, str]]:
@@ -2613,18 +2706,20 @@ class InterfaceQuotaManager:
                 # Requête non importante : prioriser les interfaces avec le moins de connexions actives
                 eligible = [
                     (
-                        sum(
-                            1
-                            for c in self._active_connections.values()
-                            if c["interface_name"] == info["name"]
-                        ),
+                        self._count_non_important_tunnels(info["name"]),
                         info,
                     )
                     for info in self.available_interfaces
                     if info["name"] not in self.resetting_interfaces
                     and info["name"] not in self._quarantine_interfaces
+                    and self._count_non_important_tunnels(info["name"])
+                    < self.max_tunnels_per_interface
                 ]
                 if not eligible:
+                    logger.warning(
+                        f"[QUOTA] Aucune interface disponible pour tunnel {request_type} "
+                        f"{host}:{port} (plafond {self.max_tunnels_per_interface}/interface)"
+                    )
                     return None
                 eligible.sort(key=lambda x: x[0])
                 interface_info = eligible[0][1]
@@ -2971,27 +3066,16 @@ class InterfaceQuotaManager:
 
     async def get_quota_stats(self) -> dict:
         """
-        Retourne un snapshot des quotas par interface pour l'UI.
-        Dict[interface_name, {"get": (used, max), "connect": (used, max)}].
+        Retourne un snapshot des quotas CONNECT par interface pour l'UI.
+        Dict[interface_name, {"connect": (used, max)}].
         used = completed_requests + temporary_requests.
         """
         async with self._lock:
             result = {}
             for info in self.egress_configs:
                 name = info["name"]
-                get_used, get_max = 0, self.max_requests_per_quota
                 connect_used, connect_max = 0, self.max_requests_per_quota
                 if name in self.quotas:
-                    # GET : on affiche les GET en attente + les temporaires (les GET déjà "appariés"
-                    # avec un CONNECT sont comptés côté CONNECT).
-                    if (
-                        "GET" in self.quotas[name]
-                        and GET_QUOTA_KEY in self.quotas[name]["GET"]
-                    ):
-                        q = self.quotas[name]["GET"][GET_QUOTA_KEY]
-                        pending_gets = self._pending_gets.get(name, 0)
-                        get_used = q.temporary_requests + pending_gets
-                        get_max = q.max_requests
                     if (
                         "CONNECT" in self.quotas[name]
                         and GAME_SERVER_QUOTA_KEY in self.quotas[name]["CONNECT"]
@@ -3000,10 +3084,19 @@ class InterfaceQuotaManager:
                         connect_used = q.completed_requests + q.temporary_requests
                         connect_max = q.max_requests
                 result[name] = {
-                    "get": (get_used, get_max),
                     "connect": (connect_used, connect_max),
                 }
             return result
+
+    async def get_active_connection_counts(self) -> dict[str, int]:
+        """Connexions ZRotate actuellement suivies, par interface."""
+        async with self._lock:
+            counts: dict[str, int] = {}
+            for conn in self._active_connections.values():
+                name = conn.get("interface_name")
+                if name:
+                    counts[name] = counts.get(name, 0) + 1
+            return counts
 
     async def get_quarantine_snapshot(self) -> list[str]:
         """Noms d'interfaces en quarantaine (ZRotate), triés pour l'UI."""
@@ -3687,7 +3780,9 @@ class ZRotateSingleProxyServer:
         egress_configs: Optional[list] = None,
         max_requests_per_quota: int = 2,
         quota_timeout_seconds: float = 60.0,
-        close_haapi_tunnel_after_seconds: float = 0.0,
+        close_haapi_tunnel_after_seconds: float = DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS,
+        max_concurrent_clients: int = ZROTATE_MAX_CONCURRENT_CLIENTS,
+        max_tunnels_per_interface: int = ZROTATE_MAX_TUNNELS_PER_INTERFACE,
     ):
         """
         Args:
@@ -3696,13 +3791,17 @@ class ZRotateSingleProxyServer:
             egress_configs: Liste de configs egress (défaut: EGRESS_IPS)
             max_requests_per_quota: Nombre max de requêtes GET/CONNECT par IP (défaut: 2)
             quota_timeout_seconds: Timeout pour réinitialiser les quotas partiels (défaut: 60s)
-            close_haapi_tunnel_after_seconds: Si > 0, ferme les tunnels CONNECT vers haapi après ce délai (secondes). 0 = désactivé.
+            close_haapi_tunnel_after_seconds: Ferme les tunnels CONNECT hostname après ce délai (s).
+            max_concurrent_clients: Plafond global de connexions client simultanées.
+            max_tunnels_per_interface: Plafond tunnels hostname par interface.
         """
         self.host = host
         self.port = port
         self._close_haapi_tunnel_after_seconds = max(
             0.0, float(close_haapi_tunnel_after_seconds)
         )
+        self._max_concurrent_clients = max(1, int(max_concurrent_clients))
+        self._client_semaphore = asyncio.Semaphore(self._max_concurrent_clients)
         egress_configs = egress_configs or EGRESS_IPS
 
         # Validation des egress IPs au démarrage
@@ -3731,6 +3830,7 @@ class ZRotateSingleProxyServer:
             valid_configs,
             max_requests_per_quota=max_requests_per_quota,
             quota_timeout_seconds=quota_timeout_seconds,
+            max_tunnels_per_interface=max_tunnels_per_interface,
         )
         # Garder l'ancien sélecteur pour compatibilité (non utilisé si quota_manager est actif)
         self.egress_selector = RoundRobinEgressSelector(valid_configs)
@@ -3809,7 +3909,41 @@ class ZRotateSingleProxyServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ):
-        """Gère une connexion client"""
+        """Gère une connexion client (plafond global de connexions simultanées)."""
+        acquired = False
+        try:
+            try:
+                await asyncio.wait_for(self._client_semaphore.acquire(), timeout=0)
+                acquired = True
+            except (asyncio.TimeoutError, TimeoutError):
+                try:
+                    writer.write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+                    writer.write(
+                        b"Server busy: too many concurrent connections.\r\n"
+                    )
+                    await writer.drain()
+                except Exception:
+                    pass
+                return
+
+            await self._handle_client_inner(reader, writer)
+        finally:
+            if acquired:
+                self._client_semaphore.release()
+            else:
+                try:
+                    if not writer.is_closing():
+                        writer.close()
+                        await writer.wait_closed()
+                except Exception:
+                    pass
+
+    async def _handle_client_inner(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ):
+        """Corps du traitement client (après acquisition du semaphore global)."""
         client_addr = writer.get_extra_info("peername")
         self._connection_counter += 1
         connection_id = self._connection_counter
@@ -3820,7 +3954,6 @@ class ZRotateSingleProxyServer:
         request_type = None
         dest_host = None
         dest_port = None
-        is_get_request = False
 
         # Extraire IP et port du client
         client_ip = client_addr[0] if client_addr else "unknown"
@@ -3853,7 +3986,6 @@ class ZRotateSingleProxyServer:
 
                 dest_host, dest_port = dest
                 request_type = "CONNECT"
-                is_get_request = False
             else:
                 # Requête HTTP proxy-form (GET http://...)
                 parsed = parse_http_proxy_request(request_lines)
@@ -3863,19 +3995,17 @@ class ZRotateSingleProxyServer:
                     )
                     writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
                     await writer.drain()
-                    # Si la première ligne ressemble à un GET, compter comme GET rejetée
-                    if first_line.upper().startswith("GET "):
-                        self.total_requests += 1
-                        self.rejected_requests += 1
                     return
 
                 dest_host = parsed["host"]
                 dest_port = parsed["port"]
                 request_type = parsed["method"]  # "GET", "POST", etc.
-                is_get_request = request_type.upper() == "GET"
 
-            # On a une requête valide à ce stade : ne compter en stats que les GET
-            if is_get_request:
+            # Compteur UI : uniquement CONNECT IP (celles qui consomment le quota CONNECT)
+            is_quota_connect = request_type == "CONNECT" and _host_is_ip_only(
+                dest_host or ""
+            )
+            if is_quota_connect:
                 self.total_requests += 1
 
             # Sélectionner l'interface selon le système utilisé
@@ -3897,7 +4027,7 @@ class ZRotateSingleProxyServer:
                         b"No interface available at the moment. Please try again later.\r\n"
                     )
                     await writer.drain()
-                    if is_get_request:
+                    if is_quota_connect:
                         self.rejected_requests += 1
                     return
             else:
@@ -3945,11 +4075,15 @@ class ZRotateSingleProxyServer:
                         await self.quota_manager.complete_request(
                             connection_id, success=False
                         )
+                    if is_quota_connect:
+                        self.rejected_requests += 1
                     return
 
                 # Répondre au client
                 writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 await writer.drain()
+                if is_quota_connect:
+                    self.successful_requests += 1
 
                 # Fermer les tunnels CONNECT vers un hostname (haapi, waf, etc.) après N secondes
                 # pour ne pas garder les interfaces bloquées. CONNECT vers IP (game server) restent ouvertes.
@@ -4003,8 +4137,6 @@ class ZRotateSingleProxyServer:
                         await self.quota_manager.complete_request(
                             connection_id, success=False
                         )
-                    if is_get_request:
-                        self.rejected_requests += 1
                     return
 
                 logger.info(
@@ -4059,8 +4191,6 @@ class ZRotateSingleProxyServer:
                         await self.quota_manager.complete_request(
                             connection_id, success=False
                         )
-                    if is_get_request:
-                        self.rejected_requests += 1
                     return
 
                 # Envoyer la requête reconstruite
@@ -4081,8 +4211,6 @@ class ZRotateSingleProxyServer:
 
                 # Relay bidirectionnel (avec Connection: close, on ferme après réponse)
                 try:
-                    if is_get_request:
-                        self.successful_requests += 1
                     await asyncio.gather(
                         pipe(reader, upstream_writer),
                         pipe(upstream_reader, writer),
@@ -4550,6 +4678,7 @@ class ZRotateProxyServer(QThread):
     )  # dict[interface_name, {"get": (used, max), "connect": (used, max)}]
     quarantine_updated = Signal(object)  # list[str] noms en quarantaine
     pool_state_updated = Signal(object)  # dict[name, {in_pool, resetting, quarantine}]
+    active_connection_counts_updated = Signal(object)  # dict[str, int]
 
     def __init__(
         self,
@@ -4558,7 +4687,9 @@ class ZRotateProxyServer(QThread):
         port: int = 9999,
         max_requests_per_quota: int = 2,
         quota_timeout_seconds: float = 60.0,
-        close_haapi_tunnel_after_seconds: float = 0.0,
+        close_haapi_tunnel_after_seconds: float = DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS,
+        max_concurrent_clients: int = ZROTATE_MAX_CONCURRENT_CLIENTS,
+        max_tunnels_per_interface: int = ZROTATE_MAX_TUNNELS_PER_INTERFACE,
     ):
         """
         Args:
@@ -4567,7 +4698,9 @@ class ZRotateProxyServer(QThread):
             port: Port d'écoute
             max_requests_per_quota: Nombre max de requêtes GET/CONNECT par IP (proxy_configs.json)
             quota_timeout_seconds: Timeout pour réinitialiser les quotas partiels
-            close_haapi_tunnel_after_seconds: Si > 0, ferme les tunnels CONNECT haapi après ce délai (0 = désactivé)
+            close_haapi_tunnel_after_seconds: Ferme les tunnels CONNECT hostname après ce délai (s)
+            max_concurrent_clients: Plafond global de connexions client simultanées
+            max_tunnels_per_interface: Plafond tunnels hostname par interface
         """
         super().__init__()
         self.egress_configs = egress_configs
@@ -4576,9 +4709,37 @@ class ZRotateProxyServer(QThread):
         self.max_requests_per_quota = max_requests_per_quota
         self.quota_timeout_seconds = quota_timeout_seconds
         self.close_haapi_tunnel_after_seconds = close_haapi_tunnel_after_seconds
+        self.max_concurrent_clients = max_concurrent_clients
+        self.max_tunnels_per_interface = max_tunnels_per_interface
         self.running = False
         self.loop = None
         self.proxy_server: Optional[ZRotateSingleProxyServer] = None
+        self._emit_stats_summary = True
+        self._emit_connection_counts = True
+        self._emit_ui_logs = True
+        self._zrotate_log_handler: Optional[logging.Handler] = None
+
+    def set_stats_backend(
+        self, *, stats_summary: bool, connection_counts: bool
+    ) -> None:
+        self._emit_stats_summary = bool(stats_summary)
+        self._emit_connection_counts = bool(connection_counts)
+
+    def set_ui_logs_enabled(self, enabled: bool) -> None:
+        self._emit_ui_logs = bool(enabled)
+        import logging
+
+        logger = logging.getLogger("zrotate_single_proxy")
+        handler = self._zrotate_log_handler
+        if handler is None:
+            return
+        if self._emit_ui_logs:
+            if handler not in logger.handlers:
+                logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+        else:
+            logger.removeHandler(handler)
+            logger.setLevel(logging.CRITICAL + 1)
 
     async def _publish_stats_loop(self):
         """Publie périodiquement les statistiques de ZRotate vers l'UI."""
@@ -4586,10 +4747,13 @@ class ZRotateProxyServer(QThread):
         while self.running:
             try:
                 if self.proxy_server is not None:
-                    total = getattr(self.proxy_server, "total_requests", 0)
-                    successful = getattr(self.proxy_server, "successful_requests", 0)
-                    rejected = getattr(self.proxy_server, "rejected_requests", 0)
-                    self.stats_updated.emit(int(total), int(successful), int(rejected))
+                    if self._emit_stats_summary:
+                        total = getattr(self.proxy_server, "total_requests", 0)
+                        successful = getattr(self.proxy_server, "successful_requests", 0)
+                        rejected = getattr(self.proxy_server, "rejected_requests", 0)
+                        self.stats_updated.emit(
+                            int(total), int(successful), int(rejected)
+                        )
                     qm = getattr(self.proxy_server, "quota_manager", None)
                     if qm is not None:
                         stats = await qm.get_quota_stats()
@@ -4598,6 +4762,9 @@ class ZRotateProxyServer(QThread):
                         self.quarantine_updated.emit(qlist)
                         pool_snap = await qm.get_pool_ui_snapshot()
                         self.pool_state_updated.emit(pool_snap)
+                        if self._emit_connection_counts:
+                            conn_counts = await qm.get_active_connection_counts()
+                            self.active_connection_counts_updated.emit(conn_counts)
             except Exception:
                 pass
             # Intervalle raisonnable pour l'UI sans charger la boucle
@@ -4618,6 +4785,8 @@ class ZRotateProxyServer(QThread):
                 max_requests_per_quota=self.max_requests_per_quota,
                 quota_timeout_seconds=self.quota_timeout_seconds,
                 close_haapi_tunnel_after_seconds=self.close_haapi_tunnel_after_seconds,
+                max_concurrent_clients=self.max_concurrent_clients,
+                max_tunnels_per_interface=self.max_tunnels_per_interface,
             )
 
             # Rediriger les logs vers le signal Qt
@@ -4626,9 +4795,12 @@ class ZRotateProxyServer(QThread):
             logger = logging.getLogger("zrotate_single_proxy")
             # Retirer les handlers existants pour éviter le double logging
             logger.handlers.clear()
-            handler = LogHandler(self.log_message)
-            logger.addHandler(handler)
-            logger.setLevel(logging.INFO)
+            self._zrotate_log_handler = LogHandler(self.log_message)
+            if self._emit_ui_logs:
+                logger.addHandler(self._zrotate_log_handler)
+                logger.setLevel(logging.INFO)
+            else:
+                logger.setLevel(logging.CRITICAL + 1)
             # Empêcher la propagation vers le logger root pour éviter le double affichage
             logger.propagate = False
 
@@ -5089,6 +5261,7 @@ class InterfaceWidget(QFrame):
     delete_requested = Signal(str)  # interface distante
     edit_requested = Signal(str)  # interface distante
     user_interaction = Signal()  # toute interaction utilisateur sur ce widget
+    console_requested = Signal(str)  # clic simple → console de l'interface
 
     def __init__(self, interface: InterfaceInfo, parent=None):
         super().__init__(parent)
@@ -5103,6 +5276,9 @@ class InterfaceWidget(QFrame):
         self._reset_in_use = (
             False  # True si la clé a une requête/connexion en cours (ZRotate)
         )
+        self._conn_stats_enabled = False
+        self._drag_press_pos: QPoint | None = None
+        self._drag_started = False
 
         self.setObjectName("interfaceCard")
         self.setMinimumHeight(84)
@@ -5183,6 +5359,11 @@ class InterfaceWidget(QFrame):
         self.proxy_status_chip.installEventFilter(self)
         self.proxy_status_chip.setCursor(Qt.PointingHandCursor)
         status_col.addWidget(self.proxy_status_chip, 0, Qt.AlignRight)
+
+        self.conn_stats_badge = QLabel()
+        self.conn_stats_badge.setObjectName("connStatsBadge")
+        self.conn_stats_badge.setVisible(False)
+        status_col.addWidget(self.conn_stats_badge, 0, Qt.AlignRight)
 
         info_row.addLayout(status_col, 1)
         main_layout.addLayout(info_row)
@@ -5401,6 +5582,24 @@ class InterfaceWidget(QFrame):
             if self.reset_badge.text() != txt:
                 self.reset_badge.setText(txt)
 
+    def set_connection_stats_enabled(self, enabled: bool) -> None:
+        self._conn_stats_enabled = enabled
+        if not enabled:
+            self.conn_stats_badge.setVisible(False)
+
+    def update_connection_stats(self, total: int) -> None:
+        if not self._conn_stats_enabled:
+            return
+        if total <= 0:
+            if self.conn_stats_badge.isVisible():
+                self.conn_stats_badge.setVisible(False)
+            return
+        txt = f"{total} co"
+        if self.conn_stats_badge.text() != txt:
+            self.conn_stats_badge.setText(txt)
+        if not self.conn_stats_badge.isVisible():
+            self.conn_stats_badge.setVisible(True)
+
     def _update_reset_loading_animation(self):
         """Met à jour l'animation de loading du bouton reset"""
         if self._reset_loading:
@@ -5437,6 +5636,71 @@ class InterfaceWidget(QFrame):
             return True
         return super().eventFilter(obj, event)
 
+    def _parent_list(self) -> Optional[QListWidget]:
+        parent = self.parentWidget()
+        while parent is not None and not isinstance(parent, QListWidget):
+            parent = parent.parentWidget()
+        return parent
+
+    def _is_drag_blocked_target(self, child: Optional[QWidget]) -> bool:
+        """True si le clic vise un contrôle interactif (pas de drag)."""
+        while child is not None and child is not self:
+            if isinstance(child, (QLineEdit, QPushButton, QAbstractSpinBox, QComboBox)):
+                return True
+            if child is getattr(self, "reset_badge", None):
+                return True
+            if child is getattr(self, "proxy_status_chip", None):
+                return True
+            if child is getattr(self, "delete_button", None):
+                return True
+            child = child.parentWidget()
+        return False
+
+    def mousePressEvent(self, event):
+        self.user_interaction.emit()
+        self._drag_press_pos = None
+        self._drag_started = False
+        if event.button() == Qt.LeftButton:
+            child = self.childAt(event.pos())
+            if not self._is_drag_blocked_target(child):
+                self._drag_press_pos = QPoint(event.pos())
+                list_w = self._parent_list()
+                if list_w is not None:
+                    for row in range(list_w.count()):
+                        item = list_w.item(row)
+                        if list_w.itemWidget(item) is self:
+                            list_w.setCurrentItem(item)
+                            break
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._drag_press_pos is not None
+            and (event.buttons() & Qt.LeftButton)
+            and not self._drag_started
+        ):
+            if (
+                event.pos() - self._drag_press_pos
+            ).manhattanLength() >= QApplication.startDragDistance():
+                self._drag_started = True
+                self._drag_press_pos = None
+                list_w = self._parent_list()
+                if list_w is not None:
+                    list_w.startDrag(Qt.MoveAction)
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (
+            event.button() == Qt.LeftButton
+            and self._drag_press_pos is not None
+            and not self._drag_started
+        ):
+            self.console_requested.emit(self.interface_name)
+        self._drag_press_pos = None
+        self._drag_started = False
+        super().mouseReleaseEvent(event)
+
 
 class ManualInterfacesList(QListWidget):
     order_changed = Signal(list)  # list of interface names
@@ -5448,7 +5712,8 @@ class ManualInterfacesList(QListWidget):
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDefaultDropAction(Qt.MoveAction)
-        self.setSelectionMode(QAbstractItemView.NoSelection)
+        # SingleSelection requis pour InternalMove (NoSelection cassait le drag).
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setDragDropMode(QAbstractItemView.InternalMove)
         # Cartes un peu plus rapprochées
         self.setSpacing(4)
@@ -5458,6 +5723,9 @@ class ManualInterfacesList(QListWidget):
             QListWidget::item {
                 padding: 0px;
                 margin: 0px;
+            }
+            QListWidget::item:selected {
+                background: transparent;
             }
             """
         )
@@ -5520,13 +5788,6 @@ class ZRotateInterfaceRow(QFrame):
         stats_layout.setContentsMargins(0, 0, 0, 0)
         stats_layout.setSpacing(8)
 
-        self.get_chip = QLabel("0/2")
-        self.get_chip.setObjectName("zrotateGetChip")
-        self.get_chip.setAlignment(Qt.AlignCenter)
-        self.get_chip.setFixedWidth(74)
-        self.get_chip.setFixedHeight(22)
-        stats_layout.addWidget(self.get_chip)
-
         self.connect_chip = QLabel("0/2")
         self.connect_chip.setObjectName("zrotateConnectChip")
         self.connect_chip.setAlignment(Qt.AlignCenter)
@@ -5565,19 +5826,14 @@ class ZRotateInterfaceRow(QFrame):
             # Ligne en cours de destruction pendant un refresh UI.
             pass
 
-    def set_quota_values(self, g_used: int, g_max: int, c_used: int, c_max: int):
-        get_txt = f"<b>{g_used}/{g_max}</b>"
+    def set_quota_values(self, c_used: int, c_max: int):
         con_txt = f"<b>{c_used}/{c_max}</b>"
-        if self.get_chip.text() != get_txt:
-            self.get_chip.setText(get_txt)
         if self.connect_chip.text() != con_txt:
             self.connect_chip.setText(con_txt)
 
     def _apply_checked_visual_state(self):
         enabled = self.is_checked()
-        self.get_chip.setVisible(enabled)
         self.connect_chip.setVisible(enabled)
-        self.get_chip.setEnabled(enabled)
         self.connect_chip.setEnabled(enabled)
         self.ip_chip.setEnabled(enabled)
         self.checkbox.setEnabled(True)
@@ -5630,13 +5886,6 @@ class ZRotateInterfacesHeaderRow(QFrame):
         stats_layout = QHBoxLayout(self.stats_widget)
         stats_layout.setContentsMargins(0, 0, 0, 0)
         stats_layout.setSpacing(8)
-
-        self.get_label = QLabel("GET")
-        self.get_label.setObjectName("zrotateHeaderChip")
-        self.get_label.setAlignment(Qt.AlignCenter)
-        self.get_label.setFixedWidth(74)
-        self.get_label.setFixedHeight(22)
-        stats_layout.addWidget(self.get_label)
 
         self.connect_label = QLabel("CONNECT")
         self.connect_label.setObjectName("zrotateHeaderChip")
@@ -5708,10 +5957,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ProxyZ - 0 proxy actif")
-        # Taille minimale = deux panneaux (400 + 540) + espacement + marges, hauteur agrandie de 50%
-        self.setMinimumSize(
-            1070, 944
-        )  # Largeur: 400 + 540 + 20 espacement + marges ≈ 1070, Hauteur: 644 * 1.5 ≈ 966, arrondi à 944
+        self.setMinimumSize(1070, 700)
 
         try:
             self.interface_manager = InterfaceManager(self)
@@ -5776,12 +6022,19 @@ class MainWindow(QMainWindow):
 
         self._console_view: str | None = None
         self._console_lines: dict[str | None, list[str]] = {None: []}
+        self.logs_panel_enabled = DEFAULT_ZROTATE_LOGS_UI_ENABLED
+        self.connection_stats_ui_enabled = DEFAULT_CONNECTION_STATS_UI_ENABLED
+        self.stats_panel_enabled = DEFAULT_STATS_PANEL_ENABLED
+        self._zrotate_conn_counts: dict[str, int] = {}
         self._iface_by_port: dict[int, str] = {}
         self._remote_public_ip_inflight: set[str] = set()
         self._remote_public_ip_inflight_lock = threading.Lock()
         self._remote_public_ip_last_ok: dict[str, tuple[str, float]] = {}
 
         self._build_ui()
+        self._connection_stats_timer = QTimer(self)
+        self._connection_stats_timer.setInterval(CONNECTION_STATS_REFRESH_MS)
+        self._connection_stats_timer.timeout.connect(self._refresh_connection_stats_ui)
         self._load_config()
 
         self.interface_manager.interfaces_updated.connect(self.on_interfaces_updated)
@@ -5933,29 +6186,26 @@ class MainWindow(QMainWindow):
         central.setObjectName("mainWidget")
         self.setCentralWidget(central)
 
-        # Marges fixes autour du panneau pour un rendu symétrique et esthétique
+        # Panneaux sombres en plein écran (plus de bandeau bleu clair autour)
         main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(
-            24, 24, 24, 24
-        )  # Marges symétriques : gauche, haut, droite, bas
+        main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Panneau interfaces (panneau unique 400x900 - agrandi de 50%)
+        # Panneau interfaces : largeur fixe, hauteur = toute la fenêtre
         interfaces_panel = QWidget(central)
         interfaces_panel.setObjectName("interfacesPanel")
-        interfaces_panel.setFixedSize(400, 900)
+        interfaces_panel.setFixedWidth(400)
+        interfaces_panel.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+        )
 
         left = QVBoxLayout(interfaces_panel)
         left.setContentsMargins(12, 12, 12, 12)
         left.setSpacing(10)
 
-        # Ligne titre + bouton paramètres réseau global (sur la même hauteur)
+        # Ligne boutons (Options / paramètres / ajout interface distante)
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
-
-        title = QLabel("ProxyZ")
-        title.setObjectName("titleLabel")
-        title_row.addWidget(title)
 
         # Bouton paramètres réseau global
         self.global_settings_button = QPushButton()
@@ -5967,40 +6217,28 @@ class MainWindow(QMainWindow):
         self.global_settings_button.clicked.connect(
             lambda: self.on_interface_settings_requested("")
         )
-        # Laisse le titre à gauche et pousse le bouton vers le centre/droite
-        title_row.addStretch(1)
+
+        # Options (warmup / serveur reset) en popup — sans flèche menu
+        self.options_button = QPushButton("Options")
+        self.options_button.setObjectName("globalSettingsButton")
+        self.options_button.setToolTip("Serveur de reset HTTP, logs et stats connexions")
+        self.options_button.setFixedHeight(34)
+        self.options_button.clicked.connect(self._show_options_menu)
+        self._build_options_menu()
+
+        self.add_remote_iface_button = QPushButton("+")
+        self.add_remote_iface_button.setObjectName("addRemoteIfaceButton")
+        self.add_remote_iface_button.setToolTip("Ajouter une interface réseau distante")
+        self.add_remote_iface_button.setFixedHeight(34)
+        self.add_remote_iface_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_remote_iface_button.clicked.connect(self._on_add_remote_interface)
+
+        title_row.addWidget(self.options_button)
         title_row.addWidget(self.global_settings_button)
+        title_row.addWidget(self.add_remote_iface_button)
+        title_row.addStretch(1)
 
         left.addLayout(title_row)
-
-        # Statut global juste sous le titre
-        self.global_status_label = QLabel("0 connexion / 0 proxy")
-        self.global_status_label.setObjectName("globalStatus")
-        left.addWidget(self.global_status_label)
-
-        self.playwright_warmup_checkbox = QCheckBox(
-            "Warmup Playwright au démarrage"
-        )
-        self.playwright_warmup_checkbox.setObjectName("playwrightWarmupCheckbox")
-        self.playwright_warmup_checkbox.setToolTip(
-            "Prépare les navigateurs reset (page modem) en arrière-plan au lancement. "
-            "Interfaces distantes toujours exclues."
-        )
-        self.playwright_warmup_checkbox.stateChanged.connect(
-            self._on_playwright_warmup_changed
-        )
-        left.addWidget(self.playwright_warmup_checkbox)
-
-        # Serveur HTTP de reset : permet à un générateur externe de reset une clé
-        # via GET /reset?proxy=p:PORT. Port/token configurables dans proxy_configs.json.
-        self.reset_server_checkbox = QCheckBox("Serveur de reset HTTP")
-        self.reset_server_checkbox.setObjectName("playwrightWarmupCheckbox")
-        self.reset_server_checkbox.setToolTip(
-            "Expose GET /reset?proxy=p:PORT pour déclencher le reset d'une clé "
-            "depuis un outil externe (générateur). Port/token dans proxy_configs.json."
-        )
-        self.reset_server_checkbox.stateChanged.connect(self._on_reset_server_toggled)
-        left.addWidget(self.reset_server_checkbox)
 
         self.auto_container = QWidget()
         self.auto_layout = QVBoxLayout(self.auto_container)
@@ -6009,19 +6247,6 @@ class MainWindow(QMainWindow):
         # Largeur raisonnable des cartes pour un rendu équilibré
         self.auto_container.setMaximumWidth(620)
         left.addWidget(self.auto_container)
-
-        interfaces_header = QHBoxLayout()
-        interfaces_header.setSpacing(8)
-        interfaces_list_label = QLabel("Interfaces")
-        interfaces_list_label.setObjectName("globalStatus")
-        interfaces_header.addWidget(interfaces_list_label)
-        interfaces_header.addStretch(1)
-        self.add_remote_iface_button = QPushButton("+")
-        self.add_remote_iface_button.setObjectName("addRemoteIfaceButton")
-        self.add_remote_iface_button.setToolTip("Ajouter une interface réseau distante")
-        self.add_remote_iface_button.clicked.connect(self._on_add_remote_interface)
-        interfaces_header.addWidget(self.add_remote_iface_button)
-        left.addLayout(interfaces_header)
 
         self.manual_list = ManualInterfacesList()
         self.manual_list.order_changed.connect(self.on_manual_order_changed)
@@ -6049,14 +6274,14 @@ class MainWindow(QMainWindow):
         # Ajouter le panneau d'interfaces à gauche
         splitter.addWidget(interfaces_panel)
 
-        # Panneau de droite pour ZRotate (agrandi de 50% en hauteur: 600 -> 900, et de 20% en largeur: 450 -> 540)
+        # Panneau de droite pour ZRotate : hauteur = toute la fenêtre
         zrotate_panel = QWidget(central)
         zrotate_panel.setObjectName("zrotatePanel")
-        zrotate_panel.setMinimumWidth(400)  # Largeur minimale
-        zrotate_panel.setMaximumWidth(
-            1200
-        )  # Largeur maximale pour permettre l'expansion
-        zrotate_panel.setFixedHeight(900)
+        zrotate_panel.setMinimumWidth(400)
+        zrotate_panel.setMaximumWidth(1200)
+        zrotate_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
 
         zrotate_layout = QVBoxLayout(zrotate_panel)
         zrotate_layout.setContentsMargins(12, 12, 12, 12)
@@ -6071,14 +6296,6 @@ class MainWindow(QMainWindow):
         tab_zrotate_layout = QVBoxLayout(tab_zrotate)
         tab_zrotate_layout.setContentsMargins(10, 10, 10, 10)
         tab_zrotate_layout.setSpacing(10)
-
-        zrotate_title = QLabel("ZRotate - Rotation d'IP")
-        zrotate_title.setObjectName("zrotateTitle")
-        tab_zrotate_layout.addWidget(zrotate_title)
-
-        interfaces_label = QLabel("Interfaces pour le pool d'IP:")
-        interfaces_label.setObjectName("zrotateLabel")
-        tab_zrotate_layout.addWidget(interfaces_label)
 
         self.zrotate_interfaces_list = QListWidget()
         self.zrotate_interfaces_list.setObjectName("zrotateInterfacesList")
@@ -6127,14 +6344,96 @@ class MainWindow(QMainWindow):
         self.zrotate_section_tabs.addTab(tab_zrotate, "ZRotate")
         self.zrotate_section_tabs.addTab(tab_quarantine, "Quarantaine")
 
-        # Panel bas : Console de logs
+        # Panel bas : boutons stats/logs + onglets Stats (défaut) / Logs
+        bottom_container = QWidget()
+        bottom_container.setObjectName("zrotateBottomContainer")
+        bottom_container_layout = QVBoxLayout(bottom_container)
+        bottom_container_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_container_layout.setSpacing(6)
+
+        stats_toggle_row = QHBoxLayout()
+        stats_toggle_row.setContentsMargins(0, 0, 0, 0)
+        stats_toggle_row.setSpacing(8)
+        stats_toggle_row.addStretch(1)
+        self.stats_panel_toggle_button = QPushButton("Désactiver les stats")
+        self.stats_panel_toggle_button.setObjectName("zrotateStatsToggleButton")
+        self.stats_panel_toggle_button.setCheckable(True)
+        self.stats_panel_toggle_button.setChecked(True)
+        self.stats_panel_toggle_button.setFixedHeight(28)
+        self.stats_panel_toggle_button.setToolTip(
+            "Arrête le suivi des stats (onglet masqué, plus de comptage ni de rafraîchissement)."
+        )
+        self.stats_panel_toggle_button.toggled.connect(self._on_stats_panel_toggled)
+        stats_toggle_row.addWidget(self.stats_panel_toggle_button)
+
+        self.logs_panel_toggle_button = QPushButton("Désactiver les logs")
+        self.logs_panel_toggle_button.setObjectName("zrotateStatsToggleButton")
+        self.logs_panel_toggle_button.setCheckable(True)
+        self.logs_panel_toggle_button.setChecked(True)
+        self.logs_panel_toggle_button.setFixedHeight(28)
+        self.logs_panel_toggle_button.setToolTip(
+            "Arrête la collecte des logs (onglet masqué, plus d'émission ni de buffer console)."
+        )
+        self.logs_panel_toggle_button.toggled.connect(self._on_logs_panel_toggled)
+        stats_toggle_row.addWidget(self.logs_panel_toggle_button)
+        bottom_container_layout.addLayout(stats_toggle_row)
+
+        bottom_tabs = QTabWidget()
+        bottom_tabs.setObjectName("zrotateBottomTabs")
+        self.zrotate_bottom_tabs = bottom_tabs
+
+        # --- Onglet Stats ---
+        stats_panel = QWidget()
+        stats_panel.setObjectName("zrotateStatsPanel")
+        stats_layout = QVBoxLayout(stats_panel)
+        stats_layout.setContentsMargins(10, 10, 10, 10)
+        stats_layout.setSpacing(6)
+
+        self.zrotate_stats_label = QLabel("0 CONNECT · 0 OK · 0 rejetée")
+        self.zrotate_stats_label.setObjectName("zrotateStatsLabel")
+        self.zrotate_stats_label.setToolTip(
+            "Compteur des CONNECT vers une IP (game server) — "
+            "celles qui consomment le quota CONNECT. Les CONNECT hostname et les GET sont exclus."
+        )
+        stats_layout.addWidget(self.zrotate_stats_label)
+
+        stats_header = QWidget()
+        stats_header_layout = QHBoxLayout(stats_header)
+        stats_header_layout.setContentsMargins(8, 2, 8, 2)
+        stats_header_layout.setSpacing(8)
+        h_name = QLabel("Interface")
+        h_name.setObjectName("zrotateStatsColHeader")
+        h_proxy = QLabel("Proxy")
+        h_proxy.setObjectName("zrotateStatsColHeader")
+        h_proxy.setFixedWidth(72)
+        h_proxy.setAlignment(Qt.AlignCenter)
+        h_zr = QLabel("ZRotate")
+        h_zr.setObjectName("zrotateStatsColHeader")
+        h_zr.setFixedWidth(80)
+        h_zr.setAlignment(Qt.AlignCenter)
+        h_total = QLabel("Total")
+        h_total.setObjectName("zrotateStatsColHeader")
+        h_total.setFixedWidth(64)
+        h_total.setAlignment(Qt.AlignCenter)
+        stats_header_layout.addWidget(h_name, 1)
+        stats_header_layout.addWidget(h_proxy)
+        stats_header_layout.addWidget(h_zr)
+        stats_header_layout.addWidget(h_total)
+        stats_layout.addWidget(stats_header)
+
+        self.connection_stats_list = QListWidget()
+        self.connection_stats_list.setObjectName("zrotateConnectionStatsList")
+        self.connection_stats_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.connection_stats_list.setFocusPolicy(Qt.NoFocus)
+        stats_layout.addWidget(self.connection_stats_list, 1)
+
+        # --- Onglet Logs ---
         console_panel = QWidget()
         console_panel.setObjectName("zrotateConsolePanel")
         console_layout = QVBoxLayout(console_panel)
         console_layout.setContentsMargins(10, 10, 10, 10)
         console_layout.setSpacing(5)
 
-        # Ligne titre + bouton clear
         console_title_row = QHBoxLayout()
         console_title_row.setSpacing(8)
 
@@ -6145,13 +6444,12 @@ class MainWindow(QMainWindow):
         self.zrotate_general_console_button.setVisible(False)
         console_title_row.addWidget(self.zrotate_general_console_button)
 
-        self.zrotate_console_title = QLabel("Console ZRotate")
+        self.zrotate_console_title = QLabel("Logs ZRotate")
         self.zrotate_console_title.setObjectName("zrotateTitle")
         console_title_row.addWidget(self.zrotate_console_title)
 
         console_title_row.addStretch(1)
 
-        # Bouton Clear
         self.zrotate_clear_button = QPushButton("Clear")
         self.zrotate_clear_button.setObjectName("zrotateClearButton")
         self.zrotate_clear_button.setFixedSize(60, 28)
@@ -6160,21 +6458,21 @@ class MainWindow(QMainWindow):
 
         console_layout.addLayout(console_title_row)
 
-        # Statistiques ZRotate (total / succès / rejets)
-        self.zrotate_stats_label = QLabel("0 requête · 0 OK · 0 rejetée")
-        self.zrotate_stats_label.setObjectName("zrotateStatsLabel")
-        console_layout.addWidget(self.zrotate_stats_label)
-
         self.zrotate_log_box = QTextEdit()
         self.zrotate_log_box.setReadOnly(True)
         self.zrotate_log_box.setObjectName("zrotateLogBox")
         console_layout.addWidget(self.zrotate_log_box, 1)
 
+        bottom_tabs.addTab(stats_panel, "Stats")
+        bottom_tabs.addTab(console_panel, "Logs")
+        bottom_tabs.setCurrentIndex(0)
+        bottom_container_layout.addWidget(bottom_tabs, 1)
+
         self.zrotate_vertical_splitter = QSplitter(Qt.Vertical)
         self.zrotate_vertical_splitter.setObjectName("zrotateVerticalSplitter")
         self.zrotate_vertical_splitter.setChildrenCollapsible(False)
         self.zrotate_vertical_splitter.addWidget(self.zrotate_section_tabs)
-        self.zrotate_vertical_splitter.addWidget(console_panel)
+        self.zrotate_vertical_splitter.addWidget(bottom_container)
         self.zrotate_vertical_splitter.setStretchFactor(0, 3)
         self.zrotate_vertical_splitter.setStretchFactor(1, 2)
         self.zrotate_vertical_splitter.setSizes([540, 360])
@@ -6200,22 +6498,15 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow {
-                background-color: #000b1a;
+                background-color: #011324;
             }
             QWidget#mainWidget {
-                background: qradialgradient(
-                    cx:0.5, cy:0.25, radius:1.1,
-                    fx:0.5, fy:0.25,
-                    stop:0   #0a7ce5,
-                    stop:0.55 #0258b8,
-                    stop:1   #02173a
-                );
+                background-color: #011324;
             }
             QWidget#interfacesPanel {
                 background-color: #011324;
-                border-radius: 18px;
-                border: 1px solid rgba(15, 23, 42, 0.9);
-                box-shadow: 0 12px 30px rgba(0, 0, 0, 0.65);
+                border: none;
+                border-right: 1px solid rgba(31, 41, 55, 0.9);
             }
             QLabel#titleLabel {
                 color: #ecf0f1;
@@ -6238,7 +6529,7 @@ class MainWindow(QMainWindow):
                 border: none;
             }
             QListWidget {
-                background-color: #02172e;
+                background-color: #011324;
                 border-radius: 12px;
                 border: 1px solid rgba(31, 41, 55, 0.9);
             }
@@ -6263,25 +6554,21 @@ class MainWindow(QMainWindow):
             }
             QWidget#zrotatePanel {
                 background-color: #011324;
-                border-radius: 18px;
-                border: 1px solid rgba(15, 23, 42, 0.9);
-                box-shadow: 0 12px 30px rgba(0, 0, 0, 0.65);
+                border: none;
             }
             QWidget#zrotateConfigPanel {
-                background-color: #02172e;
-                border-radius: 12px;
-                border: 1px solid rgba(31, 41, 55, 0.9);
+                background-color: #011324;
+                border: none;
             }
             QWidget#zrotateQuarantinePanel {
-                background-color: #02172e;
-                border-radius: 12px;
-                border: 1px solid rgba(31, 41, 55, 0.9);
+                background-color: #011324;
+                border: none;
             }
             QTabWidget#zrotateSectionTabs::pane {
-                border: 1px solid rgba(31, 41, 55, 0.9);
+                border: 1px solid rgba(31, 41, 55, 0.45);
                 border-radius: 10px;
                 top: -1px;
-                background-color: #02172e;
+                background-color: #011324;
             }
             QTabWidget#zrotateSectionTabs QTabBar::tab {
                 background-color: #1a2f45;
@@ -6295,21 +6582,21 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
             }
             QTabWidget#zrotateSectionTabs QTabBar::tab:selected {
-                background-color: #02172e;
+                background-color: #011324;
                 color: #ecf0f1;
                 font-weight: 600;
             }
             QTabWidget#zrotateSectionTabs QTabBar::tab:hover:!selected {
-                background-color: #22313f;
+                background-color: #0f2a45;
             }
             QLabel#zrotateQuarantineStatus {
                 color: #95a5a6;
                 font-size: 11px;
             }
             QListWidget#zrotateQuarantineList {
-                background-color: #22313f;
+                background-color: #0a2238;
                 border-radius: 6px;
-                border: 1px solid rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(31, 41, 55, 0.45);
                 color: #ecf0f1;
                 font-size: 12px;
             }
@@ -6320,9 +6607,67 @@ class MainWindow(QMainWindow):
                 background-color: rgba(52, 152, 219, 0.3);
             }
             QWidget#zrotateConsolePanel {
-                background-color: #02172e;
-                border-radius: 12px;
+                background-color: #011324;
+                border: none;
+            }
+            QWidget#zrotateStatsPanel {
+                background-color: #011324;
+                border: none;
+            }
+            QWidget#zrotateBottomContainer {
+                background-color: #011324;
+            }
+            QTabWidget#zrotateBottomTabs::pane {
+                border: 1px solid rgba(31, 41, 55, 0.45);
+                border-radius: 10px;
+                top: -1px;
+                background-color: #011324;
+            }
+            QTabWidget#zrotateBottomTabs QTabBar::tab {
+                background-color: #1a2f45;
+                color: #bdc3c7;
                 border: 1px solid rgba(31, 41, 55, 0.9);
+                border-bottom: none;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                min-width: 5em;
+                padding: 6px 12px;
+                font-size: 12px;
+            }
+            QTabWidget#zrotateBottomTabs QTabBar::tab:selected {
+                background-color: #011324;
+                color: #ecf0f1;
+            }
+            QLabel#zrotateStatsColHeader {
+                color: #94a3b8;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QListWidget#zrotateConnectionStatsList {
+                background-color: #0a2238;
+                border-radius: 6px;
+                border: 1px solid rgba(31, 41, 55, 0.45);
+                color: #ecf0f1;
+                font-size: 15px;
+            }
+            QListWidget#zrotateConnectionStatsList::item {
+                padding: 2px 0px;
+                margin: 2px 0px;
+            }
+            QLabel#zrotateConnStatsName {
+                color: #e2e8f0;
+                font-size: 15px;
+                font-weight: 600;
+            }
+            QLabel#zrotateConnStatsValue {
+                color: #93c5fd;
+                font-size: 16px;
+                font-weight: 600;
+            }
+            QLabel#zrotateConnStatsTotal {
+                color: #6ee7b7;
+                font-size: 16px;
+                font-weight: 700;
             }
             QSplitter#zrotateVerticalSplitter::handle {
                 background-color: rgba(52, 152, 219, 0.28);
@@ -6354,9 +6699,9 @@ class MainWindow(QMainWindow):
                 border: 1px solid #3498db;
             }
             QListWidget#zrotateInterfacesList {
-                background-color: #22313f;
+                background-color: #0a2238;
                 border-radius: 6px;
-                border: 1px solid rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(31, 41, 55, 0.45);
                 color: #ecf0f1;
                 font-size: 12px;
             }
@@ -6368,7 +6713,8 @@ class MainWindow(QMainWindow):
             }
             QLabel#zrotateStatsLabel {
                 color: #bdc3c7;
-                font-size: 11px;
+                font-size: 13px;
+                font-weight: 600;
             }
             QPushButton#zrotateStartButton {
                 background-color: qlineargradient(
@@ -6447,10 +6793,41 @@ class MainWindow(QMainWindow):
                 border: 1px solid #27ae60;
                 border-radius: 3px;
             }
-            QTextEdit#zrotateLogBox {
-                background-color: #1a1a1a;
+            QMenu#proxyzOptionsMenu {
+                background-color: #011324;
+                border: 1px solid rgba(59, 130, 246, 0.45);
+                border-radius: 10px;
+                padding: 4px;
+            }
+            QWidget#proxyzOptionsPanel {
+                background-color: #011324;
+            }
+            QPushButton#zrotateStatsToggleButton {
+                background-color: rgba(127, 140, 141, 0.25);
+                color: #bdc3c7;
                 border-radius: 6px;
-                border: 1px solid rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(127, 140, 141, 0.4);
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 12px;
+            }
+            QPushButton#zrotateStatsToggleButton:hover {
+                background-color: rgba(127, 140, 141, 0.35);
+                color: #ffffff;
+            }
+            QPushButton#zrotateStatsToggleButton:checked {
+                background-color: rgba(59, 130, 246, 0.2);
+                color: #93c5fd;
+                border-color: rgba(59, 130, 246, 0.45);
+            }
+            QPushButton#zrotateStatsToggleButton:checked:hover {
+                background-color: rgba(59, 130, 246, 0.35);
+                color: #ffffff;
+            }
+            QTextEdit#zrotateLogBox {
+                background-color: #0a2238;
+                border-radius: 6px;
+                border: 1px solid rgba(31, 41, 55, 0.45);
                 color: #ecf0f1;
                 font-family: 'Consolas', 'Monaco', monospace;
                 font-size: 11px;
@@ -6459,6 +6836,51 @@ class MainWindow(QMainWindow):
             + INTERFACE_CARD_QSS
             + ZROTATE_INTERFACE_ROW_QSS
         )
+
+    def _build_options_menu(self) -> None:
+        """Popup Options : serveur reset HTTP et badges connexions."""
+        # Serveur HTTP de reset : permet à un générateur externe de reset une clé
+        # via GET /reset?proxy=p:PORT. Port/token configurables dans proxy_configs.json.
+        self.reset_server_checkbox = QCheckBox("Serveur de reset HTTP")
+        self.reset_server_checkbox.setObjectName("playwrightWarmupCheckbox")
+        self.reset_server_checkbox.setToolTip(
+            "Expose GET /reset?proxy=p:PORT pour déclencher le reset d'une clé "
+            "depuis un outil externe (générateur). Port/token dans proxy_configs.json."
+        )
+        self.reset_server_checkbox.stateChanged.connect(self._on_reset_server_toggled)
+
+        self.connection_stats_checkbox = QCheckBox("Badges connexions sur les cartes")
+        self.connection_stats_checkbox.setObjectName("playwrightWarmupCheckbox")
+        self.connection_stats_checkbox.setToolTip(
+            "Affiche un badge « N co » sur chaque carte d'interface à gauche. "
+            "Les onglets Stats et Logs se contrôlent via les boutons au-dessus du panneau bas."
+        )
+        self.connection_stats_checkbox.stateChanged.connect(
+            self._on_connection_stats_ui_changed
+        )
+
+        panel = QWidget()
+        panel.setObjectName("proxyzOptionsPanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(12, 10, 12, 10)
+        panel_layout.setSpacing(8)
+        panel_layout.addWidget(self.reset_server_checkbox)
+        panel_layout.addWidget(self.connection_stats_checkbox)
+
+        menu = QMenu(self)
+        menu.setObjectName("proxyzOptionsMenu")
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(panel)
+        menu.addAction(action)
+        self.options_menu = menu
+
+    def _show_options_menu(self) -> None:
+        """Ouvre le menu Options sous le bouton (sans flèche Qt)."""
+        menu = getattr(self, "options_menu", None)
+        btn = getattr(self, "options_button", None)
+        if menu is None or btn is None:
+            return
+        menu.exec(btn.mapToGlobal(QPoint(0, btn.height())))
 
     # --- Logging / titre ---
     def _rebuild_iface_port_map(self) -> None:
@@ -6570,11 +6992,6 @@ class MainWindow(QMainWindow):
             online_count = 0
 
         self.setWindowTitle(f"ProxyZ - {online_count} Co / {self.active_proxies} Prox")
-
-        self.global_status_label.setText(
-            f"{online_count} connexion{'s' if online_count != 1 else ''} / "
-            f"{self.active_proxies} proxy actif{'s' if self.active_proxies != 1 else ''}"
-        )
 
     # --- Config / persistance ---
     def _read_playwright_warmup_enabled_from_config(self) -> bool:
@@ -6746,7 +7163,16 @@ class MainWindow(QMainWindow):
             _max_req = 2
         zrotate_cfg["max_requests_per_quota"] = _max_req
         zrotate_cfg.setdefault("quota_timeout_seconds", 60.0)
-        zrotate_cfg.setdefault("close_haapi_tunnel_after_seconds", 0.0)
+        zrotate_cfg.setdefault(
+            "close_haapi_tunnel_after_seconds",
+            DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS,
+        )
+        zrotate_cfg.setdefault(
+            "max_concurrent_clients", ZROTATE_MAX_CONCURRENT_CLIENTS
+        )
+        zrotate_cfg.setdefault(
+            "max_tunnels_per_interface", ZROTATE_MAX_TUNNELS_PER_INTERFACE
+        )
         self.zrotate_server_url = str(
             zrotate_cfg.get("server_url", "http://127.0.0.1:9999")
         ).strip() or "http://127.0.0.1:9999"
@@ -6758,14 +7184,8 @@ class MainWindow(QMainWindow):
                 Qt.Checked if zrotate_cfg["auto_start"] else Qt.Unchecked
             )
 
-        self.playwright_warmup_enabled = self._read_playwright_warmup_enabled_from_config()
-        self.config["playwright_warmup_enabled"] = self.playwright_warmup_enabled
-        if hasattr(self, "playwright_warmup_checkbox"):
-            blocked = self.playwright_warmup_checkbox.blockSignals(True)
-            self.playwright_warmup_checkbox.setCheckState(
-                Qt.Checked if self.playwright_warmup_enabled else Qt.Unchecked
-            )
-            self.playwright_warmup_checkbox.blockSignals(blocked)
+        self.playwright_warmup_enabled = False
+        self.config["playwright_warmup_enabled"] = False
 
         # --- Serveur de reset HTTP ---
         self.reset_server_enabled = bool(self.config.get("reset_server_enabled", False))
@@ -6802,6 +7222,29 @@ class MainWindow(QMainWindow):
             )
 
         ui = self.config.get("ui", {})
+        self.logs_panel_enabled = bool(
+            ui.get("zrotate_logs_enabled", DEFAULT_ZROTATE_LOGS_UI_ENABLED)
+        )
+        self.zrotate_logs_ui_enabled = self.logs_panel_enabled
+        self._update_logs_panel_toggle_button()
+        self._apply_logs_panel_state()
+
+        self.connection_stats_ui_enabled = bool(
+            ui.get("connection_stats_enabled", DEFAULT_CONNECTION_STATS_UI_ENABLED)
+        )
+        if hasattr(self, "connection_stats_checkbox"):
+            blocked = self.connection_stats_checkbox.blockSignals(True)
+            self.connection_stats_checkbox.setCheckState(
+                Qt.Checked if self.connection_stats_ui_enabled else Qt.Unchecked
+            )
+            self.connection_stats_checkbox.blockSignals(blocked)
+
+        self.stats_panel_enabled = bool(
+            ui.get("stats_panel_enabled", DEFAULT_STATS_PANEL_ENABLED)
+        )
+        self._update_stats_panel_toggle_button()
+        self._apply_connection_stats_ui_state()
+
         size = ui.get("last_window_size")
         if isinstance(size, list) and len(size) == 2:
             self.resize(size[0], size[1])
@@ -6995,7 +7438,9 @@ class MainWindow(QMainWindow):
         widget.delete_requested.connect(self.on_remote_interface_delete_requested)
         widget.edit_requested.connect(self._on_edit_remote_interface)
         widget.user_interaction.connect(self._mark_user_interaction)
+        widget.console_requested.connect(self._show_interface_console)
         self.interface_widgets[info.name] = widget
+        widget.set_connection_stats_enabled(self.connection_stats_ui_enabled)
 
         iface_cfg = self.config.get("interface_proxies", {}).get(info.name)
         if iface_cfg:
@@ -7452,6 +7897,70 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             print(f"Erreur sauvegarde warmup Playwright: {e}")
+
+    def _save_zrotate_logs_ui_config(self) -> None:
+        """Persiste l'état du panneau Logs dans proxy_configs.json (merge)."""
+        try:
+            config_path = self._config_path()
+            data: dict = {}
+            if config_path.is_file():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+
+            ui = data.setdefault("ui", {})
+            ui["zrotate_logs_enabled"] = bool(self.logs_panel_enabled)
+            _atomic_write_json(config_path, data)
+
+            self.config.setdefault("ui", {})["zrotate_logs_enabled"] = bool(
+                self.logs_panel_enabled
+            )
+            self.zrotate_logs_ui_enabled = bool(self.logs_panel_enabled)
+        except Exception as e:
+            print(f"Erreur sauvegarde panneau Logs UI: {e}")
+
+    def _save_connection_stats_ui_config(self) -> None:
+        """Persiste l'affichage des stats connexions dans proxy_configs.json."""
+        try:
+            config_path = self._config_path()
+            data: dict = {}
+            if config_path.is_file():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+
+            ui = data.setdefault("ui", {})
+            ui["connection_stats_enabled"] = bool(self.connection_stats_ui_enabled)
+            _atomic_write_json(config_path, data)
+
+            self.config.setdefault("ui", {})["connection_stats_enabled"] = bool(
+                self.connection_stats_ui_enabled
+            )
+        except Exception as e:
+            print(f"Erreur sauvegarde stats connexions UI: {e}")
+
+    def _save_stats_panel_config(self) -> None:
+        """Persiste l'état du panneau Stats dans proxy_configs.json."""
+        try:
+            config_path = self._config_path()
+            data: dict = {}
+            if config_path.is_file():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+
+            ui = data.setdefault("ui", {})
+            ui["stats_panel_enabled"] = bool(self.stats_panel_enabled)
+            _atomic_write_json(config_path, data)
+
+            self.config.setdefault("ui", {})["stats_panel_enabled"] = bool(
+                self.stats_panel_enabled
+            )
+        except Exception as e:
+            print(f"Erreur sauvegarde panneau Stats UI: {e}")
 
     def _save_config(self):
         """Écriture complète désactivée — utiliser les _save_* merge par changement."""
@@ -8161,6 +8670,7 @@ class MainWindow(QMainWindow):
             else (lambda n=name: self.interface_manager.get_local_ip(n))
         )
         thread = ProxyThread(config, bind_ip_provider=bind_ip_provider)
+        thread.set_track_active_clients(self._connection_tracking_needed())
         # Ne pas capturer directement le widget dans le slot, on utilise le nom
         thread.status_changed.connect(
             lambda running, iface=name, p=port: self._on_thread_status_changed(
@@ -8447,6 +8957,8 @@ class MainWindow(QMainWindow):
 
     def _zrotate_log(self, message: str):
         """Route les logs vers la console affichée (générale ou interface)."""
+        if not getattr(self, "logs_panel_enabled", False):
+            return
         timestamp = time.strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
         iface = self._resolve_log_interface(message)
@@ -8454,7 +8966,10 @@ class MainWindow(QMainWindow):
         if buffer_key is None and self._is_general_console_noise(message):
             return
         self._ensure_console_buffer(buffer_key)
-        self._console_lines[buffer_key].append(line)
+        buf = self._console_lines[buffer_key]
+        buf.append(line)
+        if len(buf) > CONSOLE_MAX_LINES:
+            del buf[:-CONSOLE_MAX_LINES]
         if self._console_view == buffer_key:
             self.zrotate_log_box.append(line)
             self._scroll_console_to_bottom()
@@ -8462,17 +8977,19 @@ class MainWindow(QMainWindow):
     @Slot(int, int, int)
     def _on_zrotate_stats_updated(self, total: int, successful: int, rejected: int):
         """Met à jour le label de stats ZRotate"""
+        if not getattr(self, "stats_panel_enabled", False):
+            return
         if rejected == 0:
-            text = f"{total} requête{'s' if total != 1 else ''} · {successful} OK"
+            text = f"{total} CONNECT · {successful} OK"
         else:
             text = (
-                f"{total} requête{'s' if total != 1 else ''} · "
-                f"{successful} OK · {rejected} rejetée{'s' if rejected != 1 else ''}"
+                f"{total} CONNECT · {successful} OK · "
+                f"{rejected} rejetée{'s' if rejected != 1 else ''}"
             )
         self.zrotate_stats_label.setText(text)
 
     def _on_quota_stats_updated(self, stats: dict):
-        """Met à jour les badges GET/CONNECT sans recréer la liste."""
+        """Met à jour les badges CONNECT sans recréer la liste."""
         rows = getattr(self, "_zrotate_interface_rows", None)
         if not rows:
             return
@@ -8482,10 +8999,9 @@ class MainWindow(QMainWindow):
                 continue
             if not row_widget.is_checked():
                 continue
-            g_used, g_max = data.get("get", (0, 2))
             c_used, c_max = data.get("connect", (0, 2))
             try:
-                row_widget.set_quota_values(g_used, g_max, c_used, c_max)
+                row_widget.set_quota_values(c_used, c_max)
             except RuntimeError:
                 continue
 
@@ -8537,10 +9053,241 @@ class MainWindow(QMainWindow):
         self.zrotate_start_button.style().unpolish(self.zrotate_start_button)
         self.zrotate_start_button.style().polish(self.zrotate_start_button)
 
-    def _on_playwright_warmup_changed(self, state: int):
-        self.playwright_warmup_enabled = state == Qt.CheckState.Checked
-        self.config["playwright_warmup_enabled"] = self.playwright_warmup_enabled
-        self._save_playwright_warmup_config()
+    def _on_logs_panel_toggled(self, enabled: bool) -> None:
+        self.logs_panel_enabled = enabled
+        self.config.setdefault("ui", {})["zrotate_logs_enabled"] = enabled
+        self._save_zrotate_logs_ui_config()
+        self._update_logs_panel_toggle_button()
+        self._apply_logs_panel_state()
+
+    def _update_logs_panel_toggle_button(self) -> None:
+        btn = getattr(self, "logs_panel_toggle_button", None)
+        if btn is None:
+            return
+        enabled = bool(getattr(self, "logs_panel_enabled", True))
+        blocked = btn.blockSignals(True)
+        btn.setChecked(enabled)
+        btn.setText("Désactiver les logs" if enabled else "Activer les logs")
+        btn.blockSignals(blocked)
+
+    def _disconnect_zrotate_log_slot(self, emitter) -> None:
+        if emitter is None:
+            return
+        try:
+            emitter.log_message.disconnect(self._zrotate_log)
+        except (TypeError, RuntimeError):
+            pass
+
+    def _connect_zrotate_log_slot(self, emitter) -> None:
+        if emitter is None:
+            return
+        self._disconnect_zrotate_log_slot(emitter)
+        if getattr(self, "logs_panel_enabled", False):
+            emitter.log_message.connect(self._zrotate_log)
+
+    def _select_visible_bottom_tab(self) -> None:
+        tabs = getattr(self, "zrotate_bottom_tabs", None)
+        if tabs is None:
+            return
+        if getattr(self, "stats_panel_enabled", False):
+            tabs.setCurrentIndex(0)
+        elif getattr(self, "logs_panel_enabled", False):
+            tabs.setCurrentIndex(1)
+
+    def _apply_logs_panel_state(self) -> None:
+        enabled = bool(getattr(self, "logs_panel_enabled", True))
+        tabs = getattr(self, "zrotate_bottom_tabs", None)
+        if tabs is not None:
+            tabs.setTabVisible(1, enabled)
+            if not enabled and tabs.currentIndex() == 1:
+                self._select_visible_bottom_tab()
+        if not enabled:
+            self._console_lines = {None: []}
+            if hasattr(self, "zrotate_log_box"):
+                self.zrotate_log_box.clear()
+        self._connect_zrotate_log_slot(getattr(self, "zrotate_proxy_server", None))
+        self._connect_zrotate_log_slot(getattr(self, "reset_http_server", None))
+        srv = getattr(self, "zrotate_proxy_server", None)
+        if srv is not None:
+            srv.set_ui_logs_enabled(enabled)
+
+    def _connection_tracking_needed(self) -> bool:
+        return bool(
+            getattr(self, "stats_panel_enabled", False)
+            or getattr(self, "connection_stats_ui_enabled", False)
+        )
+
+    def _sync_stats_backend(self) -> None:
+        tracking = self._connection_tracking_needed()
+        for thread in self.proxy_threads.values():
+            thread.set_track_active_clients(tracking)
+        srv = getattr(self, "zrotate_proxy_server", None)
+        if srv is not None:
+            srv.set_stats_backend(
+                stats_summary=bool(getattr(self, "stats_panel_enabled", False)),
+                connection_counts=tracking,
+            )
+        if not tracking:
+            self._zrotate_conn_counts = {}
+
+    def _on_connection_stats_ui_changed(self, state: int):
+        self.connection_stats_ui_enabled = state == Qt.CheckState.Checked
+        self.config.setdefault("ui", {})["connection_stats_enabled"] = (
+            self.connection_stats_ui_enabled
+        )
+        self._save_connection_stats_ui_config()
+        self._apply_connection_stats_ui_state()
+
+    def _on_stats_panel_toggled(self, enabled: bool) -> None:
+        self.stats_panel_enabled = enabled
+        self.config.setdefault("ui", {})["stats_panel_enabled"] = enabled
+        self._save_stats_panel_config()
+        self._update_stats_panel_toggle_button()
+        self._apply_connection_stats_ui_state()
+
+    def _update_stats_panel_toggle_button(self) -> None:
+        btn = getattr(self, "stats_panel_toggle_button", None)
+        if btn is None:
+            return
+        enabled = bool(getattr(self, "stats_panel_enabled", True))
+        blocked = btn.blockSignals(True)
+        btn.setChecked(enabled)
+        btn.setText("Désactiver les stats" if enabled else "Activer les stats")
+        btn.blockSignals(blocked)
+
+    def _apply_connection_stats_ui_state(self) -> None:
+        badges_enabled = bool(getattr(self, "connection_stats_ui_enabled", False))
+        stats_enabled = bool(getattr(self, "stats_panel_enabled", True))
+        tracking = self._connection_tracking_needed()
+        timer = getattr(self, "_connection_stats_timer", None)
+        if timer is not None:
+            if tracking:
+                if not timer.isActive():
+                    timer.start()
+            else:
+                timer.stop()
+
+        self._sync_stats_backend()
+
+        bottom_tabs = getattr(self, "zrotate_bottom_tabs", None)
+        if bottom_tabs is not None:
+            stats_idx = 0
+            bottom_tabs.setTabVisible(stats_idx, stats_enabled)
+            if not stats_enabled and bottom_tabs.currentIndex() == stats_idx:
+                self._select_visible_bottom_tab()
+
+        for widget in self.interface_widgets.values():
+            widget.set_connection_stats_enabled(badges_enabled)
+            if not badges_enabled:
+                widget.update_connection_stats(0)
+
+        if stats_enabled:
+            self._refresh_connection_stats_ui()
+        elif hasattr(self, "connection_stats_list"):
+            self.connection_stats_list.clear()
+            if hasattr(self, "zrotate_stats_label"):
+                self.zrotate_stats_label.setText("0 CONNECT · 0 OK · 0 rejetée")
+
+    @Slot(object)
+    def _on_zrotate_active_connection_counts(self, counts_obj: object) -> None:
+        if not self._connection_tracking_needed():
+            return
+        self._zrotate_conn_counts = (
+            dict(counts_obj) if isinstance(counts_obj, dict) else {}
+        )
+
+    def _make_connection_stats_row(
+        self, name: str, proxy_n: int, zr_n: int, total: int
+    ) -> QWidget:
+        row = QWidget()
+        row.setObjectName("zrotateConnStatsRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        name_lbl = QLabel(self._get_interface_display_name(name))
+        name_lbl.setObjectName("zrotateConnStatsName")
+        proxy_lbl = QLabel(str(proxy_n))
+        proxy_lbl.setObjectName("zrotateConnStatsValue")
+        proxy_lbl.setFixedWidth(72)
+        proxy_lbl.setAlignment(Qt.AlignCenter)
+        zr_lbl = QLabel(str(zr_n))
+        zr_lbl.setObjectName("zrotateConnStatsValue")
+        zr_lbl.setFixedWidth(80)
+        zr_lbl.setAlignment(Qt.AlignCenter)
+        total_lbl = QLabel(str(total))
+        total_lbl.setObjectName("zrotateConnStatsTotal")
+        total_lbl.setFixedWidth(64)
+        total_lbl.setAlignment(Qt.AlignCenter)
+        layout.addWidget(name_lbl, 1)
+        layout.addWidget(proxy_lbl)
+        layout.addWidget(zr_lbl)
+        layout.addWidget(total_lbl)
+        return row
+
+    def _refresh_connection_stats_ui(self) -> None:
+        if not self._connection_tracking_needed():
+            return
+        zr_counts = (
+            getattr(self, "_zrotate_conn_counts", {})
+            if getattr(self, "zrotate_running", False)
+            else {}
+        )
+        badges_enabled = bool(getattr(self, "connection_stats_ui_enabled", False))
+        stats_enabled = bool(getattr(self, "stats_panel_enabled", True))
+        stats_list = getattr(self, "connection_stats_list", None)
+
+        rows_data: list[tuple[str, int, int, int]] = []
+        for name, widget in self.interface_widgets.items():
+            proxy_n = 0
+            thread = self.proxy_threads.get(name)
+            if thread is not None and getattr(thread, "running", False):
+                proxy_n = int(getattr(thread, "active_client_count", 0) or 0)
+            zr_n = int(zr_counts.get(name, 0) or 0)
+            total = proxy_n + zr_n
+            rows_data.append((name, proxy_n, zr_n, total))
+            if badges_enabled:
+                widget.update_connection_stats(total)
+            else:
+                widget.update_connection_stats(0)
+
+        if not stats_enabled or stats_list is None:
+            return
+
+        # Rebuild uniquement si le set d'interfaces change ; sinon met à jour les textes.
+        wanted_names = [r[0] for r in rows_data]
+        existing_names: list[str] = []
+        for i in range(stats_list.count()):
+            item = stats_list.item(i)
+            existing_names.append(item.data(Qt.UserRole) if item else "")
+
+        if existing_names != wanted_names:
+            stats_list.clear()
+            for name, proxy_n, zr_n, total in rows_data:
+                item = QListWidgetItem()
+                item.setData(Qt.UserRole, name)
+                row_w = self._make_connection_stats_row(name, proxy_n, zr_n, total)
+                item.setSizeHint(row_w.sizeHint())
+                stats_list.addItem(item)
+                stats_list.setItemWidget(item, row_w)
+            return
+
+        for i, (name, proxy_n, zr_n, total) in enumerate(rows_data):
+            item = stats_list.item(i)
+            row_w = stats_list.itemWidget(item)
+            if row_w is None:
+                continue
+            labels = row_w.findChildren(QLabel)
+            # name, proxy, zr, total
+            if len(labels) >= 4:
+                display = self._get_interface_display_name(name)
+                if labels[0].text() != display:
+                    labels[0].setText(display)
+                if labels[1].text() != str(proxy_n):
+                    labels[1].setText(str(proxy_n))
+                if labels[2].text() != str(zr_n):
+                    labels[2].setText(str(zr_n))
+                if labels[3].text() != str(total):
+                    labels[3].setText(str(total))
 
     # --- Serveur de reset HTTP ---
     def _on_reset_server_toggled(self, state: int):
@@ -8589,7 +9336,7 @@ class MainWindow(QMainWindow):
                 allowed_ips=self.reset_server_allowed_ips,
             )
             srv.reset_requested.connect(self._on_http_reset_requested)
-            srv.log_message.connect(self._zrotate_log)
+            self._connect_zrotate_log_slot(srv)
             self.reset_http_server = srv
             srv.set_known_ports(self._iface_by_port.keys())
             srv.start()
@@ -8794,10 +9541,21 @@ class MainWindow(QMainWindow):
             max_requests = 2
         quota_timeout = zrotate_cfg.get("quota_timeout_seconds", 60.0)
         close_haapi_after = float(
-            zrotate_cfg.get("close_haapi_tunnel_after_seconds", 0.0)
+            zrotate_cfg.get(
+                "close_haapi_tunnel_after_seconds",
+                DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS,
+            )
         )
         if close_haapi_after < 0:
             close_haapi_after = 0.0
+        max_concurrent_clients = int(
+            zrotate_cfg.get("max_concurrent_clients", ZROTATE_MAX_CONCURRENT_CLIENTS)
+        )
+        max_tunnels_per_interface = int(
+            zrotate_cfg.get(
+                "max_tunnels_per_interface", ZROTATE_MAX_TUNNELS_PER_INTERFACE
+            )
+        )
 
         # Créer et démarrer le serveur proxy avec les egress IPs
         self.zrotate_proxy_server = ZRotateProxyServer(
@@ -8807,8 +9565,15 @@ class MainWindow(QMainWindow):
             max_requests_per_quota=max_requests,
             quota_timeout_seconds=quota_timeout,
             close_haapi_tunnel_after_seconds=close_haapi_after,
+            max_concurrent_clients=max_concurrent_clients,
+            max_tunnels_per_interface=max_tunnels_per_interface,
         )
-        self.zrotate_proxy_server.log_message.connect(self._zrotate_log)
+        self.zrotate_proxy_server.set_ui_logs_enabled(self.logs_panel_enabled)
+        self.zrotate_proxy_server.set_stats_backend(
+            stats_summary=self.stats_panel_enabled,
+            connection_counts=self._connection_tracking_needed(),
+        )
+        self._connect_zrotate_log_slot(self.zrotate_proxy_server)
         # Reset demandé par ZRotate : chemin COALESCÉ (ignore si déjà en cours),
         # surtout PAS on_interface_reset_requested qui annulerait un reset en cours.
         self.zrotate_proxy_server.reset_interface_requested.connect(
@@ -8828,6 +9593,9 @@ class MainWindow(QMainWindow):
         )
         self.zrotate_proxy_server.pool_state_updated.connect(
             self._on_pool_state_updated
+        )
+        self.zrotate_proxy_server.active_connection_counts_updated.connect(
+            self._on_zrotate_active_connection_counts
         )
 
         # Démarrer le serveur
@@ -8918,6 +9686,9 @@ class MainWindow(QMainWindow):
             w = self.interface_widgets.get(name)
             if w:
                 w.set_reset_badge_in_use(False)
+
+        self._zrotate_conn_counts = {}
+        self._refresh_connection_stats_ui()
 
         self._zrotate_log("⏹️ ZRotate arrêté")
 
