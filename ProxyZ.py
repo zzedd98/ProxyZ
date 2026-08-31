@@ -1287,8 +1287,6 @@ PROXY_RELAY_SOCKET_TIMEOUT_S = 180.0    # timeout relais TCP (auth peut durer ~3
 
 # Robustesse ZRotate
 DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS = 180.0
-ZROTATE_MAX_CONCURRENT_CLIENTS = 1000
-ZROTATE_MAX_TUNNELS_PER_INTERFACE = 32
 CONSOLE_MAX_LINES = 2000
 DEFAULT_ZROTATE_LOGS_UI_ENABLED = True
 CONNECTION_STATS_REFRESH_MS = 2000
@@ -2240,14 +2238,12 @@ class InterfaceQuotaManager:
         egress_configs: list,
         quota_timeout_seconds: float = 60.0,
         max_requests_per_quota: int = 2,
-        max_tunnels_per_interface: int = ZROTATE_MAX_TUNNELS_PER_INTERFACE,
     ):
         """
         Args:
             egress_configs: Liste de dicts avec 'name' et 'ip' pour les proxies disponibles
             quota_timeout_seconds: Timeout pour réinitialiser les quotas partiels (défaut: 60s)
             max_requests_per_quota: Nombre maximum de requêtes par quota (défaut: 2)
-            max_tunnels_per_interface: Plafond tunnels CONNECT hostname par interface
         """
         self.egress_configs = egress_configs.copy()
         # Structure: {interface_name: {request_type: {domain: QuotaInfo}}}
@@ -2260,7 +2256,6 @@ class InterfaceQuotaManager:
         self._lock = asyncio.Lock()
         self.quota_timeout_seconds = quota_timeout_seconds
         self.max_requests_per_quota = max_requests_per_quota
-        self.max_tunnels_per_interface = max(1, int(max_tunnels_per_interface))
         self._cleanup_task: Optional[asyncio.Task] = None
         self._retry_reset_task: Optional[asyncio.Task] = None
         self._reset_callback: Optional[Callable] = (
@@ -2674,14 +2669,6 @@ class InterfaceQuotaManager:
         """Génère une clé de domaine pour le quota"""
         return f"{host}:{port}"
 
-    def _count_non_important_tunnels(self, interface_name: str) -> int:
-        return sum(
-            1
-            for c in self._active_connections.values()
-            if c.get("interface_name") == interface_name
-            and not c.get("is_important", False)
-        )
-
     async def get_interface_for_request(
         self, request_type: str, host: str, port: int, connection_id: int
     ) -> Optional[Dict[str, str]]:
@@ -2706,20 +2693,18 @@ class InterfaceQuotaManager:
                 # Requête non importante : prioriser les interfaces avec le moins de connexions actives
                 eligible = [
                     (
-                        self._count_non_important_tunnels(info["name"]),
+                        sum(
+                            1
+                            for c in self._active_connections.values()
+                            if c["interface_name"] == info["name"]
+                        ),
                         info,
                     )
                     for info in self.available_interfaces
                     if info["name"] not in self.resetting_interfaces
                     and info["name"] not in self._quarantine_interfaces
-                    and self._count_non_important_tunnels(info["name"])
-                    < self.max_tunnels_per_interface
                 ]
                 if not eligible:
-                    logger.warning(
-                        f"[QUOTA] Aucune interface disponible pour tunnel {request_type} "
-                        f"{host}:{port} (plafond {self.max_tunnels_per_interface}/interface)"
-                    )
                     return None
                 eligible.sort(key=lambda x: x[0])
                 interface_info = eligible[0][1]
@@ -3781,8 +3766,6 @@ class ZRotateSingleProxyServer:
         max_requests_per_quota: int = 2,
         quota_timeout_seconds: float = 60.0,
         close_haapi_tunnel_after_seconds: float = DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS,
-        max_concurrent_clients: int = ZROTATE_MAX_CONCURRENT_CLIENTS,
-        max_tunnels_per_interface: int = ZROTATE_MAX_TUNNELS_PER_INTERFACE,
     ):
         """
         Args:
@@ -3792,16 +3775,12 @@ class ZRotateSingleProxyServer:
             max_requests_per_quota: Nombre max de requêtes GET/CONNECT par IP (défaut: 2)
             quota_timeout_seconds: Timeout pour réinitialiser les quotas partiels (défaut: 60s)
             close_haapi_tunnel_after_seconds: Ferme les tunnels CONNECT hostname après ce délai (s).
-            max_concurrent_clients: Plafond global de connexions client simultanées.
-            max_tunnels_per_interface: Plafond tunnels hostname par interface.
         """
         self.host = host
         self.port = port
         self._close_haapi_tunnel_after_seconds = max(
             0.0, float(close_haapi_tunnel_after_seconds)
         )
-        self._max_concurrent_clients = max(1, int(max_concurrent_clients))
-        self._client_semaphore = asyncio.Semaphore(self._max_concurrent_clients)
         egress_configs = egress_configs or EGRESS_IPS
 
         # Validation des egress IPs au démarrage
@@ -3830,7 +3809,6 @@ class ZRotateSingleProxyServer:
             valid_configs,
             max_requests_per_quota=max_requests_per_quota,
             quota_timeout_seconds=quota_timeout_seconds,
-            max_tunnels_per_interface=max_tunnels_per_interface,
         )
         # Garder l'ancien sélecteur pour compatibilité (non utilisé si quota_manager est actif)
         self.egress_selector = RoundRobinEgressSelector(valid_configs)
@@ -3909,41 +3887,7 @@ class ZRotateSingleProxyServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ):
-        """Gère une connexion client (plafond global de connexions simultanées)."""
-        acquired = False
-        try:
-            try:
-                await asyncio.wait_for(self._client_semaphore.acquire(), timeout=0)
-                acquired = True
-            except (asyncio.TimeoutError, TimeoutError):
-                try:
-                    writer.write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
-                    writer.write(
-                        b"Server busy: too many concurrent connections.\r\n"
-                    )
-                    await writer.drain()
-                except Exception:
-                    pass
-                return
-
-            await self._handle_client_inner(reader, writer)
-        finally:
-            if acquired:
-                self._client_semaphore.release()
-            else:
-                try:
-                    if not writer.is_closing():
-                        writer.close()
-                        await writer.wait_closed()
-                except Exception:
-                    pass
-
-    async def _handle_client_inner(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-    ):
-        """Corps du traitement client (après acquisition du semaphore global)."""
+        """Gère une connexion client"""
         client_addr = writer.get_extra_info("peername")
         self._connection_counter += 1
         connection_id = self._connection_counter
@@ -4688,8 +4632,6 @@ class ZRotateProxyServer(QThread):
         max_requests_per_quota: int = 2,
         quota_timeout_seconds: float = 60.0,
         close_haapi_tunnel_after_seconds: float = DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS,
-        max_concurrent_clients: int = ZROTATE_MAX_CONCURRENT_CLIENTS,
-        max_tunnels_per_interface: int = ZROTATE_MAX_TUNNELS_PER_INTERFACE,
     ):
         """
         Args:
@@ -4699,8 +4641,6 @@ class ZRotateProxyServer(QThread):
             max_requests_per_quota: Nombre max de requêtes GET/CONNECT par IP (proxy_configs.json)
             quota_timeout_seconds: Timeout pour réinitialiser les quotas partiels
             close_haapi_tunnel_after_seconds: Ferme les tunnels CONNECT hostname après ce délai (s)
-            max_concurrent_clients: Plafond global de connexions client simultanées
-            max_tunnels_per_interface: Plafond tunnels hostname par interface
         """
         super().__init__()
         self.egress_configs = egress_configs
@@ -4709,8 +4649,6 @@ class ZRotateProxyServer(QThread):
         self.max_requests_per_quota = max_requests_per_quota
         self.quota_timeout_seconds = quota_timeout_seconds
         self.close_haapi_tunnel_after_seconds = close_haapi_tunnel_after_seconds
-        self.max_concurrent_clients = max_concurrent_clients
-        self.max_tunnels_per_interface = max_tunnels_per_interface
         self.running = False
         self.loop = None
         self.proxy_server: Optional[ZRotateSingleProxyServer] = None
@@ -4785,8 +4723,6 @@ class ZRotateProxyServer(QThread):
                 max_requests_per_quota=self.max_requests_per_quota,
                 quota_timeout_seconds=self.quota_timeout_seconds,
                 close_haapi_tunnel_after_seconds=self.close_haapi_tunnel_after_seconds,
-                max_concurrent_clients=self.max_concurrent_clients,
-                max_tunnels_per_interface=self.max_tunnels_per_interface,
             )
 
             # Rediriger les logs vers le signal Qt
@@ -7167,12 +7103,6 @@ class MainWindow(QMainWindow):
             "close_haapi_tunnel_after_seconds",
             DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS,
         )
-        zrotate_cfg.setdefault(
-            "max_concurrent_clients", ZROTATE_MAX_CONCURRENT_CLIENTS
-        )
-        zrotate_cfg.setdefault(
-            "max_tunnels_per_interface", ZROTATE_MAX_TUNNELS_PER_INTERFACE
-        )
         self.zrotate_server_url = str(
             zrotate_cfg.get("server_url", "http://127.0.0.1:9999")
         ).strip() or "http://127.0.0.1:9999"
@@ -9548,14 +9478,6 @@ class MainWindow(QMainWindow):
         )
         if close_haapi_after < 0:
             close_haapi_after = 0.0
-        max_concurrent_clients = int(
-            zrotate_cfg.get("max_concurrent_clients", ZROTATE_MAX_CONCURRENT_CLIENTS)
-        )
-        max_tunnels_per_interface = int(
-            zrotate_cfg.get(
-                "max_tunnels_per_interface", ZROTATE_MAX_TUNNELS_PER_INTERFACE
-            )
-        )
 
         # Créer et démarrer le serveur proxy avec les egress IPs
         self.zrotate_proxy_server = ZRotateProxyServer(
@@ -9565,8 +9487,6 @@ class MainWindow(QMainWindow):
             max_requests_per_quota=max_requests,
             quota_timeout_seconds=quota_timeout,
             close_haapi_tunnel_after_seconds=close_haapi_after,
-            max_concurrent_clients=max_concurrent_clients,
-            max_tunnels_per_interface=max_tunnels_per_interface,
         )
         self.zrotate_proxy_server.set_ui_logs_enabled(self.logs_panel_enabled)
         self.zrotate_proxy_server.set_stats_backend(
