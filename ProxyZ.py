@@ -26,6 +26,7 @@ import traceback
 import signal
 import asyncio
 import httpx
+import certifi
 from enum import Enum
 from typing import Optional, Dict, Callable, Awaitable, Tuple
 from datetime import datetime
@@ -34,6 +35,56 @@ from urllib.parse import urlparse, parse_qs
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Cache TLS en mémoire propre à ce processus ; aucune connexion réseau conservée.
+# Garder ce bloc autonome dans les scripts reset (pas de dépendance à ProxyZ/Qt).
+# Redémarrer le processus après modification du contenu des certificats.
+_contexts: dict[tuple, ssl.SSLContext] = {}
+_context_lock = threading.Lock()
+
+
+def get_httpx_tls_context() -> ssl.SSLContext:
+    """Politique HTTPX verify=True/trust_env=True, chargée une seule fois.
+
+    SSL_CERT_FILE conserve la priorité sur SSL_CERT_DIR, puis sur certifi.
+    Un capath reste géré par OpenSSL (chargement différé des certificats du
+    répertoire), pour préserver la sémantique de SSL_CERT_DIR.
+    """
+    cafile = os.environ.get("SSL_CERT_FILE")
+    capath = os.environ.get("SSL_CERT_DIR")
+    if cafile:
+        source, path = "pem", os.path.abspath(cafile)
+    elif capath:
+        source, path = "directory", os.path.abspath(capath)
+    else:
+        source, path = "pem", certifi.where()
+    key = ("httpx", source, path)
+    with _context_lock:
+        context = _contexts.get(key)
+        if context is None:
+            if source == "pem":
+                pem = Path(path).read_text(encoding="ascii")
+                context = ssl.create_default_context(cadata=pem)
+            else:
+                context = ssl.create_default_context(capath=path)
+            _contexts[key] = context
+        return context
+
+
+def get_system_tls_context() -> ssl.SSLContext:
+    """Conserve le magasin système des sondes socket locales, mis en cache.
+
+    Cette politique est distincte de celle de HTTPX/certifi. Le magasin système
+    est chargé normalement au premier appel, puis réutilisé en mémoire.
+    """
+    key = ("system", os.environ.get("SSL_CERT_FILE"), os.environ.get("SSL_CERT_DIR"))
+    with _context_lock:
+        context = _contexts.get(key)
+        if context is None:
+            context = ssl.create_default_context()
+            _contexts[key] = context
+        return context
+
 
 # Sous Windows, empêche l'ouverture de consoles éphémères pour netsh / control.exe
 if sys.platform.startswith("win"):
@@ -1982,7 +2033,7 @@ class InterfaceManager(QObject):
                 s.bind((local_ip, 0))
                 s.connect((host, port))
                 if use_tls:
-                    ctx = ssl.create_default_context()
+                    ctx = get_system_tls_context()
                     s = ctx.wrap_socket(s, server_hostname=host)
                 req = (
                     f"GET {path} HTTP/1.1\r\n"
@@ -4491,7 +4542,8 @@ class IPPoolManager:
                         await asyncio.sleep(2)
 
                     async with httpx.AsyncClient(
-                        proxy=proxy_url, timeout=20.0, follow_redirects=True
+                        proxy=proxy_url, timeout=20.0, follow_redirects=True,
+                        verify=get_httpx_tls_context(),
                     ) as client:
                         response = await client.get(service)
 
@@ -7740,7 +7792,10 @@ class MainWindow(QMainWindow):
             for proxy_url in proxy_urls:
                 for service in services:
                     try:
-                        with httpx.Client(proxy=proxy_url, timeout=8.0) as client:
+                        with httpx.Client(
+                            proxy=proxy_url, timeout=8.0,
+                            verify=get_httpx_tls_context(),
+                        ) as client:
                             response = client.get(service)
                             if response.status_code == 200:
                                 candidate = response.text.strip()

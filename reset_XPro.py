@@ -19,7 +19,44 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+import certifi
+import ssl
 from playwright.sync_api import sync_playwright
+
+# Cache TLS en mémoire propre à ce processus ; aucune connexion réseau conservée.
+# Garder ce bloc autonome dans les scripts reset (pas de dépendance à ProxyZ/Qt).
+# Redémarrer le processus après modification du contenu des certificats.
+_contexts: dict[tuple, ssl.SSLContext] = {}
+_context_lock = threading.Lock()
+
+
+def get_httpx_tls_context() -> ssl.SSLContext:
+    """Politique HTTPX verify=True/trust_env=True, chargée une seule fois.
+
+    SSL_CERT_FILE conserve la priorité sur SSL_CERT_DIR, puis sur certifi.
+    Un capath reste géré par OpenSSL (chargement différé des certificats du
+    répertoire), pour préserver la sémantique de SSL_CERT_DIR.
+    """
+    cafile = os.environ.get("SSL_CERT_FILE")
+    capath = os.environ.get("SSL_CERT_DIR")
+    if cafile:
+        source, path = "pem", os.path.abspath(cafile)
+    elif capath:
+        source, path = "directory", os.path.abspath(capath)
+    else:
+        source, path = "pem", certifi.where()
+    key = ("httpx", source, path)
+    with _context_lock:
+        context = _contexts.get(key)
+        if context is None:
+            if source == "pem":
+                pem = Path(path).read_text(encoding="ascii")
+                context = ssl.create_default_context(cadata=pem)
+            else:
+                context = ssl.create_default_context(capath=path)
+            _contexts[key] = context
+        return context
+
 
 DEFAULT_MODEM_GATEWAY = "192.168.100.1"
 MODEM_WEB_URL = f"http://{DEFAULT_MODEM_GATEWAY}/"
@@ -148,7 +185,9 @@ def _get_modem_ip(proxy_port: int) -> str | None:
     services = ["https://icanhazip.com", "https://api.ipify.org"]
     for service in services:
         try:
-            with httpx.Client(proxy=proxy_url, timeout=10.0) as client:
+            with httpx.Client(
+                proxy=proxy_url, timeout=10.0, verify=get_httpx_tls_context()
+            ) as client:
                 response = client.get(service)
                 if response.status_code == 200:
                     ip = response.text.strip()

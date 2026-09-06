@@ -1,0 +1,642 @@
+RAPPORT DE SYNTHÈSE — FREEZES WINDOWS / ANKABOT / I/O DISQUE
+============================================================
+
+Objectif
+--------
+Ce document résume toutes les interprétations tirées de la trace WPR/ETWAnalyzer
+AnkaFreeze.etl -> AnkaFreeze.json7z, afin de pouvoir transmettre le contexte à
+Codex sur un autre PC et lui faire analyser ProxyZ localement en corrélant les
+différents éléments.
+
+IMPORTANT
+---------
+Les points ci-dessous distinguent :
+- les observations concrètes vues dans l'extraction ETWAnalyzer ;
+- les hypothèses/interprétations qui en découlent ;
+- les limites de la trace actuelle.
+
+Le problème principal à expliquer est :
+- le SSD NVMe atteint 100 % de temps d'activité ;
+- la file d'attente disque augmente fortement ;
+- tout Windows devient très lent / freeze ;
+- VS Code, Explorer, ouverture/fermeture de programmes deviennent très lents ;
+- fermer VS Code améliore nettement la fluidité ;
+- beaucoup d'instances AnkaBot sont ouvertes simultanément.
+
+Le conflit ponctuel user.config d'AnkaBot n'est PAS considéré comme la cause
+principale des freezes. C'est un bug séparé, visible et ponctuel.
+
+
+1. CONTEXTE MACHINE / CHARGE
+============================
+
+Pendant les observations précédentes :
+- CPU autour de 44 % ;
+- RAM autour de 49,6 / 63,7 Go, soit ~78 % ;
+- SSD WD Black SN770 pouvant atteindre 100 % d'activité ;
+- débit disque parfois relativement faible malgré 100 % d'activité.
+
+Interprétation importante :
+Un SSD à 100 % d'activité avec seulement quelques Mo/s est typiquement compatible
+avec une saturation par :
+- énormément de petites I/O ;
+- des I/O aléatoires ;
+- une forte latence ;
+- une longue file d'attente ;
+et pas forcément avec un gros débit séquentiel.
+
+C'est ce phénomène de latence / queue I/O qui est considéré comme le coeur du
+problème.
+
+
+2. ANKABOT ET LES PROFILS APPDATA
+=================================
+
+Il existe bien 4 répertoires différents sous :
+C:\Users\shune\AppData\Local\SwiftBot\
+
+Cela correspond vraisemblablement aux 4 répertoires AnkaBotPC1 à AnkaBotPC4.
+
+Conclusion :
+- les 4 copies AnkaBot génèrent bien des profils .NET séparés ;
+- le fait de séparer les répertoires AnkaBot n'était donc pas complètement
+  inutile ;
+- cependant, plusieurs processus lancés depuis une même copie peuvent encore
+  partager des données internes à cette copie.
+
+Le bug ponctuel vu auparavant était :
+System.Configuration.ConfigurationErrorsException
+"Le fichier de configuration a été modifié par un autre programme"
+sur user.config.
+
+Interprétation :
+- ce bug prouve qu'il existe parfois des écritures concurrentes ;
+- mais il n'est PAS retenu comme explication principale de la saturation globale
+  du SSD.
+
+
+3. WINDOWS DEFENDER
+===================
+
+Des exclusions ont été ajoutées pour :
+- C:\Users\shune\AppData\Local\SwiftBot
+- les dossiers AnkaBotPC contenant les exécutables et fichiers fortement accédés.
+
+Observation issue de la trace analysée :
+- MsMpEng.exe / Windows Defender ne semblait PAS être un gros consommateur
+  physique de disque pendant cette trace ;
+- environ ~2 Mo de File I/O en lecture étaient visibles ;
+- l'activité physique associée à Defender était faible.
+
+Interprétation :
+- Defender peut amplifier des workloads avec beaucoup de petits fichiers ;
+- les exclusions restent pertinentes pour tester ;
+- MAIS la trace actuelle ne permet pas de désigner Defender comme cause principale.
+
+Conclusion actuelle :
+Defender = facteur potentiel secondaire, pas suspect n°1 d'après cette trace.
+
+
+4. WINDOWS SEARCH INDEXER
+=========================
+
+Observation :
+SearchProtocolHost.exe / Windows Search a accédé à des fichiers appartenant à
+l'écosystème AnkaBot, notamment :
+- SnowMaster\logs.txt
+- AnkaBotPC\save\SBConfig...
+- AnkaBotPC3\save\...
+- AnkaBotPC4\Errors\...
+etc.
+
+Environ ~28 Mo de File I/O ont été observés.
+
+Interprétation :
+- Windows Search parcourt bien certains répertoires AnkaBot ;
+- il est logique d'exclure les dossiers AnkaBot / SnowMaster / scripts associés de
+  l'indexation ;
+- mais l'activité physique disque de Search Indexer paraissait faible dans cette
+  trace.
+
+Conclusion actuelle :
+Windows Search = bruit inutile à supprimer, mais pas cause principale évidente.
+
+Test radical possible :
+Stop-Service WSearch
+puis comparer le comportement avec la même charge.
+Pour réactiver :
+Start-Service WSearch
+
+
+5. RAM / PAGEFILE
+=================
+
+Observation de la trace :
+- RAM active approximative : ~49,7 Go ;
+- Commit approximatif : ~58,1 Go ;
+- les processus AnkaBot représentaient environ :
+  ~30 AnkaBot.exe
+  ~28,1 Go de Working Set
+  ~27,0 Go de Commit
+  ~24,7 Go de mémoire privée.
+
+Mais l'activité pagefile observée était faible :
+- ~6,8 Mo lus ;
+- ~2,0 Mo écrits.
+
+Interprétation :
+- AnkaBot consomme énormément de RAM ;
+- malgré cela, la trace ne montre PAS de swapping massif ;
+- il n'y a donc pas assez d'éléments pour accuser pagefile.sys d'être la cause
+  principale des freezes ;
+- passer directement à 96/128 Go de RAM n'est pas justifié sur la base de cette
+  trace seule.
+
+Conclusion actuelle :
+RAM = très chargée, mais pagefile non identifié comme cause principale.
+
+
+6. ANKABOT LUI-MÊME ET LES I/O PHYSIQUES
+=========================================
+
+Observation contre-intuitive :
+Dans cette trace, les chemins directement associés à :
+- AnkaBotPC...
+- SwiftBot...
+- AnkabotScripts...
+ont montré relativement peu d'I/O PHYSIQUES disque.
+
+Interprétation :
+- AnkaBot peut générer beaucoup d'activité logique/fichier sans forcément faire
+  énormément d'accès physiques grâce au cache Windows ;
+- une grande partie du problème peut venir de l'écosystème autour d'AnkaBot
+  plutôt que d'AnkaBot.exe seul ;
+- il faut distinguer impérativement :
+  File I/O = appels filesystem, parfois servis par le cache RAM
+  Disk I/O = requêtes réellement envoyées au disque physique.
+
+Conclusion :
+Ne pas conclure "AnkaBot.exe est innocent".
+La trace actuelle montre seulement qu'il n'était pas le plus gros générateur
+d'I/O physique pendant la période correctement capturée.
+
+
+7. VS CODE
+==========
+
+Observation utilisateur très importante :
+- lorsque VS Code est ouvert, le PC ralentit davantage ;
+- lorsque VS Code est fermé, la machine redevient nettement plus fluide.
+
+Interprétation :
+VS Code peut ajouter beaucoup de petites I/O via :
+- file watchers ;
+- Git auto-refresh ;
+- extensions ;
+- indexation ;
+- TypeScript / Java language servers ;
+- cache Electron ;
+- autosave ;
+- Local History ;
+- logs.
+
+Une capture précédente montrait notamment VS Code bloqué à la fermeture sur :
+"Saving local history".
+
+Hypothèse :
+VS Code n'est probablement pas la source primaire du problème, mais peut être le
+facteur qui fait passer le système de :
+"très chargé mais encore utilisable"
+à :
+"queue disque saturée / freezes".
+
+Tests conseillés :
+1) VS Code fermé.
+2) VS Code vide :
+   code --disable-extensions
+3) VS Code + workspace, extensions désactivées.
+4) VS Code + workspace + extensions normales.
+
+Si les dossiers AnkaBot se trouvent dans un répertoire parent ouvert par VS Code,
+les exclure avec files.watcherExclude / search.exclude.
+
+Exemple :
+"files.watcherExclude": {
+    "**/AnkaBotPC*/**": true
+}
+
+Conclusion :
+VS Code est un amplificateur crédible et doit être pris au sérieux dans les tests.
+
+
+8. ANOMALIE ASUS FRAMEWORK / POWERSHELL / WMI
+=============================================
+
+C'est une des anomalies les plus importantes observées.
+
+Observation :
+asus_framework.exe avait environ 23 processus PowerShell associés exécutant
+pratiquement la même logique autour de :
+gwmi win32_process -Filter ...
+
+Donc ASUS Framework semble lancer de nombreuses interrogations WMI sur les
+processus Windows.
+
+Dans la trace, les chargements / activités PowerShell/.NET figuraient parmi les
+plus gros temps de service disque visibles.
+
+Ordre de grandeur observé du temps de service disque attribué :
+- PowerShell/.NET : ~434 ms
+- NTFS/System metadata : ~232 ms
+- SnowMaster : ~176 ms
+- Brave : ~151 ms
+- ProxyZ/Python : ~57 ms
+- Pagefile : ~23 ms
+- AnkaBot : ~16 ms
+- Defender : ~9 ms
+- Windows Search : ~2 ms
+
+Interprétation :
+- avoir ~23 PowerShell lancés par ASUS Framework pour faire du WMI est anormal /
+  très suspect ;
+- cela peut générer du CPU, du filesystem activity, des scans de processus et des
+  interactions fréquentes avec le système ;
+- ce comportement peut devenir particulièrement pénalisant lorsqu'AnkaBot lance
+  beaucoup de processus.
+
+Test proposé :
+Stop-Process -Name asus_framework -Force
+
+Puis inspecter les PowerShell restants :
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+Where-Object { $_.CommandLine -like "*gwmi win32_process*" } |
+Select-Object ProcessId, ParentProcessId, CommandLine
+
+Et éventuellement tuer UNIQUEMENT ceux-là :
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+Where-Object { $_.CommandLine -like "*gwmi win32_process*" } |
+ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+
+Conclusion actuelle :
+ASUS Framework / WMI / PowerShell = suspect sérieux à tester indépendamment.
+
+
+9. ANOMALIE MAJEURE PROXYZ / PYTHON
+===================================
+
+C'est probablement l'élément le plus intéressant à faire analyser localement
+par Codex.
+
+Observation :
+Il y avait environ 8 processus de type :
+pythonw.exe ...\ProxyZ\reset_XPro_dist.py 4001 192.168.1.157
+pythonw.exe ...\ProxyZ\reset_XPro_dist.py 4002 192.168.1.157
+...
+ainsi que ProxyZ.exe.
+
+Ces processus ont effectué au total environ :
+~4 857 000 lectures de fichiers en ~11 minutes.
+
+Cela correspond à environ :
+~7 100 appels de lecture / seconde.
+
+Une très grande partie des lectures concernait :
+Python313\Lib\site-packages\certifi\cacert.pem
+
+Pour ProxyZ.exe packagé, des lectures similaires apparaissaient dans un chemin :
+...\Temp\_MEI...\certifi\cacert.pem
+
+Exemples observés pour un seul pythonw.exe :
+- ~656 905 lectures sur cacert.pem ;
+- un autre ~636 286 ;
+- un autre ~587 167 ;
+etc.
+
+Interprétation CRUCIALE :
+- ces millions de lectures sont surtout des File I/O ;
+- elles semblent en grande partie servies par le cache Windows ;
+- elles ne correspondent donc PAS forcément à 4,8 millions de lectures physiques
+  du NVMe ;
+- MAIS elles représentent une tempête extrêmement importante d'appels filesystem,
+  kernel, open/read/close, potentiellement des allocations, locks et validations.
+
+Même si le contenu est en cache RAM, une boucle faisant des milliers d'appels
+filesystem par seconde peut :
+- consommer du CPU kernel ;
+- provoquer des context switches ;
+- accroître la pression sur NTFS / cache manager ;
+- augmenter la contention ;
+- interagir avec Defender/Search/monitoring ;
+- aggraver très fortement la latence globale quand la machine est déjà sous
+  charge.
+
+Hypothèse technique à investiguer dans ProxyZ :
+Le script reset_XPro_dist.py ou une dépendance réseau/TLS semble probablement
+recharger/relire le bundle CA certifi (cacert.pem) à chaque requête ou à une
+fréquence anormalement élevée.
+
+Codex doit analyser particulièrement :
+- requests ;
+- urllib3 ;
+- httpx ;
+- aiohttp ;
+- ssl ;
+- certifi.where() ;
+- verify=... ;
+- création répétée de sessions HTTP ;
+- création répétée de SSLContext ;
+- boucles extrêmement rapides ;
+- polling ;
+- absence de sleep/backoff ;
+- exception/retry loops ;
+- subprocess ;
+- appels qui recréent un client réseau à chaque itération.
+
+Question essentielle :
+Pourquoi chaque reset_XPro_dist.py provoque-t-il des centaines de milliers de
+lectures sur cacert.pem ?
+
+Il faut vérifier si le code fait quelque chose conceptuellement équivalent à :
+while True:
+    requests.get(...)
+sans Session persistante, avec création TLS répétée et boucle trop rapide.
+
+Ou :
+while True:
+    ssl.create_default_context(cafile=certifi.where())
+    ...
+
+Ou une librairie proxy qui recharge systématiquement le CA bundle.
+
+
+10. TEST PROXYZ PROPOSÉ
+=======================
+
+Pour tester sans modifier le code :
+identifier les processus :
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+Where-Object { $_.CommandLine -like "*reset_XPro_dist.py*" } |
+Select-Object ProcessId, CommandLine
+
+Puis les arrêter temporairement :
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+Where-Object { $_.CommandLine -like "*reset_XPro_dist.py*" } |
+ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+
+Comparer immédiatement :
+AnkaBot + scripts ProxyZ
+VS
+AnkaBot sans scripts reset_XPro_dist.py
+
+Si la fluidité s'améliore fortement :
+ProxyZ devient un contributeur majeur confirmé.
+
+
+11. LIMITATION MAJEURE DE LA TRACE ACTUELLE
+============================================
+
+C'est un point essentiel.
+
+Sur environ ~11 minutes de trace, l'extraction ETWAnalyzer montrait seulement
+environ :
+- ~146 Mo de lectures physiques ;
+- ~100 Mo d'écritures physiques ;
+- ~1,23 seconde cumulée de service disque.
+
+Ce volume n'est PAS compatible avec l'idée que le NVMe était effectivement
+bloqué à 100 % pendant plusieurs minutes continues.
+
+Interprétation la plus probable :
+WPR a été lancé ALORS que le PC freezait, mais comme Windows était déjà très
+bloqué, la commande de démarrage WPR a probablement été exécutée seulement après
+le pic le plus violent.
+
+WPR ne remonte pas dans le temps.
+
+Donc la trace contient :
+- beaucoup d'informations pertinentes sur le système ;
+- plusieurs anomalies réelles ;
+mais probablement pas le coeur exact du pire épisode de saturation SSD.
+
+Conclusion :
+Il faut éviter de considérer les chiffres de cette trace comme une photographie
+parfaite du pic de 100 % disque.
+
+
+12. POURQUOI LE DEUXIÈME NVME N'EST PAS RETENU COMME SOLUTION ACTUELLE
+======================================================================
+
+Le simple déplacement d'AnkaBot sur un autre NVMe ferait certes rester Windows
+utilisable, mais ne réglerait pas la cause profonde :
+- le deuxième SSD pourrait être saturé à son tour ;
+- les instances AnkaBot continueraient alors de bloquer.
+
+L'objectif actuel n'est donc PAS de déplacer le problème.
+L'objectif est de comprendre et réduire la quantité / nature des I/O qui créent
+la file d'attente.
+
+
+13. HYPOTHÈSE GLOBALE ACTUELLE
+==============================
+
+Le problème semble probablement être une combinaison de nombreux workloads plutôt
+qu'un seul énorme flux disque.
+
+Architecture possible du problème :
+
+AnkaBot (beaucoup d'instances)
+    +
+Application_v2.0 / sous-processus
+    +
+ProxyZ
+    +
+8 x reset_XPro_dist.py
+    -> tempête de File I/O sur cacert.pem
+    +
+ASUS Framework
+    -> nombreux PowerShell + WMI
+    +
+VS Code
+    -> watchers / Git / extensions / Local History
+    +
+Windows Search
+    +
+Defender
+    +
+NTFS / Cache Manager / System
+    =
+forte contention filesystem/kernel
+    ->
+augmentation de la latence
+    ->
+queue disque qui explose
+    ->
+SSD 100 % active time
+    ->
+tout Windows devient lent / freeze.
+
+Ce schéma est actuellement une HYPOTHÈSE, pas encore une preuve définitive.
+
+
+14. PRIORITÉ DES SUSPECTS À CE STADE
+====================================
+
+Priorité élevée :
+1. ProxyZ / reset_XPro_dist.py / certifi\cacert.pem
+2. ASUS Framework / PowerShell / WMI
+3. interaction VS Code + workload AnkaBot
+
+Priorité moyenne / amplificateurs :
+4. Windows Search
+5. Defender
+6. NTFS / Cache Manager / métadonnées système
+
+Moins supporté actuellement :
+7. pagefile / manque de RAM
+8. bug user.config
+
+Le bug user.config est réel mais séparé du problème principal.
+
+
+15. CE QUE CODEX DOIT ANALYSER DANS PROXYZ
+==========================================
+
+Codex dispose du code source local de ProxyZ et doit répondre précisément à :
+
+A. Pourquoi reset_XPro_dist.py relit-il certifi\cacert.pem des centaines de
+   milliers de fois ?
+
+B. Chercher dans tout le projet :
+   - certifi
+   - cacert.pem
+   - requests
+   - urllib3
+   - httpx
+   - aiohttp
+   - ssl
+   - create_default_context
+   - SSLContext
+   - verify=
+   - Session(
+   - Client(
+   - AsyncClient(
+   - while True
+   - retry
+   - reconnect
+   - health check
+   - polling
+   - proxy test
+
+C. Identifier les boucles dont la fréquence est élevée et calculer leur nombre
+   d'itérations/seconde.
+
+D. Vérifier si un client HTTP/TLS est recréé à chaque boucle.
+
+E. Vérifier si une Session persistante pourrait être réutilisée.
+
+F. Vérifier si le contexte SSL / CA bundle peut être créé une seule fois au
+   démarrage puis réutilisé.
+
+G. Vérifier s'il existe une boucle d'erreur/retry sans sleep ou avec un délai trop
+   faible.
+
+H. Vérifier si 8 processus effectuent tous exactement la même opération et si une
+   partie du travail pourrait être mutualisée.
+
+I. Mesurer localement avant/après correction :
+   - ReadOperationCount ;
+   - WriteOperationCount ;
+   - CPU ;
+   - handles ;
+   - threads ;
+   - appels/sec ;
+   - accès cacert.pem/sec.
+
+J. Vérifier si les scripts ProxyZ ouvrent continuellement des connexions HTTPS aux
+   proxies ou à des endpoints de test.
+
+K. Produire une hypothèse causale claire reliant le code de ProxyZ aux ~4,8
+   millions de File I/O observées.
+
+
+16. TESTS A/B RECOMMANDÉS
+=========================
+
+Faire les tests avec exactement le même nombre d'instances AnkaBot.
+
+TEST 1
+AnkaBot normal + ProxyZ normal
+
+TEST 2
+AnkaBot normal + scripts reset_XPro_dist.py arrêtés
+
+TEST 3
+AnkaBot normal + ASUS Framework arrêté
+
+TEST 4
+AnkaBot normal + VS Code fermé
+
+TEST 5
+AnkaBot normal + VS Code --disable-extensions
+
+TEST 6
+AnkaBot normal + WSearch arrêté
+
+Mesurer pour chaque test :
+- temps d'activité SSD ;
+- longueur de file d'attente ;
+- latence ;
+- fluidité générale ;
+- CPU ;
+- mémoire ;
+- nombre d'I/O.
+
+
+17. PROCHAINE TRACE WPR SI NÉCESSAIRE
+=====================================
+
+La prochaine trace doit être démarrée AVANT que le freeze arrive.
+
+Ne pas refaire :
+GeneralProfile + DiskIO + FileIO + CPU pendant plusieurs minutes,
+car cela a généré un ETL de ~6,6 Go.
+
+Pour le prochain diagnostic :
+- démarrer une trace légère avant le freeze ;
+- capturer une courte fenêtre ;
+- privilégier DiskIO pour voir le vrai disque physique ;
+- ajouter FileIO uniquement sur une courte période si nécessaire.
+
+Le but est de capturer le moment exact où :
+- Disk Active Time -> 100 %
+- Disk Queue Length -> explose
+- latence -> explose
+
+puis identifier le ou les processus responsables.
+
+
+18. CONCLUSION ACTUELLE
+=======================
+
+La trace actuelle ne prouve pas encore quel processus provoque directement le pic
+de saturation physique du NVMe.
+
+En revanche, elle a révélé deux comportements très anormaux et fortement
+prioritaires :
+
+1) ASUS Framework :
+   ~23 PowerShell / WMI interrogent les processus.
+
+2) ProxyZ :
+   ~4,857 millions de lectures de fichier en ~11 minutes,
+   principalement sur certifi\cacert.pem,
+   soit environ ~7 100 lectures/sec.
+
+ProxyZ est donc la piste la plus intéressante à faire analyser maintenant au
+niveau du code source.
+
+L'objectif de l'analyse Codex doit être :
+"identifier pourquoi ProxyZ génère cette tempête de File I/O et corriger ce
+comportement sans casser les fonctions de reset/proxy."
+
+FIN DU RAPPORT
