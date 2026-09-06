@@ -2277,6 +2277,20 @@ if not logging.root.handlers:
     )
 # Utiliser un nom de logger spécifique pour que ProxyZ.py puisse le capturer
 logger = logging.getLogger("zrotate_single_proxy")
+
+
+def log_zrotate_request(method, host, port, interface_name=None):
+    """Une ligne par requête, sans chemin, jeton, en-tête ni contenu HTTPS."""
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    host = str(host).replace("\r", "\\r").replace("\n", "\\n")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    interface = json.dumps(interface_name, ensure_ascii=False)
+    logger.info(
+        f"[REQ] {str(method).upper()} → {host}:{port} | interface: {interface}",
+        extra={"zrotate_request": True},
+    )
 # Empêcher la propagation vers le logger root si un handler est déjà configuré ailleurs
 logger.propagate = True  # Laisser propager si aucun handler n'est configuré dans ProxyZ
 
@@ -4107,6 +4121,7 @@ class ZRotateSingleProxyServer:
                 # Si aucune interface n'est disponible au moment de la requête,
                 # on renvoie immédiatement une erreur au client au lieu d'attendre.
                 if not egress_info:
+                    log_zrotate_request(request_type, dest_host, dest_port)
                     logger.warning(
                         f"[{connection_id}] Aucune interface disponible pour {request_type} {dest_host}:{dest_port} (quotas pleins ou clés en reset)"
                     )
@@ -4122,15 +4137,7 @@ class ZRotateSingleProxyServer:
                 # Ancien système round-robin
                 egress_info = await self.egress_selector.get_egress()
 
-            if request_type == "CONNECT":
-                logger.info(
-                    f"[{connection_id}] Requête CONNECT reçue → {egress_info['name']} → {dest_host}:{dest_port}"
-                )
-            else:
-                logger.info(
-                    f"[{connection_id}] Nouvelle connexion depuis {client_ip}:{client_port} "
-                    f"→ Egress: {egress_info['name']} ({egress_info['ip']})"
-                )
+            log_zrotate_request(request_type, dest_host, dest_port, egress_info["name"])
 
             # Traiter la requête selon son type
             if request_type == "CONNECT":
@@ -4226,10 +4233,6 @@ class ZRotateSingleProxyServer:
                             connection_id, success=False
                         )
                     return
-
-                logger.info(
-                    f"[{connection_id}] HTTP {request_type} {dest_host}:{dest_port}{parsed.get('path', '')}"
-                )
 
                 # Reconstruire la requête en origin-form
                 rebuilt_request = rebuild_http_request(parsed, request_data)
@@ -4954,13 +4957,15 @@ class ZRotateProxyServer(QThread):
 
 
 class LogHandler(logging.Handler):
-    """Handler de logging qui émet un signal Qt"""
+    """Seules les lignes de requêtes alimentent la console réseau Qt."""
 
     def __init__(self, signal_emitter):
         super().__init__()
         self.signal_emitter = signal_emitter
 
     def emit(self, record):
+        if not getattr(record, "zrotate_request", False):
+            return
         try:
             msg = self.format(record)
             self.signal_emitter.emit(msg)
@@ -9169,21 +9174,27 @@ class MainWindow(QMainWindow):
         self.zrotate_log_box.clear()
 
     def _zrotate_log(self, message: str):
-        """Route les logs vers la console affichée (générale ou interface)."""
-        if not getattr(self, "logs_panel_enabled", False):
+        """Toutes les requêtes en général, et une copie dans leur interface."""
+        if not getattr(self, "logs_panel_enabled", False) or not message.startswith("[REQ] "):
+            return
+        try:
+            request, encoded_interface = message[6:].rsplit(" | interface: ", 1)
+            iface = json.loads(encoded_interface)
+            if iface is not None and not isinstance(iface, str):
+                return
+        except (ValueError, TypeError):
             return
         timestamp = time.strftime("%H:%M:%S")
-        line = f"[{timestamp}] {message}"
-        iface = self._resolve_log_interface(message)
-        buffer_key = iface if iface else None
-        if buffer_key is None and self._is_general_console_noise(message):
-            return
-        self._ensure_console_buffer(buffer_key)
-        buf = self._console_lines[buffer_key]
-        buf.append(line)
-        if len(buf) > CONSOLE_MAX_LINES:
-            del buf[:-CONSOLE_MAX_LINES]
-        if self._console_view == buffer_key:
+        label = encoded_interface if iface is not None else "aucune (503)"
+        line = f"[{timestamp}] {request} | interface: {label}"
+        keys = [None, iface] if iface is not None else [None]
+        for key in keys:
+            self._ensure_console_buffer(key)
+            buf = self._console_lines[key]
+            buf.append(line)
+            if len(buf) > CONSOLE_MAX_LINES:
+                del buf[:-CONSOLE_MAX_LINES]
+        if self._console_view in keys:
             self.zrotate_log_box.append(line)
             self._scroll_console_to_bottom()
 
