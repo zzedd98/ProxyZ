@@ -67,7 +67,8 @@ IDLE_BROWSER_CLOSE_SECONDS = 15 * 60
 IP_VERIFY_UNCHANGED_LIMIT = 5
 IP_VERIFY_INTERVAL_SECONDS = 0.9
 IP_VERIFY_INITIAL_DELAY_SECONDS = 2.8
-RESET_ATTEMPTS_ON_STALE_IP = 2
+# ProxyZ espace et plafonne les reprises : une seule tentative par exécution.
+RESET_ATTEMPTS_ON_STALE_IP = 1
 HEADLESS = os.environ.get("RESET_XPRO_HEADLESS", "1").strip().lower() not in (
     "0",
     "false",

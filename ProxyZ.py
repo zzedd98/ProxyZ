@@ -2337,7 +2337,48 @@ GAME_SERVER_QUOTA_KEY = "game_server"  # CONNECT vers IP (x.x.x.x)
 GET_QUOTA_KEY = "get"  # GET (ex. ipinfo.io/ip) : 2 max par interface
 
 # Après N échecs consécutifs du script de reset : quarantaine (plus de reset auto, hors pool).
-MAX_CONSECUTIVE_RESET_FAILURES = 5
+MAX_CONSECUTIVE_RESET_FAILURES = 10
+RESET_RETRY_DELAY_SECONDS = 30.0
+RESET_POOL_RETURN_DELAY_SECONDS = 5.0
+
+
+class ResetRetryPolicy:
+    """État de session commun aux demandes HTTP, ZRotate et aux clics manuels.
+
+    Une tentative correspond à une exécution du driver de reset. Seul un
+    succès ou un clic manuel réarme la série ; aucune reprise après annulation.
+    Utilisé uniquement depuis le thread Qt.
+    """
+
+    def __init__(self):
+        self.failures = {}
+        self.next_retry = {}
+        self.blocked = set()
+
+    def can_start(self, name, now):
+        return name not in self.blocked and now >= self.next_retry.get(name, 0.0)
+
+    def rearm(self, name):
+        self.blocked.discard(name)
+        self.failures.pop(name, None)
+        self.next_retry.pop(name, None)
+
+    def cancel(self, name):
+        self.blocked.add(name)
+        self.next_retry.pop(name, None)
+
+    def finish(self, name, success, now):
+        if name in self.blocked:
+            return  # Un résultat tardif ne doit pas annuler un Clean.
+        if success:
+            self.rearm(name)
+            return
+        count = self.failures.get(name, 0) + 1
+        self.failures[name] = count
+        if count >= MAX_CONSECUTIVE_RESET_FAILURES:
+            self.cancel(name)
+        else:
+            self.next_retry[name] = now + RESET_RETRY_DELAY_SECONDS
 
 
 def _host_is_ip_only(host: str) -> bool:
@@ -2372,7 +2413,7 @@ class InterfaceQuotaManager:
         # Exemple: {"Clé 101": {"GET": {"ipinfo.io:80": QuotaInfo(2)}}}
         self.quotas: Dict[str, Dict[str, Dict[str, QuotaInfo]]] = {}
         self.available_interfaces: list = (
-            egress_configs.copy()
+            [cfg for cfg in egress_configs if not cfg.get("reset_blocked")]
         )  # Interfaces disponibles
         self.resetting_interfaces: set = set()  # Interfaces en cours de reset
         self._lock = asyncio.Lock()
@@ -2399,11 +2440,9 @@ class InterfaceQuotaManager:
         # Clés retirées du pool (3 échecs) : retry reset toutes les 30s jusqu'à remise en pool
         self._keys_removed_from_pool: set = set()
         self._consecutive_reset_failures: Dict[str, int] = {}
-        self._quarantine_interfaces: set = set()
-        # Reprise automatique de quarantaine (backoff exponentiel) : une clé en
-        # quarantaine n'est plus un cul-de-sac, on retente un reset de temps en temps.
-        self._quarantine_backoff: Dict[str, float] = {}
-        self._quarantine_next_retry: Dict[str, float] = {}
+        self._quarantine_interfaces: set = {cfg["name"] for cfg in egress_configs if cfg.get("reset_blocked")}
+        # Quarantaine permanente jusqu'à un reset demandé manuellement.
+        self._reset_next_retry: Dict[str, float] = {}
         self._pool_health_task: Optional[asyncio.Task] = None
         # Event pour réveiller les requêtes en attente quand une interface redevient disponible
         self._interface_available_event = asyncio.Event()
@@ -2510,6 +2549,8 @@ class InterfaceQuotaManager:
                             continue
                         if key_name in self.resetting_interfaces:
                             continue  # un reset est déjà en cours : pas de double
+                        if time.monotonic() < self._reset_next_retry.get(key_name, 0.0):
+                            continue
                         if key_name in (a["name"] for a in self.available_interfaces):
                             continue  # déjà remise
                         if not self._reset_callback:
@@ -2528,43 +2569,11 @@ class InterfaceQuotaManager:
             except Exception as e:
                 logger.error(f"[QUOTA] Erreur dans _retry_reset_loop: {e}")
 
-    async def _recover_quarantined_interfaces(self) -> None:
-        """Reprise de quarantaine (backoff) : retente périodiquement un reset des
-        clés quarantorées au lieu de les laisser hors pool indéfiniment. Un reset
-        réussi les sort automatiquement de la quarantaine."""
-        now_mono = time.monotonic()
-        async with self._lock:
-            candidates = [
-                n
-                for n in list(self._quarantine_interfaces)
-                if n not in self.resetting_interfaces
-                and now_mono >= self._quarantine_next_retry.get(n, 0.0)
-            ]
-            for name in candidates:
-                # Prochain essai avec backoff exponentiel (plafond 30 min).
-                backoff = min(self._quarantine_backoff.get(name, 60.0) * 2, 1800.0)
-                self._quarantine_backoff[name] = backoff
-                self._quarantine_next_retry[name] = time.monotonic() + backoff
-                if not self._reset_callback:
-                    continue
-                self.resetting_interfaces.add(name)
-                try:
-                    self._reset_callback.reset_interface(name)
-                    logger.info(
-                        f"[QUOTA] ♻️ Reprise quarantaine : nouvelle tentative de "
-                        f"reset pour {name} (prochain essai dans {int(backoff)}s)"
-                    )
-                except Exception as e:
-                    logger.error(f"[QUOTA] Erreur reprise quarantaine {name}: {e}")
-                    self.resetting_interfaces.discard(name)
-
     async def _pool_health_loop(self):
         """Toutes les 30s : retire du pool les clés qui n'obtiennent pas d'IP publique via leur egress."""
         while True:
             try:
                 await asyncio.sleep(30)
-                # Tenter de sortir les clés quarantorées (backoff).
-                await self._recover_quarantined_interfaces()
                 async with self._lock:
                     snapshot = [
                         dict(x)
@@ -2757,6 +2766,8 @@ class InterfaceQuotaManager:
     def _request_interface_reset(self, interface_name: str, reason: str):
         """Retire l'interface du pool et déclenche un reset réel avant retour à 0/0."""
         if interface_name in self.resetting_interfaces:
+            return
+        if time.monotonic() < self._reset_next_retry.get(interface_name, 0.0):
             return
         if interface_name in self._quarantine_interfaces:
             logger.warning(
@@ -3039,7 +3050,7 @@ class InterfaceQuotaManager:
                 # Ne pas compter comme échec si l'interface est déjà en reset : les déconnexions
                 # (ex. ConnectionResetError WinError 64 "nom réseau plus disponible") sont normales
                 # quand le modem est réinitialisé et ne doivent pas déclencher retrait du pool.
-                if interface_name in self.resetting_interfaces:
+                if interface_name in self.resetting_interfaces or interface_name in self._quarantine_interfaces:
                     logger.debug(
                         f"[QUOTA] {interface_name}: {request_type} {domain_key} fermée pendant reset (non comptée comme échec)"
                     )
@@ -3162,6 +3173,8 @@ class InterfaceQuotaManager:
                 logger.error(f"[QUOTA] ❌ Script reset introuvable: {script_path}")
 
             # Réinitialiser tous les quotas et remettre l'interface disponible
+            if reset_ok:
+                await asyncio.sleep(RESET_POOL_RETURN_DELAY_SECONDS)
             await self._release_interface_after_reset(interface_name, reset_ok)
 
         except Exception as e:
@@ -3253,8 +3266,8 @@ class InterfaceQuotaManager:
             self._keys_removed_from_pool.discard(interface_name)
             self._consecutive_reset_failures.pop(interface_name, None)
             self._interface_failure_count[interface_name] = 0
-            self._quarantine_backoff.pop(interface_name, None)
-            self._quarantine_next_retry.pop(interface_name, None)
+            self._quarantine_interfaces.add(interface_name)
+            self._reset_next_retry.pop(interface_name, None)
             # Ne PAS ré-ajouter au pool (IP indéterminée après kill).
             self.available_interfaces = [
                 i for i in self.available_interfaces if i["name"] != interface_name
@@ -3270,11 +3283,36 @@ class InterfaceQuotaManager:
             except Exception:
                 pass
 
+    async def prepare_manual_reset(self, interface_name: str):
+        """Seul un clic manuel peut sortir de l'arrêt après annulation/plafond."""
+        async with self._lock:
+            self._quarantine_interfaces.discard(interface_name)
+            self._consecutive_reset_failures.pop(interface_name, None)
+            self._reset_next_retry.pop(interface_name, None)
+            self._keys_removed_from_pool.discard(interface_name)
+            self.resetting_interfaces.add(interface_name)
+            self.available_interfaces = [i for i in self.available_interfaces if i["name"] != interface_name]
+            self._interface_available_event_clear_if_empty()
+
+    async def defer_interface_reset(self, interface_name: str, deadline: float):
+        """Libère une demande prématurée déjà en file sans consommer un essai."""
+        async with self._lock:
+            if interface_name in self._quarantine_interfaces:
+                return
+            self.resetting_interfaces.discard(interface_name)
+            self._keys_removed_from_pool.add(interface_name)
+            self._reset_next_retry[interface_name] = max(
+                deadline, self._reset_next_retry.get(interface_name, 0.0)
+            )
+            await self.start_retry_reset_task()
+
     async def _release_interface_after_reset(
         self, interface_name: str, reset_succeeded: bool = True
     ):
         """Remet une interface en disponibilité après reset (manuel ou ZRotate) et réinitialise tous ses quotas."""
         async with self._lock:
+            if interface_name in self._quarantine_interfaces:
+                return  # Résultat tardif après annulation : aucun réarmement implicite.
             # Réinitialiser tous les quotas de l'interface (CONNECT game_server, GET, etc.)
             new_quotas_str = []
             if interface_name in self.quotas:
@@ -3318,9 +3356,7 @@ class InterfaceQuotaManager:
             if reset_succeeded:
                 self._consecutive_reset_failures.pop(interface_name, None)
                 self._quarantine_interfaces.discard(interface_name)
-                # Sortie de quarantaine réussie : réinitialiser le backoff.
-                self._quarantine_backoff.pop(interface_name, None)
-                self._quarantine_next_retry.pop(interface_name, None)
+                self._reset_next_retry.pop(interface_name, None)
                 if interface_info:
                     names_in_available = [a["name"] for a in self.available_interfaces]
                     if interface_name not in names_in_available:
@@ -3342,35 +3378,21 @@ class InterfaceQuotaManager:
                 n = self._consecutive_reset_failures.get(interface_name, 0) + 1
                 self._consecutive_reset_failures[interface_name] = n
                 if n >= MAX_CONSECUTIVE_RESET_FAILURES:
-                    already_q = interface_name in self._quarantine_interfaces
                     self._quarantine_interfaces.add(interface_name)
                     self._keys_removed_from_pool.discard(interface_name)
-                    # Programmer une reprise automatique (backoff) : la quarantaine
-                    # n'est plus définitive, on retentera un reset plus tard.
-                    self._quarantine_backoff.setdefault(interface_name, 60.0)
-                    self._quarantine_next_retry[interface_name] = (
-                        time.monotonic() + self._quarantine_backoff[interface_name]
+                    self._reset_next_retry.pop(interface_name, None)
+                    logger.error(
+                        f"[QUOTA] 🛑 {interface_name} : {n}/{MAX_CONSECUTIVE_RESET_FAILURES} "
+                        "tentatives échouées — arrêt automatique, intervention manuelle requise"
                     )
-                    if not already_q:
-                        logger.error(
-                            f"[QUOTA] 🛑 {interface_name} en quarantaine après {n} échec(s) de reset consécutifs "
-                            f"(seuil {MAX_CONSECUTIVE_RESET_FAILURES}) — reprise auto (backoff) programmée"
-                        )
                 else:
                     self._keys_removed_from_pool.add(interface_name)
+                    self._reset_next_retry[interface_name] = time.monotonic() + RESET_RETRY_DELAY_SECONDS
                     await self.start_retry_reset_task()
-                    if self._reset_callback and interface_info:
-                        try:
-                            self.resetting_interfaces.add(interface_name)
-                            self._reset_callback.reset_interface(interface_name)
-                            logger.info(
-                                f"[QUOTA] 🔄 Nouvelle tentative de reset pour {interface_name} (suite à échec, {n}/{MAX_CONSECUTIVE_RESET_FAILURES})"
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"[QUOTA] Erreur callback reset après échec: {e}"
-                            )
-                            self.resetting_interfaces.discard(interface_name)
+                    logger.info(
+                        f"[QUOTA] {interface_name} : échec {n}/{MAX_CONSECUTIVE_RESET_FAILURES}, "
+                        f"prochain essai dans au moins {RESET_RETRY_DELAY_SECONDS:.0f}s"
+                    )
 
             # Notifier l'UI : interface à nouveau disponible (badge RESET)
             if self._usage_callback:
@@ -6074,6 +6096,7 @@ class MainWindow(QMainWindow):
         self._reset_procs_lock = threading.Lock()
         self._reset_cleaning = False
         self._closing = False
+        self._reset_retry_policy = ResetRetryPolicy()
         self._reset_duration_sums: dict[str, float] = {}
         self._reset_duration_counts: dict[str, int] = {}
         self._refresh_after_reset_timer = QTimer(self)
@@ -6098,6 +6121,9 @@ class MainWindow(QMainWindow):
         self._connection_stats_timer.setInterval(CONNECTION_STATS_REFRESH_MS)
         self._connection_stats_timer.timeout.connect(self._refresh_connection_stats_ui)
         self._load_config()
+        blocked_resets = self.config.get("reset_manual_required", [])
+        if isinstance(blocked_resets, list):
+            self._reset_retry_policy.blocked.update(n for n in blocked_resets if isinstance(n, str))
 
         self.interface_manager.interfaces_updated.connect(self.on_interfaces_updated)
         self.interface_manager.public_ip_updated.connect(self.on_public_ip_updated)
@@ -8188,6 +8214,36 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     print(f"[RESET] ⚠️ Erreur annulation ZRotate: {e}")
 
+    def _prepare_manual_reset_in_zrotate(self, name: str):
+        server = self.zrotate_proxy_server
+        qm = getattr(getattr(server, "proxy_server", None), "quota_manager", None)
+        loop = getattr(server, "loop", None)
+        if qm and loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(qm.prepare_manual_reset(name), loop)
+
+    def _save_reset_blocks(self):
+        """Écriture uniquement au blocage/réarmement, jamais sur les connexions."""
+        blocked = sorted(self._reset_retry_policy.blocked)
+        if blocked == self.config.get("reset_manual_required", []):
+            return
+        try:
+            path = self._config_path()
+            data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            data["reset_manual_required"] = blocked
+            _atomic_write_json(path, data)
+            self.config["reset_manual_required"] = blocked
+        except Exception as exc:
+            self._zrotate_log(f"[RESET] Blocage actif mais sauvegarde impossible : {exc}")
+
+    def _defer_reset_in_zrotate(self, name: str):
+        server = self.zrotate_proxy_server
+        qm = getattr(getattr(server, "proxy_server", None), "quota_manager", None)
+        loop = getattr(server, "loop", None)
+        if qm and loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                qm.defer_interface_reset(name, self._reset_retry_policy.next_retry[name]), loop
+            )
+
     def _interface_has_reset(self, name: str) -> bool:
         if name in self._remote_interfaces:
             return bool(self._remote_iface_reset_script(name))
@@ -8268,6 +8324,19 @@ class MainWindow(QMainWindow):
         self._reset_in_progress.discard(name)
         was_cancelled = name in self._reset_cancelled
         self._reset_cancelled.discard(name)
+        if returncode == -4 or was_cancelled:
+            self._reset_retry_policy.cancel(name)
+        else:
+            self._reset_retry_policy.finish(name, returncode == 0, time.monotonic())
+        self._save_reset_blocks()
+        if name in self._reset_retry_policy.blocked:
+            self._zrotate_log(f"[RESET] 🛑 '{name}' : reprises automatiques bloquées — cliquer RESET pour réarmer")
+        elif returncode != 0:
+            count = self._reset_retry_policy.failures.get(name, 0)
+            self._zrotate_log(
+                f"[RESET] '{name}' : échec {count}/{MAX_CONSECUTIVE_RESET_FAILURES}, "
+                f"nouvelle tentative autorisée dans {RESET_RETRY_DELAY_SECONDS:.0f}s minimum"
+            )
         try:
             widget = self.interface_widgets.get(name)
             if widget:
@@ -8313,7 +8382,7 @@ class MainWindow(QMainWindow):
             )
 
         try:
-            if returncode == -4 or was_cancelled:
+            if returncode == -4 or was_cancelled or name in self._reset_retry_policy.blocked:
                 # Annulation utilisateur : nettoyer l'état SANS compter d'échec ni
                 # relancer de reset (sinon le quota manager en redéclenche un aussitôt,
                 # d'où l'impression que « ça ne s'arrête pas »).
@@ -8378,6 +8447,12 @@ class MainWindow(QMainWindow):
             return False
         if name in self._reset_in_progress:
             return False
+        if not interactive and not self._reset_retry_policy.can_start(name, time.monotonic()):
+            if name in self._reset_retry_policy.blocked:
+                self._cancel_interface_in_zrotate(name)
+            else:
+                self._defer_reset_in_zrotate(name)
+            return False
         with self._reset_procs_lock:
             previous = self._reset_procs.get(name)
             if previous is not None and previous.poll() is None:
@@ -8436,6 +8511,10 @@ class MainWindow(QMainWindow):
         app_dir = get_app_dir()
         script_path = resolve_reset_script_path(reset_script, app_dir)
 
+        if interactive:
+            self._reset_retry_policy.rearm(name)
+            self._save_reset_blocks()
+            self._prepare_manual_reset_in_zrotate(name)
         self._reset_in_progress.add(name)
         self._reset_cancelled.discard(name)
         if widget:
@@ -8483,6 +8562,14 @@ class MainWindow(QMainWindow):
                     on_process_start=lambda p, n=name: self._register_reset_proc(n, p),
                 )
                 elapsed = time.time() - t0
+                if return_code == 0 and name not in self._reset_cancelled:
+                    ui_log(
+                        f"[RESET] '{name}' : reset réussi, remise dans le pool "
+                        f"dans {RESET_POOL_RETURN_DELAY_SECONDS:.0f}s"
+                    )
+                    # Garder l'interface en cours de reset pendant le repos.
+                    # Seul ce worker attend, pas Qt ni les autres interfaces.
+                    time.sleep(RESET_POOL_RETURN_DELAY_SECONDS)
                 # Reset interrompu par l'utilisateur (kill du process) → code -4.
                 if name in self._reset_cancelled:
                     ui_log(f"[RESET] ⛔ Reset '{name}' interrompu par l'utilisateur")
@@ -8536,8 +8623,11 @@ class MainWindow(QMainWindow):
         with self._reset_procs_lock:
             tracked = dict(self._reset_procs)
         self._reset_cancelled.update(tracked)
-        for name in set(tracked) | self._reset_in_progress:
+        affected = set(tracked) | self._reset_in_progress | set(self._reset_retry_policy.failures) | self._reset_retry_policy.blocked
+        for name in affected:
+            self._reset_retry_policy.cancel(name)
             self._cancel_interface_in_zrotate(name)
+        self._save_reset_blocks()
         app_dir = get_app_dir()
         keys = {"reset_XPro_dist.py", "reset_XPro.py", "reset_huawei.py", "reset_modem.py",
                 self.config.get("reset_script_default", DEFAULT_RESET_SCRIPT)}
@@ -8578,6 +8668,9 @@ class MainWindow(QMainWindow):
         reset (cas reset_XPro_dist). Un reset Playwright en-process ne peut pas
         être tué à mi-course : on le signale."""
         self._reset_cancelled.add(name)
+        self._reset_retry_policy.cancel(name)
+        self._save_reset_blocks()
+        self._cancel_interface_in_zrotate(name)
         # Retour visuel immédiat : couper l'animation du bouton tout de suite
         # (l'état complet sera nettoyé par _on_reset_completed dès la mort du process).
         widget = self.interface_widgets.get(name)
@@ -9633,6 +9726,10 @@ class MainWindow(QMainWindow):
                 "⚠️ Clés non ajoutées au pool (pas d'IP ou inactives): "
                 + ", ".join(missing_ips)
             )
+
+        # Un redémarrage de ZRotate ne réarme pas les interfaces arrêtées par Clean/plafond.
+        for cfg in egress_configs:
+            cfg["reset_blocked"] = cfg["name"] in self._reset_retry_policy.blocked
 
         # Parser l'URL du serveur (source unique: proxy_configs.json -> zrotate.server_url)
         url_text = str(

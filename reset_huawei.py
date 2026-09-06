@@ -60,7 +60,8 @@ MODEM_WEB_URL = "http://192.168.8.1/#/mobileconnection"
 IDLE_BROWSER_CLOSE_SECONDS = 15 * 60
 IP_VERIFY_UNCHANGED_LIMIT = 2
 IP_VERIFY_INTERVAL_SECONDS = 5
-RESET_ATTEMPTS_ON_STALE_IP = 2
+# ProxyZ espace et plafonne les reprises : une seule tentative par exécution.
+RESET_ATTEMPTS_ON_STALE_IP = 1
 
 
 def _log(message: str, proxy_port: int | None = None) -> None:
