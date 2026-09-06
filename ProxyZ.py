@@ -852,65 +852,134 @@ def build_reset_command(script_path: Path, proxy_port: int) -> list[str]:
 
 
 _RESET_MODULE_CACHE: dict[str, tuple] = {}
+_RESET_SPAWN_LOCK = threading.Lock()
+_RESET_SHUTTING_DOWN = threading.Event()
 
 
-def _terminate_process_tree(proc, timeout: float = 5.0) -> None:
-    """
-    Tue un process ET tous ses enfants. subprocess.run/Popen ne tuent que le
-    parent direct : un reset Playwright lancé en subprocess laisse sinon des
-    Chromium orphelins. On descend l'arbre via psutil.
-    """
+def _terminate_process_tree(proc, timeout: float = 5.0, log_fn=None) -> bool:
+    """Termine l'arbre identifié, vérifie l'arrêt et conserve le secours Popen."""
+    log = log_fn or print
     if proc is None:
-        return
-    parent = None
+        return True
+    is_popen = isinstance(proc, subprocess.Popen)
+    if is_popen and proc.poll() is not None:
+        return True  # Ne jamais rechercher un PID déjà libéré et potentiellement réutilisé.
     procs = []
+    inspected = True
     try:
-        parent = psutil.Process(proc.pid)
-        procs = parent.children(recursive=True)
-        procs.append(parent)
-    except Exception:
-        parent = None
+        parent = psutil.Process(proc.pid) if is_popen else proc
+        procs = [parent]
+        procs = parent.children(recursive=True) + [parent]
+        if is_popen and proc.poll() is not None:
+            return True  # Le parent a pu sortir pendant la recherche psutil.
+    except psutil.NoSuchProcess:
+        pass
+    except Exception as exc:
+        inspected = False
+        log(f"[RESET CLEAN] PID {proc.pid} : arbre inaccessible : {exc}")
     for p in procs:
         try:
             p.terminate()
-        except Exception:
+        except psutil.NoSuchProcess:
             pass
-    alive = []
+        except Exception as exc:
+            log(f"[RESET CLEAN] PID {p.pid} : terminate a échoué : {exc}")
     try:
         _gone, alive = psutil.wait_procs(procs, timeout=timeout)
-    except Exception:
+    except Exception as exc:
+        log(f"[RESET CLEAN] Vérification intermédiaire impossible : {exc}")
         alive = procs
     for p in alive:
         try:
             p.kill()
-        except Exception:
+        except psutil.NoSuchProcess:
             pass
+        except Exception as exc:
+            log(f"[RESET CLEAN] PID {p.pid} : kill a échoué : {exc}")
+    # Sur Windows Popen utilise le handle original, même si psutil est inaccessible.
+    parent_stopped = True
+    if is_popen:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=1)
+        except Exception as exc:
+            parent_stopped = False
+            log(f"[RESET CLEAN] PID {proc.pid} : arrêt non confirmé : {exc}")
     try:
-        proc.wait(timeout=1)
-    except Exception:
-        pass
+        _gone, survivors = psutil.wait_procs(alive, timeout=1)
+    except Exception as exc:
+        log(f"[RESET CLEAN] Vérification finale impossible : {exc}")
+        return False
+    if survivors:
+        log(f"[RESET CLEAN] Encore actifs : {[p.pid for p in survivors]}")
+    confirmed = inspected and parent_stopped and not survivors
+    log(f"[RESET CLEAN] PID {proc.pid} : " + (
+        "arrêt de l'arbre confirmé" if confirmed else "nettoyage incomplet ou non vérifiable"
+    ))
+    return confirmed
 
 
-def _run_subprocess_tree(cmd, timeout, cwd, creationflags: int = 0, on_process_start=None) -> int:
+def _find_reset_helpers(script_paths, log_fn):
+    """Retrouve nos helpers Python, y compris orphelins, par chemin exact."""
+    allowed = {os.path.normcase(os.path.abspath(str(p))) for p in script_paths}
+    found = []
+    inaccessible = 0
+    for proc in psutil.process_iter():
+        try:
+            if not proc.is_running():
+                continue
+            cmd = proc.cmdline()
+            if len(cmd) < 2 or not re.fullmatch(
+                r"python(?:\d+(?:\.\d+)*)?w?(?:\.exe)?", Path(cmd[0]).name, re.I
+            ):
+                continue
+            # Les commandes générées par ProxyZ passent le script en premier argument.
+            script = Path(cmd[1])
+            if not script.is_absolute():
+                script = Path(proc.cwd()) / script
+            if os.path.normcase(os.path.abspath(str(script))) not in allowed:
+                continue
+            parent = proc.parent()
+            if parent is not None and parent.pid != os.getpid():
+                log_fn(f"[RESET CLEAN] PID {proc.pid} ignoré : autre parent actif ({parent.pid})")
+                continue
+            found.append(proc)  # Objet psutil : identité PID + date de création conservée.
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied:
+            # Impossible d'identifier ce processus : ne pas le tuer à l'aveugle.
+            inaccessible += 1
+            continue
+    if inaccessible:
+        log_fn(f"[RESET CLEAN] {inaccessible} processus non inspectable(s) faute de droits (pas nécessairement des resets)")
+    return found
+
+
+def _run_subprocess_tree(cmd, timeout, cwd, creationflags: int = 0, on_process_start=None, log_fn=None) -> int:
     """
     Lance un subprocess et renvoie son code de retour. En cas de timeout, tue
     tout l'arbre de process avant de propager subprocess.TimeoutExpired.
     `on_process_start(proc)` est appelé dès le démarrage pour permettre une
     interruption externe (ex. re-clic sur RESET → kill de l'arbre de process).
     """
-    proc = subprocess.Popen(cmd, cwd=cwd, creationflags=creationflags)
-    if on_process_start is not None:
-        try:
-            on_process_start(proc)
-        except Exception:
-            pass
+    with _RESET_SPAWN_LOCK:
+        if _RESET_SHUTTING_DOWN.is_set():
+            raise RuntimeError("Fermeture de ProxyZ : lancement de reset annulé")
+        proc = subprocess.Popen(cmd, cwd=cwd, creationflags=creationflags)
+        if on_process_start is not None:
+            try:
+                on_process_start(proc)
+            except Exception:
+                _terminate_process_tree(proc, log_fn=log_fn)
+                raise
     try:
         return proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _terminate_process_tree(proc)
+        _terminate_process_tree(proc, log_fn=log_fn)
         raise
     except BaseException:
-        _terminate_process_tree(proc)
+        _terminate_process_tree(proc, log_fn=log_fn)
         raise
 
 
@@ -1251,6 +1320,7 @@ def _run_playwright_reset_subprocess(
         cwd=str(get_app_dir()),
         creationflags=CREATE_NO_WINDOW,
         on_process_start=on_process_start,
+        log_fn=log_fn,
     )
 
 
@@ -1316,6 +1386,7 @@ def run_reset_script(
         timeout=timeout_seconds,
         cwd=str(get_app_dir()),
         on_process_start=on_process_start,
+        log_fn=log_fn,
     )
 
 
@@ -5940,6 +6011,7 @@ class MainWindow(QMainWindow):
     # Signal émis par le thread de reset vers le thread Qt principal (name, returncode: 0=ok, -1=script absent, -2=timeout, autre=échec)
     reset_completed = Signal(str, int, float)
     reset_log = Signal(str)
+    reset_clean_completed = Signal(str)
     remote_public_ip_updated = Signal(str, str, bool)  # name, public_ip, online
 
     def __init__(self):
@@ -6000,6 +6072,8 @@ class MainWindow(QMainWindow):
         self._reset_procs: dict[str, "subprocess.Popen"] = {}
         self._reset_cancelled: set[str] = set()
         self._reset_procs_lock = threading.Lock()
+        self._reset_cleaning = False
+        self._closing = False
         self._reset_duration_sums: dict[str, float] = {}
         self._reset_duration_counts: dict[str, int] = {}
         self._refresh_after_reset_timer = QTimer(self)
@@ -6033,6 +6107,7 @@ class MainWindow(QMainWindow):
         # Connexion du signal reset_completed pour arrêter l'animation après un reset
         self.reset_completed.connect(self._on_reset_completed)
         self.reset_log.connect(self._on_reset_log)
+        self.reset_clean_completed.connect(self._on_reset_clean_completed)
         self.remote_public_ip_updated.connect(self._on_remote_public_ip_updated)
         self.interface_manager.public_ip_timer.timeout.connect(
             self.refresh_remote_public_ips
@@ -6191,20 +6266,18 @@ class MainWindow(QMainWindow):
         left.setContentsMargins(12, 12, 12, 12)
         left.setSpacing(10)
 
-        # Ligne boutons (Options / paramètres / ajout interface distante)
+        # Ligne boutons (Options / nettoyage resets / ajout interface distante)
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
 
-        # Bouton paramètres réseau global
-        self.global_settings_button = QPushButton()
-        self.global_settings_button.setObjectName("globalSettingsButton")
-        self.global_settings_button.setText("⚙ Paramètres réseau")
-        self.global_settings_button.setToolTip("Ouvrir les connexions réseau Windows")
-        # Hauteur fixe pour garantir un vrai "pill button" arrondi
-        self.global_settings_button.setFixedHeight(34)
-        self.global_settings_button.clicked.connect(
-            lambda: self.on_interface_settings_requested("")
+        self.reset_clean_button = QPushButton("Force Clean")
+        self.reset_clean_button.setObjectName("globalSettingsButton")
+        self.reset_clean_button.setFixedHeight(34)
+        self.reset_clean_button.setToolTip(
+            "Forcer l'arrêt des helpers de reset de cette instance et des anciens "
+            "helpers orphelins du même dossier. Le reset du modem peut continuer."
         )
+        self.reset_clean_button.clicked.connect(self._clean_reset_processes)
 
         # Options (warmup / serveur reset) en popup — sans flèche menu
         self.options_button = QPushButton("Options")
@@ -6222,7 +6295,7 @@ class MainWindow(QMainWindow):
         self.add_remote_iface_button.clicked.connect(self._on_add_remote_interface)
 
         title_row.addWidget(self.options_button)
-        title_row.addWidget(self.global_settings_button)
+        title_row.addWidget(self.reset_clean_button)
         title_row.addWidget(self.add_remote_iface_button)
         title_row.addStretch(1)
 
@@ -8190,6 +8263,8 @@ class MainWindow(QMainWindow):
     @Slot(str, int, float)
     def _on_reset_completed(self, name: str, returncode: int, elapsed_s: float):
         """Appelé sur le thread Qt principal après la fin du script de reset (évite les crashes)."""
+        if self._closing:
+            return
         self._reset_in_progress.discard(name)
         was_cancelled = name in self._reset_cancelled
         self._reset_cancelled.discard(name)
@@ -8298,9 +8373,17 @@ class MainWindow(QMainWindow):
         """Cœur du reset : résout port + script et lance le thread de reset.
         interactive=True (bouton) → pop-up en cas d'erreur ; sinon (ZRotate/HTTP)
         simples logs. Retourne True si le reset a démarré."""
+        if self._closing or self._reset_cleaning:
+            self._cancel_interface_in_zrotate(name)
+            return False
         if name in self._reset_in_progress:
             return False
-
+        with self._reset_procs_lock:
+            previous = self._reset_procs.get(name)
+            if previous is not None and previous.poll() is None:
+                self._zrotate_log(f"[RESET] '{name}' : ancien helper encore actif, utiliser Clean resets")
+                self._cancel_interface_in_zrotate(name)
+                return False
         def _err(title: str, msg: str):
             if interactive:
                 QMessageBox.warning(self, title, msg)
@@ -8354,6 +8437,7 @@ class MainWindow(QMainWindow):
         script_path = resolve_reset_script_path(reset_script, app_dir)
 
         self._reset_in_progress.add(name)
+        self._reset_cancelled.discard(name)
         if widget:
             widget.set_reset_loading(True)
 
@@ -8423,7 +8507,9 @@ class MainWindow(QMainWindow):
                     self.reset_completed.emit(name, -3, 0.0)
             finally:
                 with self._reset_procs_lock:
-                    self._reset_procs.pop(name, None)
+                    proc = self._reset_procs.get(name)
+                    if proc is not None and proc.poll() is not None:
+                        self._reset_procs.pop(name, None)
 
         threading.Thread(target=run_reset, daemon=True).start()
         return True
@@ -8434,10 +8520,58 @@ class MainWindow(QMainWindow):
             self._reset_procs[name] = proc
         # Course : si l'annulation est arrivée AVANT l'enregistrement du process
         # (clic très rapide), on tue le process immédiatement.
-        if name in self._reset_cancelled:
-            threading.Thread(
-                target=_terminate_process_tree, args=(proc,), daemon=True
-            ).start()
+        if name in self._reset_cancelled or self._closing:
+            # Déjà dans le worker de reset : attendre l'arrêt avant de rendre
+            # le verrou de lancement, pour ne pas créer d'orphelin à la fermeture.
+            _terminate_process_tree(proc, log_fn=self.reset_log.emit)
+
+    def _clean_reset_processes(self) -> None:
+        """Nettoyage manuel non bloquant ; aucun kill global par nom Python."""
+        if self._reset_cleaning or self._closing:
+            return
+        self._reset_cleaning = True
+        self.reset_clean_button.setEnabled(False)
+        self.reset_clean_button.setText("Nettoyage…")
+        self._reset_cancelled.update(self._reset_in_progress)
+        with self._reset_procs_lock:
+            tracked = dict(self._reset_procs)
+        self._reset_cancelled.update(tracked)
+        for name in set(tracked) | self._reset_in_progress:
+            self._cancel_interface_in_zrotate(name)
+        app_dir = get_app_dir()
+        keys = {"reset_XPro_dist.py", "reset_XPro.py", "reset_huawei.py", "reset_modem.py",
+                self.config.get("reset_script_default", DEFAULT_RESET_SCRIPT)}
+        keys.update(cfg.get("reset_script") for cfg in self.config.get("interface_proxies", {}).values())
+        paths = [resolve_reset_script_path(key, app_dir) for key in keys if key]
+        self._zrotate_log("[RESET CLEAN] Recherche des helpers ; les resets internes ne peuvent pas être forcés.")
+
+        def clean():
+            log = self.reset_log.emit
+            try:
+                targets = {p.pid: p for p in tracked.values() if p.poll() is None}
+                for proc in _find_reset_helpers(paths, log):
+                    targets.setdefault(proc.pid, proc)
+                # Les attentes s'effectuent en parallèle, sans bloquer Qt ni les proxys.
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    results = list(pool.map(
+                        lambda p: _terminate_process_tree(p, log_fn=log), targets.values()
+                    ))
+                summary = (f"{sum(results)}/{len(results)} arbre(s) arrêté(s) et vérifié(s). "
+                           "Les processus non identifiables ne sont pas forcés.")
+            except Exception as exc:
+                summary = f"Nettoyage incomplet : {exc}"
+            self.reset_clean_completed.emit(summary)
+
+        threading.Thread(target=clean, daemon=True).start()
+
+    @Slot(str)
+    def _on_reset_clean_completed(self, summary: str) -> None:
+        self._reset_cleaning = False
+        self.reset_clean_button.setEnabled(not self._closing)
+        self.reset_clean_button.setText("Clean resets")
+        self._zrotate_log(f"[RESET CLEAN] {summary}")
+        if not self._closing:
+            QMessageBox.information(self, "Clean resets", summary)
 
     def _cancel_reset(self, name: str) -> None:
         """Interrompt un reset en cours : tue l'arbre de process du subprocess de
@@ -8459,7 +8593,8 @@ class MainWindow(QMainWindow):
             # Tuer l'arbre de process en tâche de fond pour ne pas geler l'UI :
             # le proc.wait() du thread de reset se débloquera dès la mort du process.
             threading.Thread(
-                target=_terminate_process_tree, args=(proc,), daemon=True
+                target=_terminate_process_tree, args=(proc,),
+                kwargs={"log_fn": self.reset_log.emit}, daemon=True
             ).start()
         else:
             # Pas de subprocess (reset Playwright en-process) : non interruptible.
@@ -9678,6 +9813,16 @@ class MainWindow(QMainWindow):
     # --- Fermeture ---
     def closeEvent(self, event):
         print("[SHUTDOWN] closeEvent reçu, arrêt de l'application...")
+        self._closing = True
+        self._reset_cancelled.update(self._reset_in_progress)
+        # Synchronisé avec Popen + enregistrement : aucun nouveau helper ne peut
+        # apparaître après cette capture, même si un worker démarrait son reset.
+        with _RESET_SPAWN_LOCK:
+            _RESET_SHUTTING_DOWN.set()
+            with self._reset_procs_lock:
+                reset_procs = list(self._reset_procs.values())
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(_terminate_process_tree, reset_procs))
         self._refresh_after_reset_timer.stop()
 
         # Arrêter tous les proxies proprement
