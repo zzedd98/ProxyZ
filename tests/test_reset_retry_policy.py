@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import types
+import threading
 import unittest
 from unittest.mock import AsyncMock, Mock
 
@@ -19,9 +20,9 @@ def load_policy():
                "_interface_available_event_set"}
     for n in tree.body:
         if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in
-                {"MAX_CONSECUTIVE_RESET_FAILURES", "RESET_RETRY_DELAY_SECONDS", "RESET_POOL_RETURN_DELAY_SECONDS"} for t in n.targets):
+                {"MAX_CONSECUTIVE_RESET_FAILURES", "RESET_RETRY_DELAY_SECONDS", "RESET_POOL_RETURN_DELAY_SECONDS", "AUTH_QUOTA_SECONDS"} for t in n.targets):
             nodes.append(n)
-        if isinstance(n, ast.ClassDef) and n.name == "ResetRetryPolicy":
+        if isinstance(n, ast.ClassDef) and n.name in {"ResetRetryPolicy", "AuthQuotaState"}:
             nodes.append(n)
         if isinstance(n, ast.ClassDef) and n.name == "InterfaceQuotaManager":
             n.body = [m for m in n.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name in methods]
@@ -31,7 +32,7 @@ def load_policy():
                 if isinstance(method, ast.FunctionDef) and method.name in {"_start_reset", "_save_reset_blocks"}:
                     nodes.append(method)
     module = types.ModuleType("retry")
-    module.__dict__.update(asyncio=asyncio, json=json, math=math, logger=Mock(), _atomic_write_json=Mock(),
+    module.__dict__.update(asyncio=asyncio, json=json, math=math, threading=threading, logger=Mock(), _atomic_write_json=Mock(),
                            time=types.SimpleNamespace(monotonic=Mock(return_value=100.0)))
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(path), "exec"), module.__dict__)
     return module

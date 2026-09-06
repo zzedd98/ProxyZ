@@ -2354,6 +2354,47 @@ GET_QUOTA_KEY = "get"  # GET (ex. ipinfo.io/ip) : 2 max par interface
 MAX_CONSECUTIVE_RESET_FAILURES = 10
 RESET_RETRY_DELAY_SECONDS = 30.0
 RESET_POOL_RETURN_DELAY_SECONDS = 5.0
+AUTH_QUOTA_SECONDS = 120.0
+
+
+class AuthQuotaState:
+    """Arbitre atomique entre les réservations asyncio et les resets du thread Qt."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._deadlines = {}
+        self._resetting = set()
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._deadlines)
+
+    def unavailable(self, name):
+        with self._lock:
+            return name in self._deadlines or name in self._resetting
+
+    def reserve(self, name):
+        with self._lock:
+            if name in self._resetting or name in self._deadlines:
+                return False
+            self._deadlines[name] = time.monotonic() + AUTH_QUOTA_SECONDS
+            return True
+
+    def remaining(self, name):
+        with self._lock:
+            return max(0.0, self._deadlines.get(name, 0.0) - time.monotonic())
+
+    def begin_reset(self, name):
+        with self._lock:
+            if name in self._resetting or time.monotonic() < self._deadlines.get(name, 0.0):
+                return False
+            self._resetting.add(name)
+            return True
+
+    def finish_reset(self, name):
+        with self._lock:
+            self._resetting.discard(name)
+            self._deadlines.pop(name, None)
 
 
 class ResetRetryPolicy:
@@ -2415,6 +2456,8 @@ class InterfaceQuotaManager:
         egress_configs: list,
         quota_timeout_seconds: float = 60.0,
         max_requests_per_quota: int = 2,
+        auth_quota_enabled: bool = False,
+        auth_state: Optional[AuthQuotaState] = None,
     ):
         """
         Args:
@@ -2423,11 +2466,15 @@ class InterfaceQuotaManager:
             max_requests_per_quota: Nombre maximum de requêtes par quota (défaut: 2)
         """
         self.egress_configs = egress_configs.copy()
+        self.auth_quota_enabled = auth_quota_enabled
+        self.auth_state = auth_state if auth_state is not None else AuthQuotaState()
+        self._auth_task = None
         # Structure: {interface_name: {request_type: {domain: QuotaInfo}}}
         # Exemple: {"Clé 101": {"GET": {"ipinfo.io:80": QuotaInfo(2)}}}
         self.quotas: Dict[str, Dict[str, Dict[str, QuotaInfo]]] = {}
         self.available_interfaces: list = (
-            [cfg for cfg in egress_configs if not cfg.get("reset_blocked")]
+            [cfg for cfg in egress_configs if not cfg.get("reset_blocked")
+             and not self.auth_state.unavailable(cfg["name"])]
         )  # Interfaces disponibles
         self.resetting_interfaces: set = set()  # Interfaces en cours de reset
         self._lock = asyncio.Lock()
@@ -2462,6 +2509,21 @@ class InterfaceQuotaManager:
         self._interface_available_event = asyncio.Event()
         if self.available_interfaces:
             self._interface_available_event.set()
+
+    def start_auth_task(self):
+        if self._auth_task is None or self._auth_task.done():
+            self._auth_task = asyncio.create_task(self._auth_reset_loop())
+
+    async def _auth_reset_loop(self):
+        # Un seul ordonnanceur léger pour toutes les clés, sans thread ni accès disque.
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                names = {cfg["name"] for cfg in self.egress_configs}
+                for name, deadline in self.auth_state.snapshot().items():
+                    if name in names and now >= deadline:
+                        self._request_interface_reset(name, "quota AUTH terminé")
+            await asyncio.sleep(1.0)
 
     async def wait_for_interface_available(self, timeout: float = 120.0) -> None:
         """Attend qu'au moins une interface soit disponible (ex. après un reset). Timeout en secondes."""
@@ -2559,6 +2621,8 @@ class InterfaceQuotaManager:
                 await asyncio.sleep(30)
                 async with self._lock:
                     for key_name in list(self._keys_removed_from_pool):
+                        if self.auth_state.remaining(key_name) > 0:
+                            continue
                         if key_name in self._quarantine_interfaces:
                             continue
                         if key_name in self.resetting_interfaces:
@@ -2779,6 +2843,8 @@ class InterfaceQuotaManager:
 
     def _request_interface_reset(self, interface_name: str, reason: str):
         """Retire l'interface du pool et déclenche un reset réel avant retour à 0/0."""
+        if self.auth_state.remaining(interface_name) > 0:
+            return
         if interface_name in self.resetting_interfaces:
             return
         if time.monotonic() < self._reset_next_retry.get(interface_name, 0.0):
@@ -2850,11 +2916,28 @@ class InterfaceQuotaManager:
                     for info in self.available_interfaces
                     if info["name"] not in self.resetting_interfaces
                     and info["name"] not in self._quarantine_interfaces
+                    and not self.auth_state.unavailable(info["name"])
                 ]
                 if not eligible:
                     return None
                 eligible.sort(key=lambda x: x[0])
-                interface_info = eligible[0][1]
+                is_auth = self.auth_quota_enabled and "auth" in host.lower()
+                if is_auth:
+                    interface_info = next(
+                        (info for _, info in eligible if self.auth_state.reserve(info["name"])),
+                        None,
+                    )
+                    if interface_info is None:
+                        return None
+                    self.available_interfaces = [
+                        info for info in self.available_interfaces
+                        if info["name"] != interface_info["name"]
+                    ]
+                    self._interface_available_event_clear_if_empty()
+                    self.start_auth_task()
+                    interface_info = dict(interface_info, auth_protected=True)
+                else:
+                    interface_info = eligible[0][1]
                 interface_name = interface_info["name"]
                 # Tracker la connexion pour répartir la charge (éviter qu'une seule clé prenne tout)
                 # Ne pas mettre le badge "In use" pour les tunnels CONNECT hostname : ils restent ouverts longtemps
@@ -2875,6 +2958,8 @@ class InterfaceQuotaManager:
             for interface_info in self.available_interfaces:
                 interface_name = interface_info["name"]
 
+                if self.auth_state.unavailable(interface_name):
+                    continue
                 if interface_name in self.resetting_interfaces:
                     continue
                 if interface_name in self._quarantine_interfaces:
@@ -3078,7 +3163,7 @@ class InterfaceQuotaManager:
                     )
 
                     # Après 3 échecs : retirer la clé du pool et lancer un reset (retry toutes les 30s si échec)
-                    if fail_count >= 3:
+                    if fail_count >= 3 and self.auth_state.remaining(interface_name) <= 0:
                         self.available_interfaces = [
                             i
                             for i in self.available_interfaces
@@ -3137,6 +3222,8 @@ class InterfaceQuotaManager:
 
     async def _reset_interface_direct(self, interface_name: str):
         """Reset direct d'une interface via script (fallback si pas de callback)"""
+        if not self.auth_state.begin_reset(interface_name):
+            return
         try:
             # Port et script : depuis egress_configs si fournis (depuis ZRotate GUI), sinon fallback
             entry = next(
@@ -3151,6 +3238,7 @@ class InterfaceQuotaManager:
                     f"[QUOTA] Reset direct annulé pour '{interface_name}' : "
                     f"aucun proxy_port en configuration (port non deviné depuis le nom)."
                 )
+                await self._release_interface_after_reset(interface_name, False)
                 return
 
             script_path = None
@@ -3249,6 +3337,7 @@ class InterfaceQuotaManager:
                 n = cfg["name"]
                 out[n] = {
                     "in_pool": n in in_pool,
+                    "auth_remaining": math.ceil(self.auth_state.remaining(n)),
                     "resetting": n in self.resetting_interfaces,
                     "quarantine": n in self._quarantine_interfaces,
                 }
@@ -3300,6 +3389,8 @@ class InterfaceQuotaManager:
     async def prepare_manual_reset(self, interface_name: str):
         """Seul un clic manuel peut sortir de l'arrêt après annulation/plafond."""
         async with self._lock:
+            if self.auth_state.remaining(interface_name) > 0:
+                return
             self._quarantine_interfaces.discard(interface_name)
             self._consecutive_reset_failures.pop(interface_name, None)
             self._reset_next_retry.pop(interface_name, None)
@@ -3325,6 +3416,9 @@ class InterfaceQuotaManager:
     ):
         """Remet une interface en disponibilité après reset (manuel ou ZRotate) et réinitialise tous ses quotas."""
         async with self._lock:
+            if self.auth_state.remaining(interface_name) > 0:
+                return
+            self.auth_state.finish_reset(interface_name)
             if interface_name in self._quarantine_interfaces:
                 return  # Résultat tardif après annulation : aucun réarmement implicite.
             # Réinitialiser tous les quotas de l'interface (CONNECT game_server, GET, etc.)
@@ -3924,6 +4018,8 @@ class ZRotateSingleProxyServer:
         max_requests_per_quota: int = 2,
         quota_timeout_seconds: float = 60.0,
         close_haapi_tunnel_after_seconds: float = DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS,
+        auth_quota_enabled: bool = False,
+        auth_state: Optional[AuthQuotaState] = None,
     ):
         """
         Args:
@@ -3967,6 +4063,8 @@ class ZRotateSingleProxyServer:
             valid_configs,
             max_requests_per_quota=max_requests_per_quota,
             quota_timeout_seconds=quota_timeout_seconds,
+            auth_quota_enabled=auth_quota_enabled,
+            auth_state=auth_state,
         )
         # Garder l'ancien sélecteur pour compatibilité (non utilisé si quota_manager est actif)
         self.egress_selector = RoundRobinEgressSelector(valid_configs)
@@ -4005,6 +4103,7 @@ class ZRotateSingleProxyServer:
         addr = self.server.sockets[0].getsockname()
         logger.info(f"✅ ZRotate démarré sur {addr[0]}:{addr[1]}")
         if self._use_quotas:
+            self.quota_manager.start_auth_task()
             await self.quota_manager.start_pool_health_task()
             logger.info(
                 f"Système de quotas activé - {len(self.quota_manager.egress_configs)} interface(s) disponible(s)"
@@ -4026,6 +4125,10 @@ class ZRotateSingleProxyServer:
     async def stop(self):
         """Arrête le serveur"""
         self.running = False
+        task = self.quota_manager._auth_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
         if self.server:
             self.server.close()
@@ -4185,7 +4288,8 @@ class ZRotateSingleProxyServer:
                 is_non_important = request_type == "CONNECT" and not _host_is_ip_only(
                     dest_host or ""
                 )
-                if self._close_haapi_tunnel_after_seconds > 0 and is_non_important:
+                if (self._close_haapi_tunnel_after_seconds > 0 and is_non_important
+                        and not egress_info.get("auth_protected", False)):
                     delay = self._close_haapi_tunnel_after_seconds
                     _uw = upstream_writer
                     _w = writer
@@ -4780,6 +4884,8 @@ class ZRotateProxyServer(QThread):
         max_requests_per_quota: int = 2,
         quota_timeout_seconds: float = 60.0,
         close_haapi_tunnel_after_seconds: float = DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS,
+        auth_quota_enabled: bool = False,
+        auth_state: Optional[AuthQuotaState] = None,
     ):
         """
         Args:
@@ -4792,6 +4898,8 @@ class ZRotateProxyServer(QThread):
         """
         super().__init__()
         self.egress_configs = egress_configs
+        self.auth_quota_enabled = auth_quota_enabled
+        self.auth_state = auth_state
         self.host = host
         self.port = port
         self.max_requests_per_quota = max_requests_per_quota
@@ -4870,6 +4978,8 @@ class ZRotateProxyServer(QThread):
                 egress_configs=self.egress_configs,
                 max_requests_per_quota=self.max_requests_per_quota,
                 quota_timeout_seconds=self.quota_timeout_seconds,
+                auth_quota_enabled=self.auth_quota_enabled,
+                auth_state=self.auth_state,
                 close_haapi_tunnel_after_seconds=self.close_haapi_tunnel_after_seconds,
             )
 
@@ -4892,6 +5002,8 @@ class ZRotateProxyServer(QThread):
             reset_callback = ResetCallbackWrapper(self.reset_interface_requested)
             if hasattr(self.proxy_server, "quota_manager"):
                 qm = self.proxy_server.quota_manager
+                # Le menu peut changer pendant la validation des interfaces au démarrage.
+                qm.auth_quota_enabled = self.auth_quota_enabled
                 qm.set_reset_callback(reset_callback)
                 qm.set_usage_callback(
                     lambda name, in_use: self.interface_usage_changed.emit(name, in_use)
@@ -5949,6 +6061,11 @@ class ZRotateInterfaceRow(QFrame):
         if self._last_zrotate_live != live:
             self._last_zrotate_live = live
             _qt_apply_properties(self, {"zrotateLive": live})
+        remaining = (snap or {}).get("auth_remaining", 0)
+        self.setToolTip(
+            f"Quota AUTH : clé protégée pendant encore {remaining} s, puis reset."
+            if remaining else ""
+        )
         self._apply_checked_visual_state()
 
 
@@ -6101,6 +6218,7 @@ class MainWindow(QMainWindow):
         self._reset_procs_lock = threading.Lock()
         self._reset_cleaning = False
         self._closing = False
+        self._auth_quota_state = AuthQuotaState()
         self._reset_retry_policy = ResetRetryPolicy()
         self._reset_duration_sums: dict[str, float] = {}
         self._reset_duration_counts: dict[str, int] = {}
@@ -6313,7 +6431,7 @@ class MainWindow(QMainWindow):
         # Options (warmup / serveur reset) en popup — sans flèche menu
         self.options_button = QPushButton("Options")
         self.options_button.setObjectName("globalSettingsButton")
-        self.options_button.setToolTip("Serveur de reset HTTP, logs et stats connexions")
+        self.options_button.setToolTip("Quota AUTH, serveur de reset HTTP et stats connexions")
         self.options_button.setFixedHeight(34)
         self.options_button.clicked.connect(self._show_options_menu)
         self._build_options_menu()
@@ -6941,6 +7059,15 @@ class MainWindow(QMainWindow):
         )
         self.reset_server_checkbox.stateChanged.connect(self._on_reset_server_toggled)
 
+        self.auth_quota_checkbox = QCheckBox("Quota AUTH (2 minutes)")
+        self.auth_quota_checkbox.setObjectName("playwrightWarmupCheckbox")
+        self.auth_quota_checkbox.setToolTip(
+            "Une destination contenant « auth » (sans distinction de casse) réserve la clé "
+            "hors du pool pendant 120 secondes, puis déclenche son reset. "
+            "La désactivation conserve les protections déjà commencées."
+        )
+        self.auth_quota_checkbox.stateChanged.connect(self._on_auth_quota_toggled)
+
         self.connection_stats_checkbox = QCheckBox("Badges connexions sur les cartes")
         self.connection_stats_checkbox.setObjectName("playwrightWarmupCheckbox")
         self.connection_stats_checkbox.setToolTip(
@@ -6957,6 +7084,7 @@ class MainWindow(QMainWindow):
         panel_layout.setContentsMargins(12, 10, 12, 10)
         panel_layout.setSpacing(8)
         panel_layout.addWidget(self.reset_server_checkbox)
+        panel_layout.addWidget(self.auth_quota_checkbox)
         panel_layout.addWidget(self.connection_stats_checkbox)
 
         menu = QMenu(self)
@@ -7255,6 +7383,10 @@ class MainWindow(QMainWindow):
             _max_req = 2
         zrotate_cfg["max_requests_per_quota"] = _max_req
         zrotate_cfg.setdefault("quota_timeout_seconds", 60.0)
+        zrotate_cfg.setdefault("auth_quota_enabled", False)
+        self.auth_quota_checkbox.blockSignals(True)
+        self.auth_quota_checkbox.setChecked(bool(zrotate_cfg["auth_quota_enabled"]))
+        self.auth_quota_checkbox.blockSignals(False)
         zrotate_cfg.setdefault(
             "close_haapi_tunnel_after_seconds",
             DEFAULT_CLOSE_HAAPI_TUNNEL_AFTER_SECONDS,
@@ -8326,6 +8458,7 @@ class MainWindow(QMainWindow):
         """Appelé sur le thread Qt principal après la fin du script de reset (évite les crashes)."""
         if self._closing:
             return
+        self._auth_quota_state.finish_reset(name)
         self._reset_in_progress.discard(name)
         was_cancelled = name in self._reset_cancelled
         self._reset_cancelled.discard(name)
@@ -8516,6 +8649,14 @@ class MainWindow(QMainWindow):
         app_dir = get_app_dir()
         script_path = resolve_reset_script_path(reset_script, app_dir)
 
+        if not self._auth_quota_state.begin_reset(name):
+            if interactive:
+                remaining = math.ceil(self._auth_quota_state.remaining(name))
+                QMessageBox.information(
+                    self, "Quota AUTH", f"{name} : authentification protégée. "
+                    f"Reset autorisé dans {remaining} seconde(s).",
+                )
+            return False
         if interactive:
             self._reset_retry_policy.rearm(name)
             self._save_reset_blocks()
@@ -9513,6 +9654,25 @@ class MainWindow(QMainWindow):
                 if labels[3].text() != str(total):
                     labels[3].setText(str(total))
 
+    def _on_auth_quota_toggled(self, state: int):
+        enabled = self.auth_quota_checkbox.isChecked()
+        self.config.setdefault("zrotate", {})["auth_quota_enabled"] = enabled
+        self._merge_write_config_disk(
+            lambda data: data.setdefault("zrotate", {}).update(auth_quota_enabled=enabled)
+        )
+        server = getattr(self, "zrotate_proxy_server", None)
+        if server is not None:
+            server.auth_quota_enabled = enabled
+            def apply_option():
+                proxy = server.proxy_server
+                if proxy is not None:
+                    proxy.quota_manager.auth_quota_enabled = enabled
+            if server.loop and server.loop.is_running():
+                try:
+                    server.loop.call_soon_threadsafe(apply_option)
+                except RuntimeError:
+                    pass  # Arrêt concurrent : le prochain démarrage relira la configuration.
+
     # --- Serveur de reset HTTP ---
     def _on_reset_server_toggled(self, state: int):
         # Lire l'état directement sur la case (robuste, pas de comparaison d'enum).
@@ -9784,6 +9944,8 @@ class MainWindow(QMainWindow):
             port=port,
             max_requests_per_quota=max_requests,
             quota_timeout_seconds=quota_timeout,
+            auth_quota_enabled=bool(zrotate_cfg.get("auth_quota_enabled", False)),
+            auth_state=self._auth_quota_state,
             close_haapi_tunnel_after_seconds=close_haapi_after,
         )
         self.zrotate_proxy_server.set_ui_logs_enabled(self.logs_panel_enabled)

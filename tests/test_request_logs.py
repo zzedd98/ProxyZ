@@ -56,6 +56,7 @@ class RequestLogTests(unittest.IsolatedAsyncioTestCase):
         self.code.read_until_double_crlf.return_value = (first_line + "\r\n\r\n").encode()
         server = types.SimpleNamespace(
             _connection_counter=0, _use_quotas=True, total_requests=0, rejected_requests=0,
+            _close_haapi_tunnel_after_seconds=30,
             quota_manager=types.SimpleNamespace(
                 acquire_interface_for_request=AsyncMock(return_value=interface),
                 complete_request=AsyncMock(),
@@ -65,6 +66,24 @@ class RequestLogTests(unittest.IsolatedAsyncioTestCase):
             write=Mock(), drain=AsyncMock(), close=Mock(), wait_closed=AsyncMock())
         await self.code._handle_client(server, object(), writer)
         return writer
+
+    async def test_auth_tunnel_is_not_closed_by_hostname_timer(self):
+        upstream = types.SimpleNamespace(close=Mock(), wait_closed=AsyncMock())
+        self.code.open_connection_with_bind = AsyncMock(return_value=(object(), upstream))
+        self.code.relay_tunnel = AsyncMock()
+        scheduled = []
+        def schedule(coro):
+            scheduled.append(coro)
+            coro.close()  # Aucun timer réel dans ce test.
+        self.code.asyncio.create_task = schedule
+        await self.request("CONNECT auth.example.com:443 HTTP/1.1",
+                           {"name": "A", "ip": "127.0.0.2", "auth_protected": True})
+        self.code.relay_tunnel.assert_awaited_once()
+        self.assertEqual(scheduled, [])
+        # Option désactivée : conserver la fermeture habituelle des hostnames.
+        await self.request("CONNECT auth.example.com:443 HTTP/1.1",
+                           {"name": "A", "ip": "127.0.0.2"})
+        self.assertEqual(len(scheduled), 1)
 
     async def test_connect_destination_logged_once_even_if_upstream_fails(self):
         writer = await self.request("CONNECT auth.example.com:443 HTTP/1.1", {"name": "Clé 1", "ip": "127.0.0.2"})
