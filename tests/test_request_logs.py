@@ -89,16 +89,29 @@ class RequestLogTests(unittest.IsolatedAsyncioTestCase):
         writer = await self.request("CONNECT auth.example.com:443 HTTP/1.1", {"name": "Clé 1", "ip": "127.0.0.2"})
         self.code.open_connection_with_bind.assert_awaited_once_with("auth.example.com", 443, "127.0.0.2")
         writer.write.assert_any_call(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-        self.signal.emit.assert_called_once_with('[REQ] CONNECT → auth.example.com:443 | interface: "Clé 1"')
+        self.signal.emit.assert_called_once_with('[REQ] CONNECT → auth.example.com:443 | src: 127.0.0.1:1000 | itf: "Clé 1"')
 
     async def test_http_logs_method_and_host_without_path_query_or_credentials(self):
         await self.request("GET http://example.com/login?token=secret HTTP/1.1", {"name": "Clé 1", "ip": "127.0.0.2"})
         self.code.open_connection_with_bind.assert_awaited_once_with("example.com", 80, "127.0.0.2")
-        self.signal.emit.assert_called_once_with('[REQ] GET → example.com:80 | interface: "Clé 1"')
+        self.signal.emit.assert_called_once_with('[REQ] GET → example.com:80 | src: 127.0.0.1:1000 | itf: "Clé 1"')
 
     async def test_request_without_interface_remains_visible(self):
         await self.request("CONNECT auth.example.com:443 HTTP/1.1", None)
-        self.signal.emit.assert_called_once_with('[REQ] CONNECT → auth.example.com:443 | interface: null')
+        self.signal.emit.assert_called_once_with('[REQ] CONNECT → auth.example.com:443 | src: 127.0.0.1:1000 | itf: null')
+
+    def test_source_ipv6_survives_console_interface_routing(self):
+        self.code.log_zrotate_request("CONNECT", "auth.example.com", 443, "Clé 1", ("::1", 50862, 0, 0))
+        message = self.signal.emit.call_args.args[0]
+        self.assertIn("src: [::1]:50862", message)
+        window = self.window(view="Clé 1")
+        self.code._zrotate_log(window, message)
+        self.assertIn("src: [::1]:50862", window._console_lines["Clé 1"][0])
+        self.assertEqual(window._console_lines[None], window._console_lines["Clé 1"])
+
+    def test_missing_peer_is_explicitly_unknown(self):
+        self.code.log_zrotate_request("CONNECT", "auth.example.com", 443)
+        self.assertIn("src: inconnue", self.signal.emit.call_args.args[0])
 
     def test_technical_logs_do_not_emit_qt_signals(self):
         self.code.logger.info("[QUOTA] some technical details")
@@ -116,8 +129,8 @@ class RequestLogTests(unittest.IsolatedAsyncioTestCase):
 
     def test_request_visible_in_general_and_exact_interface(self):
         window = self.window()
-        self.code._zrotate_log(window, '[REQ] CONNECT → auth.example.com:443 | interface: "Clé 10"')
-        expected = '[12:00:00] CONNECT → auth.example.com:443 | interface: "Clé 10"'
+        self.code._zrotate_log(window, '[REQ] CONNECT → auth.example.com:443 | itf: "Clé 10"')
+        expected = '[12:00:00] CONNECT → auth.example.com:443 | itf: "Clé 10"'
         self.assertEqual(window._console_lines[None], [expected])
         self.assertEqual(window._console_lines["Clé 10"], [expected])
         self.assertNotIn("Clé 1", window._console_lines)
@@ -127,8 +140,8 @@ class RequestLogTests(unittest.IsolatedAsyncioTestCase):
     def test_filtered_view_and_bounded_buffers(self):
         window = self.window(view="Clé 1")
         for _ in range(3):
-            self.code._zrotate_log(window, '[REQ] CONNECT → 192.0.2.1:5555 | interface: "Clé 1"')
-        self.code._zrotate_log(window, '[REQ] CONNECT → other.example:443 | interface: "Clé 2"')
+            self.code._zrotate_log(window, '[REQ] CONNECT → 192.0.2.1:5555 | itf: "Clé 1"')
+        self.code._zrotate_log(window, '[REQ] CONNECT → other.example:443 | itf: "Clé 2"')
         self.assertEqual(len(window._console_lines[None]), 2)
         self.assertEqual(len(window._console_lines["Clé 1"]), 2)
         self.assertEqual(window.zrotate_log_box.append.call_count, 3)
@@ -136,7 +149,7 @@ class RequestLogTests(unittest.IsolatedAsyncioTestCase):
     def test_rejected_request_general_only_and_no_reset_noise(self):
         window = self.window()
         self.code._zrotate_log(window, "[RESET] debug details")
-        self.code._zrotate_log(window, '[REQ] CONNECT → auth.example:443 | interface: null')
+        self.code._zrotate_log(window, '[REQ] CONNECT → auth.example:443 | itf: null')
         self.assertEqual(list(window._console_lines), [None])
         self.assertIn("aucune (503)", window._console_lines[None][0])
         window.zrotate_log_box.append.assert_called_once()

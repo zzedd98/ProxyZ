@@ -2279,7 +2279,7 @@ if not logging.root.handlers:
 logger = logging.getLogger("zrotate_single_proxy")
 
 
-def log_zrotate_request(method, host, port, interface_name=None):
+def log_zrotate_request(method, host, port, interface_name=None, client_addr=None):
     """Une ligne par requête, sans chemin, jeton, en-tête ni contenu HTTPS."""
     if not logger.isEnabledFor(logging.INFO):
         return
@@ -2287,8 +2287,14 @@ def log_zrotate_request(method, host, port, interface_name=None):
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     interface = json.dumps(interface_name, ensure_ascii=False)
+    source = "inconnue"
+    if client_addr:
+        client_host = str(client_addr[0]).replace("\r", "\\r").replace("\n", "\\n")
+        if ":" in client_host and not client_host.startswith("["):
+            client_host = f"[{client_host}]"
+        source = f"{client_host}:{client_addr[1]}"
     logger.info(
-        f"[REQ] {str(method).upper()} → {host}:{port} | interface: {interface}",
+        f"[REQ] {str(method).upper()} → {host}:{port} | src: {source} | itf: {interface}",
         extra={"zrotate_request": True},
     )
 # Empêcher la propagation vers le logger root si un handler est déjà configuré ailleurs
@@ -4231,7 +4237,7 @@ class ZRotateSingleProxyServer:
                 # Si aucune interface n'est disponible au moment de la requête,
                 # on renvoie immédiatement une erreur au client au lieu d'attendre.
                 if not egress_info:
-                    log_zrotate_request(request_type, dest_host, dest_port)
+                    log_zrotate_request(request_type, dest_host, dest_port, client_addr=client_addr)
                     logger.warning(
                         f"[{connection_id}] Aucune interface disponible pour {request_type} {dest_host}:{dest_port} (quotas pleins ou clés en reset)"
                     )
@@ -4247,7 +4253,7 @@ class ZRotateSingleProxyServer:
                 # Ancien système round-robin
                 egress_info = await self.egress_selector.get_egress()
 
-            log_zrotate_request(request_type, dest_host, dest_port, egress_info["name"])
+            log_zrotate_request(request_type, dest_host, dest_port, egress_info["name"], client_addr)
 
             # Traiter la requête selon son type
             if request_type == "CONNECT":
@@ -9328,7 +9334,7 @@ class MainWindow(QMainWindow):
         if not getattr(self, "logs_panel_enabled", False) or not message.startswith("[REQ] "):
             return
         try:
-            request, encoded_interface = message[6:].rsplit(" | interface: ", 1)
+            request, encoded_interface = message[6:].rsplit(" | itf: ", 1)
             iface = json.loads(encoded_interface)
             if iface is not None and not isinstance(iface, str):
                 return
@@ -9336,7 +9342,7 @@ class MainWindow(QMainWindow):
             return
         timestamp = time.strftime("%H:%M:%S")
         label = encoded_interface if iface is not None else "aucune (503)"
-        line = f"[{timestamp}] {request} | interface: {label}"
+        line = f"[{timestamp}] {request} | itf: {label}"
         keys = [None, iface] if iface is not None else [None]
         for key in keys:
             self._ensure_console_buffer(key)
