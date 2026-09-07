@@ -208,9 +208,14 @@
     "quota_timeout_seconds": 60.0,
     "auth_lock_seconds": 120.0,
     "auth_quota_enabled": false,
-    "domain_interfaces": [],
+    "auth_reset_request_limit": 100,
+    "domain_interfaces": [
+      "Cle 101"
+    ],
     "server_url": "http://127.0.0.1:9999",
-    "selected_interfaces": [],
+    "selected_interfaces": [
+      "Cle 101"
+    ],
     "running": false,
     "auto_start": true,
     "close_haapi_tunnel_after_seconds": 0.0

@@ -22,7 +22,7 @@ def load_code():
             nodes.append(node)
         if isinstance(node, ast.ClassDef) and node.name in {"AuthQuotaState", "InterfaceQuotaManager", "QuotaInfo", "ResetRetryPolicy"}:
             nodes.append(node)
-        if isinstance(node, ast.FunctionDef) and node.name in {"_host_is_ip_only", "_host_is_domain"}:
+        if isinstance(node, ast.FunctionDef) and node.name in {"_host_is_ip_only", "_host_is_domain", "_requires_auth_interface"}:
             nodes.append(node)
         if isinstance(node, ast.ClassDef) and node.name == "MainWindow":
             nodes.extend(m for m in node.body if isinstance(m, ast.FunctionDef)

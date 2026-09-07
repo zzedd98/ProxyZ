@@ -23,13 +23,14 @@ class DomainRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def request(self, host, cid=1, method="CONNECT"):
         return await self.qm.get_interface_for_request(method, host, 443, cid)
 
-    async def test_user_auth_sequence_always_uses_dedicated_key_then_game_pool(self):
+    async def test_user_auth_sequence_routes_only_auth_and_waf_to_dedicated_key(self):
         hosts = ["hunt.ankabot.dev", "auth.ankama.com", "auth.ankama.com",
                  "3f38f7f4f368.edge.sdk.awswaf.com", "haapi.ankama.com", "avatar.ankama.com"]
         for i, host in enumerate(hosts):
             result = await self.request(host, i)
-            self.assertEqual(result["name"], "A")
-            self.assertTrue(result["auth_protected"])
+            expected = "A" if host == "auth.ankama.com" or host.endswith(".awswaf.com") else "B"
+            self.assertEqual(result["name"], expected)
+            self.assertEqual(bool(result.get("auth_protected")), expected == "A")
         self.assertEqual((await self.request("52.30.61.61", 20))["name"], "B")
         self.assertEqual(self.state.snapshot(), {})  # Aucun lock AUTH de 120 s.
         self.assertNotIn("A", self.qm.quotas)
@@ -45,11 +46,11 @@ class DomainRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_game_fallback_if_dedicated_key_unavailable(self):
         self.qm.available_interfaces = [self.qm.egress_configs[1]]
-        self.assertIsNone(await self.request("haapi.ankama.com"))
+        self.assertIsNone(await self.request("auth.ankama.com"))
         self.assertEqual((await self.request("108.128.247.72", 2))["name"], "B")
 
-    async def test_http_domains_route_to_dedicated_but_ipv6_literals_do_not(self):
-        self.assertEqual((await self.request("example.com", method="GET"))["name"], "A")
+    async def test_ordinary_http_domains_and_ipv6_use_normal_pool(self):
+        self.assertEqual((await self.request("example.com", method="GET"))["name"], "B")
         self.assertEqual((await self.request("2001:db8::1", 2))["name"], "B")
 
     async def test_automatic_resets_blocked_manual_reset_allowed(self):
