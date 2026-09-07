@@ -3,6 +3,7 @@ import ast
 import asyncio
 from datetime import datetime
 import math
+import ipaddress
 from pathlib import Path
 import threading
 import types
@@ -21,13 +22,14 @@ def load_code():
             nodes.append(node)
         if isinstance(node, ast.ClassDef) and node.name in {"AuthQuotaState", "InterfaceQuotaManager", "QuotaInfo", "ResetRetryPolicy"}:
             nodes.append(node)
-        if isinstance(node, ast.FunctionDef) and node.name == "_host_is_ip_only":
+        if isinstance(node, ast.FunctionDef) and node.name in {"_host_is_ip_only", "_host_is_domain"}:
             nodes.append(node)
         if isinstance(node, ast.ClassDef) and node.name == "MainWindow":
             nodes.extend(m for m in node.body if isinstance(m, ast.FunctionDef)
-                         and m.name in {"_start_reset", "_on_auth_quota_toggled", "_load_auth_quota_config"})
+                         and m.name in {"_start_reset", "_on_auth_quota_toggled", "_load_auth_quota_config",
+                                        "_load_domain_routing_config", "_finish_domain_role_change", "_on_domain_role_toggled"})
     code = types.ModuleType("auth_test")
-    code.__dict__.update(asyncio=asyncio, threading=threading, datetime=datetime, math=math,
+    code.__dict__.update(asyncio=asyncio, threading=threading, datetime=datetime, math=math, ipaddress=ipaddress,
                          logger=Mock(), time=types.SimpleNamespace(monotonic=Mock(return_value=100.0)),
                          resolve_interface_reset_script=Mock(return_value=("reset.py", None)),
                          get_app_dir=Mock(), resolve_reset_script_path=Mock(),

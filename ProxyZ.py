@@ -2377,6 +2377,41 @@ class AuthQuotaState:
         self._lock = threading.Lock()
         self._deadlines = {}
         self._resetting = set()
+        self._dedicated = set()
+        self._domain_users = {}
+
+    def dedicated_interfaces(self):
+        with self._lock:
+            return set(self._dedicated)
+
+    def set_dedicated_interface(self, name, enabled=True):
+        with self._lock:
+            if enabled and (name in self._resetting or name in self._deadlines):
+                return False
+            if enabled:
+                self._dedicated.add(name)
+            else:
+                self._dedicated.discard(name)
+            return True
+
+    def domain_reserved(self, name):
+        with self._lock:
+            return name in self._dedicated or name in self._domain_users.values()
+
+    def acquire_domain(self, name, token):
+        with self._lock:
+            if name not in self._dedicated or name in self._resetting or name in self._deadlines:
+                return False
+            self._domain_users[token] = name
+            return True
+
+    def release_domain(self, token):
+        with self._lock:
+            self._domain_users.pop(token, None)
+
+    def release_domain_owner(self, owner):
+        with self._lock:
+            self._domain_users = {k: v for k, v in self._domain_users.items() if k[0] != owner}
 
     def snapshot(self):
         with self._lock:
@@ -2397,8 +2432,10 @@ class AuthQuotaState:
         with self._lock:
             return max(0.0, self._deadlines.get(name, 0.0) - time.monotonic())
 
-    def begin_reset(self, name):
+    def begin_reset(self, name, automatic=False):
         with self._lock:
+            if automatic and (name in self._dedicated or name in self._domain_users.values()):
+                return False
             if name in self._resetting or time.monotonic() < self._deadlines.get(name, 0.0):
                 return False
             self._resetting.add(name)
@@ -2456,6 +2493,16 @@ def _host_is_ip_only(host: str) -> bool:
     return host.strip().replace(".", "").isdigit()
 
 
+def _host_is_domain(host: str) -> bool:
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host.strip().strip("[]"))
+        return False
+    except ValueError:
+        return True
+
+
 class InterfaceQuotaManager:
     """Gestionnaire de quotas par interface.
 
@@ -2482,6 +2529,7 @@ class InterfaceQuotaManager:
         self.auth_quota_enabled = auth_quota_enabled
         self.auth_state = auth_state if auth_state is not None else AuthQuotaState()
         self._auth_task = None
+        self._domain_cursor = 0
         # Structure: {interface_name: {request_type: {domain: QuotaInfo}}}
         # Exemple: {"Clé 101": {"GET": {"ipinfo.io:80": QuotaInfo(2)}}}
         self.quotas: Dict[str, Dict[str, Dict[str, QuotaInfo]]] = {}
@@ -2526,6 +2574,26 @@ class InterfaceQuotaManager:
     def start_auth_task(self):
         if self._auth_task is None or self._auth_task.done():
             self._auth_task = asyncio.create_task(self._auth_reset_loop())
+
+    async def set_domain_interface(self, name, enabled=True):
+        async with self._lock:
+            if enabled and (
+                name in self.resetting_interfaces or name in self._quarantine_interfaces
+                or not any(i["name"] == name for i in self.available_interfaces)
+            ):
+                return False
+            changed = self.auth_state.set_dedicated_interface(name, enabled)
+            if changed and not enabled:
+                await self._resume_regular_resets(name)
+            return changed
+
+    async def _resume_regular_resets(self, name):
+        if self.auth_state.domain_reserved(name):
+            return
+        if self._interface_failure_count.get(name, 0) >= 3:
+            self._request_interface_reset(name, "fin de protection domaines après échecs")
+        else:
+            await self._check_and_reset_if_needed(name)
 
     async def _auth_reset_loop(self):
         # Un seul ordonnanceur léger pour toutes les clés, sans thread ni accès disque.
@@ -2634,6 +2702,8 @@ class InterfaceQuotaManager:
                 await asyncio.sleep(30)
                 async with self._lock:
                     for key_name in list(self._keys_removed_from_pool):
+                        if self.auth_state.domain_reserved(key_name):
+                            continue
                         if self.auth_state.remaining(key_name) > 0:
                             continue
                         if key_name in self._quarantine_interfaces:
@@ -2671,6 +2741,7 @@ class InterfaceQuotaManager:
                         for x in self.available_interfaces
                         if x.get("name") not in self.resetting_interfaces
                         and x.get("name") not in self._quarantine_interfaces
+                        and not self.auth_state.domain_reserved(x.get("name"))
                     ]
                 n_snap = len(snapshot)
                 if n_snap == 0:
@@ -2711,7 +2782,7 @@ class InterfaceQuotaManager:
                         )
                         async with self._lock:
                             before = [a["name"] for a in self.available_interfaces]
-                            if name not in before or name in self.resetting_interfaces:
+                            if name not in before or name in self.resetting_interfaces or self.auth_state.domain_reserved(name):
                                 continue
                             self.available_interfaces = [
                                 i for i in self.available_interfaces if i["name"] != name
@@ -2733,7 +2804,7 @@ class InterfaceQuotaManager:
                         )
                         async with self._lock:
                             before = [a["name"] for a in self.available_interfaces]
-                            if name not in before or name in self.resetting_interfaces:
+                            if name not in before or name in self.resetting_interfaces or self.auth_state.domain_reserved(name):
                                 continue
                             self.available_interfaces = [
                                 i
@@ -2755,7 +2826,7 @@ class InterfaceQuotaManager:
                     )
                     async with self._lock:
                         before = [a["name"] for a in self.available_interfaces]
-                        if name not in before or name in self.resetting_interfaces:
+                        if name not in before or name in self.resetting_interfaces or self.auth_state.domain_reserved(name):
                             continue
                         self.available_interfaces = [
                             i for i in self.available_interfaces if i["name"] != name
@@ -2856,6 +2927,8 @@ class InterfaceQuotaManager:
 
     def _request_interface_reset(self, interface_name: str, reason: str):
         """Retire l'interface du pool et déclenche un reset réel avant retour à 0/0."""
+        if self.auth_state.domain_reserved(interface_name):
+            return
         if self.auth_state.remaining(interface_name) > 0:
             return
         if interface_name in self.resetting_interfaces:
@@ -2915,6 +2988,33 @@ class InterfaceQuotaManager:
             # Vérifier si c'est une requête importante (seulement celles-ci sont comptées)
             is_important = self._is_important_request(request_type, host, port)
 
+            dedicated = self.auth_state.dedicated_interfaces()
+            if dedicated and _host_is_domain(host):
+                candidates = [i for i in self.available_interfaces
+                              if i["name"] in dedicated
+                              and i["name"] not in self.resetting_interfaces
+                              and i["name"] not in self._quarantine_interfaces
+                              and not self.auth_state.unavailable(i["name"])]
+                if not candidates:
+                    return None  # Pas de bascule silencieuse vers une clé jeu.
+                # Priorité au moins de tunnels actifs, rotation en cas d'égalité.
+                counts = {}
+                for conn in self._active_connections.values():
+                    name = conn["interface_name"]
+                    counts[name] = counts.get(name, 0) + 1
+                offset = self._domain_cursor % len(candidates)
+                candidates = candidates[offset:] + candidates[:offset]
+                candidates.sort(key=lambda i: counts.get(i["name"], 0))
+                for info in candidates:
+                    name = info["name"]
+                    if self.auth_state.acquire_domain(name, (id(self), connection_id)):
+                        self._domain_cursor += 1
+                        self._active_connections[connection_id] = {
+                            "interface_name": name, "is_important": False, "dedicated_domain": True,
+                        }
+                        return dict(info, auth_protected=True)
+                return None
+
             if not is_important:
                 # Requête non importante : prioriser les interfaces avec le moins de connexions actives
                 eligible = [
@@ -2930,6 +3030,7 @@ class InterfaceQuotaManager:
                     if info["name"] not in self.resetting_interfaces
                     and info["name"] not in self._quarantine_interfaces
                     and not self.auth_state.unavailable(info["name"])
+                    and not self.auth_state.domain_reserved(info["name"])
                 ]
                 if not eligible:
                     return None
@@ -2971,7 +3072,7 @@ class InterfaceQuotaManager:
             for interface_info in self.available_interfaces:
                 interface_name = interface_info["name"]
 
-                if self.auth_state.unavailable(interface_name):
+                if self.auth_state.unavailable(interface_name) or self.auth_state.domain_reserved(interface_name):
                     continue
                 if interface_name in self.resetting_interfaces:
                     continue
@@ -3071,6 +3172,9 @@ class InterfaceQuotaManager:
                 return
 
             conn_info = self._active_connections.pop(connection_id)
+            if conn_info.get("dedicated_domain"):
+                self.auth_state.release_domain((id(self), connection_id))
+                await self._resume_regular_resets(conn_info["interface_name"])
             interface_name = conn_info["interface_name"]
             # Connexion non importante (CONNECT hostname, etc.) : pas de quota, juste libérer le slot
             if not conn_info.get("is_important", True):
@@ -3176,7 +3280,8 @@ class InterfaceQuotaManager:
                     )
 
                     # Après 3 échecs : retirer la clé du pool et lancer un reset (retry toutes les 30s si échec)
-                    if fail_count >= 3 and self.auth_state.remaining(interface_name) <= 0:
+                    if (fail_count >= 3 and self.auth_state.remaining(interface_name) <= 0
+                            and not self.auth_state.domain_reserved(interface_name)):
                         self.available_interfaces = [
                             i
                             for i in self.available_interfaces
@@ -3235,7 +3340,7 @@ class InterfaceQuotaManager:
 
     async def _reset_interface_direct(self, interface_name: str):
         """Reset direct d'une interface via script (fallback si pas de callback)"""
-        if not self.auth_state.begin_reset(interface_name):
+        if not self.auth_state.begin_reset(interface_name, automatic=True):
             return
         try:
             # Port et script : depuis egress_configs si fournis (depuis ZRotate GUI), sinon fallback
@@ -4116,7 +4221,8 @@ class ZRotateSingleProxyServer:
         addr = self.server.sockets[0].getsockname()
         logger.info(f"✅ ZRotate démarré sur {addr[0]}:{addr[1]}")
         if self._use_quotas:
-            self.quota_manager.start_auth_task()
+            if self.quota_manager.auth_state.snapshot():
+                self.quota_manager.start_auth_task()
             await self.quota_manager.start_pool_health_task()
             logger.info(
                 f"Système de quotas activé - {len(self.quota_manager.egress_configs)} interface(s) disponible(s)"
@@ -4138,6 +4244,7 @@ class ZRotateSingleProxyServer:
     async def stop(self):
         """Arrête le serveur"""
         self.running = False
+        self.quota_manager.auth_state.release_domain_owner(id(self.quota_manager))
         task = self.quota_manager._auth_task
         if task is not None:
             task.cancel()
@@ -5968,6 +6075,7 @@ class ManualInterfacesList(QListWidget):
 
 class ZRotateInterfaceRow(QFrame):
     toggled = Signal(str, int)  # interface_name, Qt.CheckState
+    domain_role_toggled = Signal(str, bool)
 
     def __init__(
         self,
@@ -5994,6 +6102,23 @@ class ZRotateInterfaceRow(QFrame):
         )
         layout.addWidget(self.checkbox, 1)
 
+        self.domain_button = QPushButton("AUTH")
+        self.domain_button.setCheckable(True)
+        self.domain_button.setFixedSize(62, 22)
+        self.domain_button.setToolTip(
+            "Dédier cette clé aux domaines (auth, HAAPI, WAF…). "
+            "Aucun trafic jeu ni reset automatique. Cliquer à nouveau pour désactiver. "
+            "Les tunnels déjà ouverts restent protégés jusqu'à leur fermeture."
+        )
+        self.domain_button.setStyleSheet(
+            "QPushButton {color: #94a3b8; background: #253044; border: 1px solid #475569; border-radius: 4px;}"
+            "QPushButton:checked {color: white; background: #087f8c; border: 1px solid #36c6c6;}"
+        )
+        self.domain_button.clicked.connect(
+            lambda checked: self.domain_role_toggled.emit(self.interface_name, checked)
+        )
+        layout.addWidget(self.domain_button)
+
         self.stats_widget = QWidget(self)
         stats_layout = QHBoxLayout(self.stats_widget)
         stats_layout.setContentsMargins(0, 0, 0, 0)
@@ -6014,6 +6139,10 @@ class ZRotateInterfaceRow(QFrame):
         stats_layout.addWidget(self.ip_chip)
 
         layout.addWidget(self.stats_widget, 0, Qt.AlignCenter)
+
+    def set_domain_role(self, enabled: bool):
+        self.domain_button.setChecked(enabled)
+        self.domain_button.setText("AUTH ✓" if enabled else "AUTH")
 
     def set_checked(self, checked: bool):
         blocked = self.checkbox.blockSignals(True)
@@ -6167,6 +6296,7 @@ class MainWindow(QMainWindow):
     # Si absent, défaut = "reset_modem.py". Les chemins relatifs sont résolus depuis le dossier de l'exe/script.
     # Signal émis par le thread de reset vers le thread Qt principal (name, returncode: 0=ok, -1=script absent, -2=timeout, autre=échec)
     reset_completed = Signal(str, int, float)
+    domain_role_result = Signal(bool)
     reset_log = Signal(str)
     reset_clean_completed = Signal(str)
     remote_public_ip_updated = Signal(str, str, bool)  # name, public_ip, online
@@ -6268,6 +6398,7 @@ class MainWindow(QMainWindow):
         )
         # Connexion du signal reset_completed pour arrêter l'animation après un reset
         self.reset_completed.connect(self._on_reset_completed)
+        self.domain_role_result.connect(self._finish_domain_role_change)
         self.reset_log.connect(self._on_reset_log)
         self.reset_clean_completed.connect(self._on_reset_clean_completed)
         self.remote_public_ip_updated.connect(self._on_remote_public_ip_updated)
@@ -7098,7 +7229,7 @@ class MainWindow(QMainWindow):
         panel_layout.setContentsMargins(12, 10, 12, 10)
         panel_layout.setSpacing(8)
         panel_layout.addWidget(self.reset_server_checkbox)
-        panel_layout.addWidget(self.auth_quota_checkbox)
+        self.auth_quota_checkbox.hide()  # Remplacé par le rôle AUTH dans la liste du pool.
         panel_layout.addWidget(self.connection_stats_checkbox)
 
         menu = QMenu(self)
@@ -7398,7 +7529,7 @@ class MainWindow(QMainWindow):
         zrotate_cfg["max_requests_per_quota"] = _max_req
         zrotate_cfg.setdefault("quota_timeout_seconds", 60.0)
         self._load_auth_quota_config(zrotate_cfg)
-        zrotate_cfg.setdefault("auth_quota_enabled", False)
+        self._load_domain_routing_config(zrotate_cfg)
         self.auth_quota_checkbox.blockSignals(True)
         self.auth_quota_checkbox.setChecked(bool(zrotate_cfg["auth_quota_enabled"]))
         self.auth_quota_checkbox.blockSignals(False)
@@ -8664,7 +8795,7 @@ class MainWindow(QMainWindow):
         app_dir = get_app_dir()
         script_path = resolve_reset_script_path(reset_script, app_dir)
 
-        if not self._auth_quota_state.begin_reset(name):
+        if not self._auth_quota_state.begin_reset(name, automatic=not interactive):
             if interactive:
                 remaining = math.ceil(self._auth_quota_state.remaining(name))
                 QMessageBox.information(
@@ -9205,6 +9336,8 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem()
             row_widget = ZRotateInterfaceRow(name, public_ip, display_name=display_name)
             row_widget.set_checked(name in self.zrotate_selected_interfaces)
+            row_widget.set_domain_role(name in self._auth_quota_state.dedicated_interfaces())
+            row_widget.domain_role_toggled.connect(self._on_domain_role_toggled)
             row_widget.toggled.connect(self._on_zrotate_interface_toggled)
             self.zrotate_interfaces_list.addItem(item)
             self.zrotate_interfaces_list.setItemWidget(item, row_widget)
@@ -9280,6 +9413,47 @@ class MainWindow(QMainWindow):
         self._last_zrotate_pool_state = state
         self._sync_zrotate_row_pool_styles()
 
+    def _on_domain_role_toggled(self, name: str, enabled: bool):
+        """Change uniquement le routage des nouvelles connexions, sans redémarrer ZRotate."""
+        server = getattr(self, "zrotate_proxy_server", None)
+        valid = name in self.zrotate_selected_interfaces
+        if enabled and (not valid or name in self._reset_retry_policy.blocked):
+            self._finish_domain_role_change(False)
+            return
+        if self.zrotate_running:
+            qm = getattr(getattr(server, "proxy_server", None), "quota_manager", None)
+            if qm is None or not server.loop or not server.loop.is_running():
+                self._finish_domain_role_change(False)
+                return
+            coro = qm.set_domain_interface(name, enabled)
+            try:
+                future = asyncio.run_coroutine_threadsafe(coro, server.loop)
+            except RuntimeError:
+                coro.close()
+                self._finish_domain_role_change(False)
+                return
+            def completed(result):
+                try:
+                    success = result.result()
+                except Exception:
+                    success = False
+                self.domain_role_result.emit(success)
+            future.add_done_callback(completed)
+            return
+        self._finish_domain_role_change(self._auth_quota_state.set_dedicated_interface(name, enabled))
+
+    def _finish_domain_role_change(self, success: bool):
+        selected = sorted(self._auth_quota_state.dedicated_interfaces())
+        if success:
+            self.config.setdefault("zrotate", {}).update(domain_interfaces=selected, auth_quota_enabled=False)
+            self._merge_write_config_disk(
+                lambda data: data.setdefault("zrotate", {}).update(domain_interfaces=selected, auth_quota_enabled=False)
+            )
+        else:
+            QMessageBox.information(self, "Clé AUTH", "Sélectionnez une clé disponible dans le pool, hors reset, verrou AUTH et quarantaine.")
+        for row_name, row in getattr(self, "_zrotate_interface_rows", {}).items():
+            row.set_domain_role(row_name in selected)
+
     def _on_zrotate_interface_toggled(self, interface_name: str, state: int):
         """Gère le changement d'état d'une checkbox d'interface."""
         self._mark_user_interaction()  # Marquer l'interaction pour éviter les mises à jour pendant la sélection
@@ -9290,6 +9464,9 @@ class MainWindow(QMainWindow):
             self.zrotate_selected_interfaces.add(interface_name)
         else:
             self.zrotate_selected_interfaces.discard(interface_name)
+            if interface_name in self._auth_quota_state.dedicated_interfaces():
+                # La sélection du pool redémarre déjà le serveur juste après ce handler.
+                self._finish_domain_role_change(self._auth_quota_state.set_dedicated_interface(interface_name, False))
         self._last_pool_state_for_ui = None
         self._sync_zrotate_row_pool_styles()
         self._save_zrotate_selection_config()
@@ -9669,6 +9846,25 @@ class MainWindow(QMainWindow):
                 if labels[3].text() != str(total):
                     labels[3].setText(str(total))
 
+    def _load_domain_routing_config(self, zrotate_cfg: dict):
+        previous_auth = zrotate_cfg.get("auth_quota_enabled", False)
+        zrotate_cfg["auth_quota_enabled"] = False
+        legacy = zrotate_cfg.get("domain_interface")
+        names = zrotate_cfg.get("domain_interfaces", [legacy] if isinstance(legacy, str) and legacy else [])
+        names = sorted({n for n in names if isinstance(n, str) and n}) if isinstance(names, list) else []
+        zrotate_cfg["domain_interfaces"] = names
+        for name in self._auth_quota_state.dedicated_interfaces():
+            self._auth_quota_state.set_dedicated_interface(name, False)
+        for name in names:
+            self._auth_quota_state.set_dedicated_interface(name)
+        if previous_auth or "domain_interface" in zrotate_cfg:
+            def migrate(data):
+                cfg = data.setdefault("zrotate", {})
+                cfg.update(auth_quota_enabled=False, domain_interfaces=names)
+                cfg.pop("domain_interface", None)
+            self._merge_write_config_disk(migrate)
+        zrotate_cfg.pop("domain_interface", None)
+
     def _load_auth_quota_config(self, zrotate_cfg: dict):
         """Durée lue au démarrage de ProxyZ, avant toute réservation AUTH."""
         self._auth_quota_state = AuthQuotaState(
@@ -9923,6 +10119,10 @@ class MainWindow(QMainWindow):
             )
 
         # Un redémarrage de ZRotate ne réarme pas les interfaces arrêtées par Clean/plafond.
+        dedicated = self._auth_quota_state.dedicated_interfaces()
+        if dedicated and not any(cfg["name"] in dedicated for cfg in egress_configs):
+            QMessageBox.warning(self, "Clé AUTH indisponible", "Aucune clé AUTH n'est disponible dans le pool sélectionné. Sélectionnez une clé dédiée disponible ou désactivez les rôles AUTH.")
+            return
         for cfg in egress_configs:
             cfg["reset_blocked"] = cfg["name"] in self._reset_retry_policy.blocked
 
