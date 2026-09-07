@@ -25,7 +25,7 @@ def load_code():
             nodes.append(node)
         if isinstance(node, ast.ClassDef) and node.name == "MainWindow":
             nodes.extend(m for m in node.body if isinstance(m, ast.FunctionDef)
-                         and m.name in {"_start_reset", "_on_auth_quota_toggled"})
+                         and m.name in {"_start_reset", "_on_auth_quota_toggled", "_load_auth_quota_config"})
     code = types.ModuleType("auth_test")
     code.__dict__.update(asyncio=asyncio, threading=threading, datetime=datetime, math=math,
                          logger=Mock(), time=types.SimpleNamespace(monotonic=Mock(return_value=100.0)),
@@ -58,6 +58,34 @@ class AuthQuotaTests(unittest.IsolatedAsyncioTestCase):
 
     async def reserve(self, host="AUTH.example.com", method="CONNECT", cid=1):
         return await self.qm.get_interface_for_request(method, host, 443, cid)
+
+    async def test_configured_duration_controls_actual_reset_deadline(self):
+        window = types.SimpleNamespace(auth_quota_checkbox=Mock())
+        config = {"auth_lock_seconds": 300}
+        self.code._load_auth_quota_config(window, config)
+        window.auth_quota_checkbox.setText.assert_called_once_with("Quota AUTH (300 s)")
+        self.qm.auth_state = window._auth_quota_state
+        await self.reserve()
+        config["auth_lock_seconds"] = 10
+        self.code.time.monotonic.return_value = 399.9
+        await self.tick()
+        self.qm._reset_callback.reset_interface.assert_not_called()
+        self.code.time.monotonic.return_value = 400
+        await self.tick()
+        self.qm._reset_callback.reset_interface.assert_called_once_with("A")
+
+    def test_missing_or_invalid_duration_falls_back_to_120_seconds(self):
+        for value in (None, "incorrect", 0, -5, True, float("nan"), float("inf"), []):
+            with self.subTest(value=value):
+                window = types.SimpleNamespace(auth_quota_checkbox=Mock())
+                config = {"auth_lock_seconds": value}
+                self.code._load_auth_quota_config(window, config)
+                self.assertEqual(window._auth_quota_state.lock_seconds, 120)
+                self.assertEqual(config["auth_lock_seconds"], 120)
+        window = types.SimpleNamespace(auth_quota_checkbox=Mock())
+        self.code._load_auth_quota_config(window, {})
+        self.assertEqual(window._auth_quota_state.lock_seconds, 120)
+        self.assertEqual(self.code.AuthQuotaState(30.5).lock_seconds, 30.5)
 
     async def test_reservation_is_immediate_and_other_traffic_uses_other_key(self):
         result = await self.reserve()

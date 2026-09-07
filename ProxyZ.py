@@ -2360,7 +2360,14 @@ AUTH_QUOTA_SECONDS = 120.0
 class AuthQuotaState:
     """Arbitre atomique entre les réservations asyncio et les resets du thread Qt."""
 
-    def __init__(self):
+    def __init__(self, lock_seconds=AUTH_QUOTA_SECONDS):
+        try:
+            seconds = float(lock_seconds)
+            if isinstance(lock_seconds, bool) or not math.isfinite(seconds) or seconds <= 0:
+                raise ValueError("Durée AUTH invalide")
+        except (TypeError, ValueError, OverflowError):
+            seconds = AUTH_QUOTA_SECONDS
+        self.lock_seconds = seconds
         self._lock = threading.Lock()
         self._deadlines = {}
         self._resetting = set()
@@ -2377,7 +2384,7 @@ class AuthQuotaState:
         with self._lock:
             if name in self._resetting or name in self._deadlines:
                 return False
-            self._deadlines[name] = time.monotonic() + AUTH_QUOTA_SECONDS
+            self._deadlines[name] = time.monotonic() + self.lock_seconds
             return True
 
     def remaining(self, name):
@@ -7059,11 +7066,12 @@ class MainWindow(QMainWindow):
         )
         self.reset_server_checkbox.stateChanged.connect(self._on_reset_server_toggled)
 
-        self.auth_quota_checkbox = QCheckBox("Quota AUTH (2 minutes)")
+        self.auth_quota_checkbox = QCheckBox("Quota AUTH")
         self.auth_quota_checkbox.setObjectName("playwrightWarmupCheckbox")
         self.auth_quota_checkbox.setToolTip(
             "Une destination contenant « auth » (sans distinction de casse) réserve la clé "
-            "hors du pool pendant 120 secondes, puis déclenche son reset. "
+            "hors du pool pendant la durée définie par zrotate.auth_lock_seconds "
+            "dans proxy_configs.json (lue au démarrage), puis déclenche son reset. "
             "La désactivation conserve les protections déjà commencées."
         )
         self.auth_quota_checkbox.stateChanged.connect(self._on_auth_quota_toggled)
@@ -7383,6 +7391,7 @@ class MainWindow(QMainWindow):
             _max_req = 2
         zrotate_cfg["max_requests_per_quota"] = _max_req
         zrotate_cfg.setdefault("quota_timeout_seconds", 60.0)
+        self._load_auth_quota_config(zrotate_cfg)
         zrotate_cfg.setdefault("auth_quota_enabled", False)
         self.auth_quota_checkbox.blockSignals(True)
         self.auth_quota_checkbox.setChecked(bool(zrotate_cfg["auth_quota_enabled"]))
@@ -9653,6 +9662,15 @@ class MainWindow(QMainWindow):
                     labels[2].setText(str(zr_n))
                 if labels[3].text() != str(total):
                     labels[3].setText(str(total))
+
+    def _load_auth_quota_config(self, zrotate_cfg: dict):
+        """Durée lue au démarrage de ProxyZ, avant toute réservation AUTH."""
+        self._auth_quota_state = AuthQuotaState(
+            zrotate_cfg.get("auth_lock_seconds", AUTH_QUOTA_SECONDS)
+        )
+        seconds = self._auth_quota_state.lock_seconds
+        zrotate_cfg["auth_lock_seconds"] = seconds
+        self.auth_quota_checkbox.setText(f"Quota AUTH ({seconds:g} s)")
 
     def _on_auth_quota_toggled(self, state: int):
         enabled = self.auth_quota_checkbox.isChecked()
